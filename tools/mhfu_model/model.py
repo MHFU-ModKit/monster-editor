@@ -111,8 +111,9 @@ class MeshGroup:
     geometry for the Blender importer; `vertex_count`/`face_count` mirror lengths
     for cheap summaries.
     """
-    index: int
+    index: int                 # global draw order across all vertex groups == bind index
     material: int
+    mesh_record: int = 0       # which PMO mesh record this vertex group belongs to
     vertex_count: int = 0
     face_count: int = 0
     scale: Vec3 = (1.0, 1.0, 1.0)

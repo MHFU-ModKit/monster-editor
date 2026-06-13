@@ -152,6 +152,7 @@ def _walk(blob, header, scale, stride):
     buf = io.BytesIO(blob)
     groups: List[MeshGroup] = []
     total = 0
+    draw = 0                       # global vertex-group draw order == bind index
     try:
         for i in range(nmesh):
             m = mesh_tab + i * stride
@@ -161,14 +162,12 @@ def _walk(blob, header, scale, stride):
             else:
                 vg_count, vg_start = struct.unpack_from("2H", blob, m + 0x10)
                 mat_base = 0
-            verts: List[dict] = []
-            faces: List[dict] = []
-            material = 0
             for j in range(vg_count):
                 vo = vg_tab + (vg_start + j) * 0x10
                 if vo + 0x10 > fsz:
                     return None, -1
                 vg = struct.unpack_from("2BH3I", blob, vo)
+                material = 0
                 mo = mat_tab + (mat_base + vg[0]) * 16
                 if mo + 16 <= fsz:
                     material = struct.unpack_from("4I", blob, mo)[2]
@@ -177,16 +176,14 @@ def _walk(blob, header, scale, stride):
                     return None, -1
                 buf.seek(ge)
                 gv, gf = run_ge(buf, scale)
-                base = len(verts)
-                verts.extend(gv)
-                for f in gf:
-                    faces.append({"v1": f["v1"] + base, "v2": f["v2"] + base,
-                                  "v3": f["v3"] + base})
-            groups.append(MeshGroup(
-                index=i, material=material, vertex_count=len(verts),
-                face_count=len(faces), scale=scale, vertices=verts, faces=faces,
-            ))
-            total += len(verts)
+                # one MeshGroup per vertex group = the rigid per-bone bind unit
+                groups.append(MeshGroup(
+                    index=draw, material=material, mesh_record=i,
+                    vertex_count=len(gv), face_count=len(gf), scale=scale,
+                    vertices=gv, faces=gf,
+                ))
+                total += len(gv)
+                draw += 1
     except (struct.error, ValueError, IndexError):
         return None, -1
     return groups, total
