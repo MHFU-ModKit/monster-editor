@@ -24,6 +24,7 @@ __all__ = [
     "load_pac", "parse_pac", "MonsterPac", "SubResource",
     "MonsterModel", "Skeleton", "Bone", "Model", "MeshGroup",
     "AnimationPack", "Animation", "BoneTrack", "Channel", "Keyframe", "Texture",
+    "repack",
 ]
 
 
@@ -49,3 +50,28 @@ def parse_pac(data: bytes) -> MonsterModel:
 def load_pac(path: str) -> MonsterModel:
     with open(path, "rb") as f:
         return parse_pac(f.read())
+
+
+def repack(mm: MonsterModel) -> bytes:
+    """Re-encode the decoded sub-resources back into a PAC (Phase 3 write-back).
+
+    Re-encodes the FIRST skeleton / model / anim sub from the decoded data model
+    and leaves every other sub-resource (textures, a monster's second model set,
+    unknown subs) byte-identical. Untouched + unedited assets reproduce the source
+    file exactly (the encoders are byte-exact); edited assets re-flow offsets via
+    `MonsterPac.to_bytes`. Texture (TMH) write-back is deferred to a later phase.
+    """
+    pac = mm.pac
+    done = {"skeleton": False, "model": False, "anim": False}
+    new_subs = []
+    for sub in pac.subs:
+        r = pac.role(sub)
+        data = sub.data
+        if r == "skeleton" and mm.skeleton and not done["skeleton"]:
+            data = _skeleton.encode(mm.skeleton); done["skeleton"] = True
+        elif r == "model" and mm.model and not done["model"]:
+            data = _pmo.encode(mm.model); done["model"] = True
+        elif r == "anim" and mm.anim and not done["anim"]:
+            data = _anim.encode(mm.anim); done["anim"] = True
+        new_subs.append(SubResource(sub.index, data))
+    return MonsterPac(subs=new_subs, tail=pac.tail).to_bytes()

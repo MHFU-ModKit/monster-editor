@@ -67,8 +67,12 @@ class Channel:
 
 @dataclass
 class BoneTrack:
-    mask: int                          # channel bitmask (low 16 of bone tag)
+    tag: int                           # full u32 bone-record tag (FLAG | mask)
     channels: List[Channel] = field(default_factory=list)
+
+    @property
+    def mask(self) -> int:             # channel bitmask (low 16 of bone tag)
+        return self.tag & 0xFFFF
 
     @property
     def channel_names(self) -> List[str]:
