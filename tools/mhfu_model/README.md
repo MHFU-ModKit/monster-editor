@@ -16,9 +16,11 @@ See `specs/002-model-anim-pipeline/tasks.md` and `docs/ANIMATION_FORMAT.md`.
   clean; each broken rule flags a specific code. Drives the Blender panel + CLI.
 - **Phase 3 (DONE, one HITL gate):** encoders (`skeleton.encode`, `anim.encode`,
   `pmo.encode`) + `repack()`. Byte-identical for unedited assets; correct for anim
-  value / keyframe-count / new-slot / skeleton bind-pose edits. PMO *geometry* edit
-  emission is the remaining stretch (re-emits source byte-identical today). The
-  in-PPSSPP visual check is the one human step (see `examples/edit_anim_demo.py`).
+  value / keyframe-count / new-slot / skeleton bind-pose **and PMO vertex-move**
+  edits. PMO geometry is **in-place** (reshape: move verts/normals/UVs at the same
+  topology — byte-exact re-encode incl. the parser's native struct-alignment pad
+  bytes); adding/removing geometry (a GE-list rebuild) is rejected and folded into
+  Phase 5. The in-PPSSPP visual check is the one human step (`examples/edit_anim_demo.py`).
 - Phase 4 = live in-RAM inject · Phase 5 = new geometry/monster.
 
 ## Quick use

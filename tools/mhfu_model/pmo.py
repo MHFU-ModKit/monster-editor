@@ -1,27 +1,44 @@
-"""PMO geometry (PAC sub-1) -> data model.
+"""PMO geometry (PAC sub-1) <-> data model.
 
-Decodes the MHFU/MHP2G *monster* PMO (magic 'pmo\\x00' ver '1.0\\x00', 0x18-stride
-mesh table) into MeshGroups carrying full vertex/face geometry. GE-display-list
-walk (`run_ge`) is ported from tools/mhff/psp/pmo.py; the monster mesh-table walk
-mirrors `convert_mhfu_monster_meshes` there. See docs/PMO_MODEL_FORMAT.md.
+Decodes the MHFU/MHP2G *monster* PMO (magic 'pmo\\x00' ver '1.0\\x00') into
+MeshGroups carrying full vertex/face geometry. The GE-display-list walk (`run_ge`)
+is ported from tools/mhff/psp/pmo.py; the monster mesh-table walk mirrors
+`convert_mhfu_monster_meshes` there. See docs/PMO_MODEL_FORMAT.md.
 
-Monster geometry is rigid-skinned: vertex groups carry no per-vertex blend weights
-(`weights` will be absent/zero); each mesh group binds to one bone by draw order.
+Geometry is rigid- or 2-bone-blend-skinned (VTYPE may set weight bits — big
+monsters like Tigrex do; small monsters don't). Each mesh group binds to one bone
+by draw order.
 
-`encode()` is a lossless passthrough until the Phase 3 PMO encoder lands.
+Encoder (Phase 3): `encode()` returns the source bytes unchanged unless
+`model.edited` is set, in which case it re-encodes each group's vertex POSITIONS
+(and normals/UVs) back into the existing vertex buffers **in place** — preserving
+the VTYPE, indices, weights, colors, all header/mesh/material tables, and the file
+layout. This is byte-identical for an unedited model and correct for vertex moves
+(reshaping). It deliberately does NOT change topology (vertex/face counts): adding
+or removing geometry needs a from-scratch GE-list rebuild (the documented stretch),
+and is reported as an error rather than silently corrupting the file.
 """
 from __future__ import annotations
 
 import array
 import io
 import struct
-from typing import List
+from typing import List, Optional
 
 from .model import MeshGroup, Model
 
+# python struct char + byte size for a PSP component encoding
+_COMP = {"b": ("b", 1), "B": ("B", 1), "h": ("h", 2), "H": ("H", 2), "f": ("f", 4)}
+
 
 def run_ge(buf: io.BytesIO, scale):
-    """Walk one GE display list -> (vertices, faces). Ported from mhff pmo.py."""
+    """Walk one GE display list -> (vertices, faces, enc).
+
+    `enc` describes the (single) vertex buffer for in-place re-encoding, or carries
+    `plain=False` when the list isn't a simple single-VADDR group (then the encoder
+    leaves it untouched). Ported verbatim from mhff pmo.py with field-offset capture
+    added.
+    """
     file_address = buf.tell()
     index_offset = 0
     vertices: List[dict] = []
@@ -29,6 +46,10 @@ def run_ge(buf: io.BytesIO, scale):
     vertex_address = index_address = vertex_format = None
     position_trans = normal_trans = color_trans = texture_trans = weight_trans = None
     index_format = face_order = None
+    # in-place re-encode descriptor (positions/normals/uv field layout)
+    enc = {"plain": True, "vaddr": None, "vsize": None,
+           "pos": None, "nrm": None, "tex": None}
+    vaddr_count = 0
     while True:
         command = array.array("I", buf.read(4))[0]
         ct = command >> 24
@@ -38,6 +59,8 @@ def run_ge(buf: io.BytesIO, scale):
             if vertex_address is not None:
                 index_offset = len(vertices)
             vertex_address = file_address + (command & 0xffffff)
+            vaddr_count += 1
+            enc["vaddr"] = vertex_address
         elif ct == 0x02:                                 # IADDR
             index_address = file_address + (command & 0xffffff)
         elif ct == 0x04:                                 # PRIM
@@ -52,6 +75,7 @@ def run_ge(buf: io.BytesIO, scale):
                 index.fromfile(buf, index_count)
                 index_address = buf.tell()
             vertex_size = struct.calcsize(vertex_format)
+            enc["vsize"] = vertex_size
             for i in index:
                 buf.seek(vertex_address + vertex_size * i)
                 raw_vertex = list(struct.unpack(vertex_format, buf.read(vertex_size)))
@@ -92,33 +116,56 @@ def run_ge(buf: io.BytesIO, scale):
             pass
         elif ct == 0x12:                                 # VTYPE
             vertex_format = ""
+            # Field byte offsets must match the parser's NATIVE struct alignment
+            # (it unpacks `vertex_format` without a '<', so e.g. a `3h` position is
+            # padded to a 2-byte boundary). Track an aligned running offset.
+            off = 0
+
+            def _field(count, char):           # -> aligned start offset; advances off
+                nonlocal off
+                a = _COMP[char][1]             # native alignment == component size
+                start = (off + a - 1) & ~(a - 1)
+                off = start + count * _COMP[char][1]
+                return start
+
             weight = (command >> 9) & 3
             if weight != 0:
                 count = ((command >> 14) & 7) + 1
-                vertex_format += str(count) + (None, "B", "H", "f")[weight]
+                wc = (None, "B", "H", "f")[weight]
+                vertex_format += str(count) + wc
                 weight_trans = (None, 0x80, 0x8000, 1)[weight]
+                _field(count, wc)
             bypass_transform = (command >> 23) & 1
             texture = command & 3
             if texture != 0:
+                tc = (None, "B", "H", "f")[texture]
                 vertex_format += (None, "2B", "2H", "2f")[texture]
                 texture_trans = 1 if bypass_transform else (None, 0x80, 0x8000, 1)[texture]
+                enc["tex"] = (_field(2, tc), tc, texture_trans)
             color = (command >> 2) & 7
             if color != 0:
-                vertex_format += (None, None, None, None, "H", "H", "H", "I")[color]
+                cfmt = (None, None, None, None, "H", "H", "H", "I")[color]
+                vertex_format += cfmt
                 color_trans = (None, None, None, None,
                                "rgb565", "rgba5", "rgba4", "rgba8")[color]
+                _field(1, cfmt)
             normal = (command >> 5) & 3
             if normal != 0:
+                nc = (None, "b", "h", "f")[normal]
                 vertex_format += (None, "3b", "3h", "3f")[normal]
                 normal_trans = 1 if bypass_transform else (None, 0x7f, 0x7fff, 1)[normal]
+                enc["nrm"] = (_field(3, nc), nc, normal_trans)
             position = (command >> 7) & 3
             if position != 0:
                 if bypass_transform:
                     vertex_format += (None, "2bB", "2hH", "3f")[position]
                     position_trans = 1
+                    enc["plain"] = False     # bypass layout — leave it to passthrough
                 else:
+                    pc = (None, "b", "h", "f")[position]
                     vertex_format += (None, "3b", "3h", "3f")[position]
                     position_trans = (None, 0x7f, 0x7fff, 1)[position]
+                    enc["pos"] = (_field(3, pc), pc, position_trans)
             index_format = (None, "B", "H", "I")[(command >> 11) & 3]
             if (command >> 18) & 7 > 0:
                 raise ValueError("Can not handle morphing")
@@ -128,21 +175,18 @@ def run_ge(buf: io.BytesIO, scale):
             face_order = command & 1
         else:
             raise ValueError("Unknown GE command: 0x{:02X}".format(ct))
-    return vertices, faces
+    if vaddr_count != 1 or enc["pos"] is None:
+        enc["plain"] = False
+    enc["vcount"] = len(vertices)
+    return vertices, faces, enc
 
 
 def _walk(blob, header, scale, stride):
     """Walk the mesh table with a given record stride; return (groups, score).
 
-    Two MHFU PMO mesh-table strides exist:
-      * 0x20 (MH2/legacy, e.g. Tigrex): record '2f2I4H2I'; vg_count=mh[6],
-        vg_start=mh[7], material base index mh[5] (material at mat_tab +
-        (mh[5]+vg[0])*16).
-      * 0x18 (small-monster, e.g. file_06139): vg_count=u16@+0x10,
-        vg_start=u16@+0x12, no material base (material at mat_tab + vg[0]*16).
-    The vertex-group record ('2BH3I') and GE display list are common to both.
-    `score` = total decoded vertices; a layout that overruns returns (None, -1)
-    so the caller can pick the stride that actually fits this file.
+    Strides: 0x20 (legacy/MH2 — Tigrex & most big monsters: mat base mh[5],
+    vg_count mh[6], vg_start mh[7]) and 0x18 (small-mon: vg_count/start u16 @+0x10).
+    `score` = total decoded vertices; an overrun returns (None, -1).
     """
     fsz = len(blob)
     nmesh, mesh_tab, vg_tab, mat_tab, ge_base = (
@@ -175,13 +219,14 @@ def _walk(blob, header, scale, stride):
                 if ge >= fsz:
                     return None, -1
                 buf.seek(ge)
-                gv, gf = run_ge(buf, scale)
-                # one MeshGroup per vertex group = the rigid per-bone bind unit
-                groups.append(MeshGroup(
+                gv, gf, enc = run_ge(buf, scale)
+                g = MeshGroup(
                     index=draw, material=material, mesh_record=i,
                     vertex_count=len(gv), face_count=len(gf), scale=scale,
                     vertices=gv, faces=gf,
-                ))
+                )
+                g.enc = enc                       # private re-encode descriptor
+                groups.append(g)
                 total += len(gv)
                 draw += 1
     except (struct.error, ValueError, IndexError):
@@ -190,14 +235,11 @@ def _walk(blob, header, scale, stride):
 
 
 def parse(blob: bytes) -> Model:
-    """Decode a big-monster PMO into MeshGroups.
+    """Decode a big-monster PMO into MeshGroups (best-effort geometry).
 
-    The header struct lives at offset 8 (after the 8-byte 'pmo\\x00','1.0\\x00'
-    magic). The mesh-table stride varies per file (0x20 legacy vs 0x18 small-mon),
-    so both walks are attempted and the one that fully validates with the most
-    decoded geometry wins. Geometry decode is best-effort: if neither layout fits
-    (a non-monster or as-yet-unknown variant) `mesh_groups` is left empty rather
-    than raising, so the PAC round-trip (raw passthrough) is never blocked.
+    Header struct at offset 8 (`I4f2H8I`). Mesh-table stride varies (0x20/0x18) —
+    both walks are tried and the valid one with the most decoded geometry wins; the
+    winning stride is recorded on the model for the encoder.
     """
     type_, version = struct.unpack_from("4s4s", blob, 0)
     if type_ != b"pmo\x00":
@@ -206,17 +248,92 @@ def parse(blob: bytes) -> Model:
     if 8 + 0x38 > len(blob):
         return model
     header = struct.unpack_from("I4f2H8I", blob, 8)
-    scale = header[2:5]
-    best, best_score = None, 0
+    model.scale = tuple(header[2:5])
+    best, best_score, best_stride = None, 0, None
     for stride in (0x20, 0x18):
-        groups, score = _walk(blob, header, scale, stride)
+        groups, score = _walk(blob, header, model.scale, stride)
         if groups is not None and score > best_score:
-            best, best_score = groups, score
+            best, best_score, best_stride = groups, score, stride
     if best is not None:
         model.mesh_groups = best
+        model.stride = best_stride
     return model
 
 
+# --------------------------------------------------------------------------- #
+# Encoder
+# --------------------------------------------------------------------------- #
+def _quant(value, char):
+    """Quantize a float to one VTYPE component (clamped to its integer range)."""
+    if char == "f":
+        return float(value)
+    q = int(round(value))
+    lim = {"b": (-128, 127), "B": (0, 255),
+           "h": (-32768, 32767), "H": (0, 65535)}[char]
+    return max(lim[0], min(lim[1], q))
+
+
+def _rewrite_group(out: bytearray, g: MeshGroup, scale):
+    """Re-encode g's vertex positions/normals/UVs into `out` in place.
+
+    Returns True if rewritten, False if the group isn't in-place-encodable
+    (multi-VADDR / bypass layout — caller decides whether that's an error)."""
+    enc = getattr(g, "enc", None)
+    if not enc or not enc.get("plain"):
+        return False
+    vaddr, vsize = enc["vaddr"], enc["vsize"]
+    if vaddr is None or vsize is None:
+        return False
+    if len(g.vertices) != enc.get("vcount", len(g.vertices)):
+        raise ValueError(
+            "mesh group %d: vertex count changed (%d -> %d) — topology edits need a "
+            "GE-list rebuild (not yet supported); reshape with the same vertex count"
+            % (g.index, enc["vcount"], len(g.vertices)))
+    poff, pchar, ptrans = enc["pos"]
+    for slot, v in enumerate(g.vertices):
+        if v is None:
+            continue
+        base = vaddr + slot * vsize
+        rx = _quant(v["x"] / scale[0] * ptrans, pchar)
+        ry = _quant(v["y"] / scale[1] * ptrans, pchar)
+        rz = _quant(v["z"] / scale[2] * ptrans, pchar)
+        struct.pack_into("<3%s" % pchar, out, base + poff, rx, ry, rz)
+        if enc.get("nrm") and ("i" in v):
+            noff, nchar, ntrans = enc["nrm"]
+            struct.pack_into("<3%s" % nchar, out, base + noff,
+                             _quant(v["i"] * ntrans, nchar),
+                             _quant(v["j"] * ntrans, nchar),
+                             _quant(v["k"] * ntrans, nchar))
+        if enc.get("tex") and ("u" in v):
+            toff, tchar, ttrans = enc["tex"]
+            struct.pack_into("<2%s" % tchar, out, base + toff,
+                             _quant(v["u"] * ttrans, tchar),
+                             _quant(v["v"] * ttrans, tchar))
+    return True
+
+
 def encode(model: Model) -> bytes:
-    """Lossless passthrough (Phase 0). Phase 3 will rebuild the GE lists."""
-    return model.raw
+    """Serialize a PMO from the data model.
+
+    Unedited (`model.edited` false) -> the source bytes verbatim (byte-identical
+    round-trip). Edited -> re-encode every in-place-capable group's vertex data
+    into a copy of the source, preserving structure/weights/colors/indices/tables.
+    A group whose vertex count changed, or that can't be re-encoded in place while
+    edited, raises a clear error (topology rebuild is the documented Phase-3
+    stretch; the Blender exporter never edits geometry, so the safe path is the
+    default).
+    """
+    raw = model.raw or b""
+    if not getattr(model, "edited", False) or not raw:
+        return raw
+    scale = getattr(model, "scale", None) or (
+        model.mesh_groups[0].scale if model.mesh_groups else (1.0, 1.0, 1.0))
+    out = bytearray(raw)
+    for g in model.mesh_groups:
+        if not _rewrite_group(out, g, scale):
+            enc = getattr(g, "enc", None)
+            raise ValueError(
+                "mesh group %d cannot be re-encoded in place (%s); geometry edits "
+                "on this group need a GE-list rebuild (not yet supported)"
+                % (g.index, "no descriptor" if not enc else "multi-VADDR/bypass"))
+    return bytes(out)
