@@ -64,28 +64,41 @@ def inject_filename(file_id: int) -> str:
     return f"file_{file_id:05d}.bin"
 
 
-def write_inject_bytes(data: bytes, file_id: int, inject_dir: str | None = None) -> str:
-    """Atomically place `data` as the inject file for `file_id`. Returns the path.
-
-    Written to a temp name then `os.replace`d so the PRX (which polls size+mtime)
-    never observes a half-written file.
-    """
-    if inject_dir is None:
-        inject_dir = default_inject_dir()
-    os.makedirs(inject_dir, exist_ok=True)
-    dst = os.path.join(inject_dir, inject_filename(file_id))
+def _atomic_write(dst: str, data: bytes) -> None:
     tmp = dst + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, dst)
+
+
+def write_inject_bytes(data: bytes, file_id: int, inject_dir: str | None = None,
+                       orig: bytes | None = None) -> str:
+    """Atomically place `data` as the inject file for `file_id`. Returns the path.
+
+    Written to a temp name then `os.replace`d so the PRX (which polls size+mtime)
+    never observes a half-written file. If `orig` is given (the pristine, unedited
+    PAC = exactly what the engine loads), it is written alongside as
+    `file_<id>.bin.orig` — the PRX content-matches the in-RAM buffer against it
+    before overwriting, so only the intended species is touched.
+    """
+    if inject_dir is None:
+        inject_dir = default_inject_dir()
+    os.makedirs(inject_dir, exist_ok=True)
+    dst = os.path.join(inject_dir, inject_filename(file_id))
+    if orig is not None:
+        _atomic_write(dst + ".orig", orig)   # write .orig first so it's ready
+    _atomic_write(dst, data)
     return dst
 
 
 def emit_model(mm, file_id: int | None = None, inject_dir: str | None = None,
-               validate: bool = True, species=None) -> str:
+               validate: bool = True, species=None, orig: bytes | None = None) -> str:
     """Validate (optional) -> repack a MonsterModel -> write the inject file.
+
+    `orig` = the pristine original PAC bytes (what the engine loads); written as
+    a `.orig` sibling for the PRX's content-match gate. Strongly recommended.
 
     Raises ValueError with the validator report if the edit is engine-invalid,
     so a modder can never push an asset the game can't represent.
@@ -100,7 +113,7 @@ def emit_model(mm, file_id: int | None = None, inject_dir: str | None = None,
             raise ValueError("injection blocked — edit is engine-invalid:\n" + str(rep))
     if file_id is None:
         raise ValueError("file_id is required for emit_model")
-    return write_inject_bytes(repack(mm), file_id, inject_dir)
+    return write_inject_bytes(repack(mm), file_id, inject_dir, orig=orig)
 
 
 def _main(argv=None) -> int:
@@ -114,10 +127,15 @@ def _main(argv=None) -> int:
                     help="skip the constraint validator (not recommended)")
     ap.add_argument("--species", default=None,
                     help="species template name or reference PAC for validation")
+    ap.add_argument("--orig", default=None,
+                    help="pristine original PAC (for the PRX .orig content-match gate); "
+                         "default: the input PAC's own bytes (identity smoke test)")
     args = ap.parse_args(argv)
 
     from . import load_pac
     fid = args.file_id if args.file_id is not None else file_id_from_name(args.pac)
+    with open(args.orig if args.orig else args.pac, "rb") as f:
+        orig_bytes = f.read()
     mm = load_pac(args.pac)
 
     species = args.species
@@ -129,13 +147,14 @@ def _main(argv=None) -> int:
 
     try:
         path = emit_model(mm, file_id=fid, inject_dir=args.dir,
-                          validate=not args.no_validate, species=species)
+                          validate=not args.no_validate, species=species,
+                          orig=orig_bytes)
     except ValueError as e:
         print(e, file=sys.stderr)
         return 2
-    print(f"injected file {fid} -> {path}")
-    print("PRX picks it up within ~0.5s; anim updates live, skeleton/geom on "
-          "next section re-entry.")
+    print(f"injected file {fid} -> {path}  (+ {path}.orig)")
+    print("PRX overwrites the raw buffer on the next COLD BOOT + section load; "
+          "watch framework.log for '[inject] OVERWROTE raw buffer'.")
     return 0
 
 
