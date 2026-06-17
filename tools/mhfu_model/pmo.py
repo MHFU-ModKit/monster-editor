@@ -192,11 +192,12 @@ def _walk(blob, header, scale, stride):
     nmesh, mesh_tab, vg_tab, mat_tab, ge_base = (
         header[5], header[7], header[8], header[11], header[12])
     if mesh_tab + nmesh * stride > fsz:
-        return None, -1
+        return None, -1, set()
     buf = io.BytesIO(blob)
     groups: List[MeshGroup] = []
     total = 0
     draw = 0                       # global vertex-group draw order == bind index
+    seen_vg = set()                # vgroup indices the mesh table referenced
     try:
         for i in range(nmesh):
             m = mesh_tab + i * stride
@@ -207,9 +208,10 @@ def _walk(blob, header, scale, stride):
                 vg_count, vg_start = struct.unpack_from("2H", blob, m + 0x10)
                 mat_base = 0
             for j in range(vg_count):
-                vo = vg_tab + (vg_start + j) * 0x10
+                vgi = vg_start + j
+                vo = vg_tab + vgi * 0x10
                 if vo + 0x10 > fsz:
-                    return None, -1
+                    return None, -1, set()
                 vg = struct.unpack_from("2BH3I", blob, vo)
                 material = 0
                 mo = mat_tab + (mat_base + vg[0]) * 16
@@ -217,7 +219,7 @@ def _walk(blob, header, scale, stride):
                     material = struct.unpack_from("4I", blob, mo)[2]
                 ge = ge_base + vg[3]
                 if ge >= fsz:
-                    return None, -1
+                    return None, -1, set()
                 buf.seek(ge)
                 gv, gf, enc = run_ge(buf, scale)
                 g = MeshGroup(
@@ -229,9 +231,56 @@ def _walk(blob, header, scale, stride):
                 groups.append(g)
                 total += len(gv)
                 draw += 1
+                seen_vg.add(vgi)
     except (struct.error, ValueError, IndexError):
-        return None, -1
-    return groups, total
+        return None, -1, set()
+    return groups, total, seen_vg
+
+
+def _append_unreferenced_vgroups(blob, header, scale, groups, seen_vg):
+    """Some big-monster PMOs (e.g. the native-quest Tigrex file_06185) split their
+    geometry into TWO mesh sets: header[5] meshes index only a SUBSET of the vgroup
+    table (the extremities), while the body lives in vgroups the header[5] table
+    never references (a 2nd set described by header[6] + tables at header[9]/[10]).
+    The full vgroup table spans [header[8], header[9]); enumerate it directly and
+    append any vgroup the mesh-table walk missed, so the WHOLE model decodes.
+    Geometry-complete + round-trip-safe (each appended group carries its own enc);
+    material is best-effort (the vgroup's own material byte via mat_tab)."""
+    fsz = len(blob)
+    vg_tab, t9, mat_tab, ge_base = header[8], header[9], header[11], header[12]
+    if not (vg_tab < t9 <= fsz):
+        return groups
+    nvg = (t9 - vg_tab) // 0x10
+    buf = io.BytesIO(blob)
+    draw = max((g.index for g in groups), default=-1) + 1
+    for vgi in range(nvg):
+        if vgi in seen_vg:
+            continue
+        vo = vg_tab + vgi * 0x10
+        if vo + 0x10 > fsz:
+            break
+        try:
+            vg = struct.unpack_from("2BH3I", blob, vo)
+            ge = ge_base + vg[3]
+            if not (ge_base <= ge < fsz):
+                continue
+            buf.seek(ge)
+            gv, gf, enc = run_ge(buf, scale)
+        except (struct.error, ValueError, IndexError):
+            continue
+        if not gv:
+            continue
+        material = 0
+        mo = mat_tab + vg[0] * 16
+        if mo + 16 <= fsz:
+            material = struct.unpack_from("4I", blob, mo)[2]
+        g = MeshGroup(index=draw, material=material, mesh_record=-1,
+                      vertex_count=len(gv), face_count=len(gf), scale=scale,
+                      vertices=gv, faces=gf)
+        g.enc = enc
+        groups.append(g)
+        draw += 1
+    return groups
 
 
 def parse(blob: bytes) -> Model:
@@ -249,12 +298,15 @@ def parse(blob: bytes) -> Model:
         return model
     header = struct.unpack_from("I4f2H8I", blob, 8)
     model.scale = tuple(header[2:5])
-    best, best_score, best_stride = None, 0, None
+    best, best_score, best_stride, best_seen = None, 0, None, set()
     for stride in (0x20, 0x18):
-        groups, score = _walk(blob, header, model.scale, stride)
+        groups, score, seen = _walk(blob, header, model.scale, stride)
         if groups is not None and score > best_score:
-            best, best_score, best_stride = groups, score, stride
+            best, best_score, best_stride, best_seen = groups, score, stride, seen
     if best is not None:
+        # recover any 2nd-set vgroups the mesh table didn't reference (split-mesh
+        # monsters like file_06185 — see _append_unreferenced_vgroups).
+        best = _append_unreferenced_vgroups(blob, header, model.scale, best, best_seen)
         model.mesh_groups = best
         model.stride = best_stride
     return model
