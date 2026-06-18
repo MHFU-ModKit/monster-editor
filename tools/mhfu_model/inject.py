@@ -64,6 +64,11 @@ def inject_filename(file_id: int) -> str:
     return f"file_{file_id:05d}.bin"
 
 
+def relocate_filename(file_id: int) -> str:
+    """The grown-PAC name the relocate driver (mhfu.inject_relocate) loads into xram."""
+    return f"file_{file_id:05d}_grown.bin"
+
+
 def _atomic_write(dst: str, data: bytes) -> None:
     tmp = dst + ".tmp"
     with open(tmp, "wb") as f:
@@ -90,6 +95,26 @@ def write_inject_bytes(data: bytes, file_id: int, inject_dir: str | None = None,
     if orig is not None:
         _atomic_write(dst + ".orig", orig)   # write .orig first so it's ready
     _atomic_write(dst, data)
+    return dst
+
+
+def write_relocate_bytes(grown: bytes, file_id: int, inject_dir: str | None = None,
+                         orig: bytes | None = None) -> str:
+    """Place a GROWN (bigger-than-source) PAC for the relocate-source live path.
+
+    A grown PAC can't overwrite the engine's fixed raw buffer in place, so it is
+    delivered via the relocate path: the PRX (`mhfu.inject_relocate`) loads it into
+    extra RAM and rewrites `get_subresource`'s package pointer to it. Writes
+    `file_<id>_grown.bin` (the grown PAC) and `file_<id>.bin.orig` (the pristine
+    source the PRX matches the live raw buffer against). Returns the grown path.
+    """
+    if inject_dir is None:
+        inject_dir = default_inject_dir()
+    os.makedirs(inject_dir, exist_ok=True)
+    if orig is not None:
+        _atomic_write(os.path.join(inject_dir, inject_filename(file_id) + ".orig"), orig)
+    dst = os.path.join(inject_dir, relocate_filename(file_id))
+    _atomic_write(dst, grown)
     return dst
 
 

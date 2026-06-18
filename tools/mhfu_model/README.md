@@ -24,16 +24,32 @@ See `specs/002-model-anim-pipeline/tasks.md` and `docs/ANIMATION_FORMAT.md`.
   (`examples/edit_anim_demo.py`).
 - **`pmo_topology.py` — topology-GROW encoder (Phase 5, kept separate from `pmo.py`).**
   Byte-level rebuild of the PMO `geBase` GE-list region to ADD vertices/faces within an
-  existing vertex group (inherits its bone/material/VTYPE). `parse` / `grow_group(g, n,
-  shift, spread)` / `serialize` re-lay the region 16-byte-aligned, patch each list's
+  existing vertex group (inherits its bone/material/VTYPE). `parse` / `grow_group` /
+  `grow_group_explicit` / `serialize` re-lay the region 16-byte-aligned, patch each list's
   VADDR/IADDR + each vgroup record's I3/I4/I5, bump header size; everything before `geBase`
-  stays byte-identical. 8-bit-index 256-vert/group cap. CLI: `python -m
-  mhfu_model.pmo_topology in.bin out.bin -n <verts> --spread <r>` (**spread>0 required** —
-  a uniform shift makes degenerate, invisible triangles). New verts copy vertex0's
-  UV/normal/weights for now (polish TODO). Tested in `tests/test_pmo_topology.py`.
+  stays byte-identical. CLIs:
+  - `python -m mhfu_model.pmo_topology in.bin out.bin -n <verts> --spread <r>` — synthetic
+    ring/fan grow (**spread>0 required** — a uniform shift makes degenerate, invisible
+    triangles). `--bone <i>` / `-g <vgroup>` choose the target group (bind index ==
+    vgroup draw order); `--weight-slot <s>` picks the bone-palette slot the new verts bind
+    100% to; `--force-16bit`; `--list` prints the vgroup→bone table.
+  - `grow_group_explicit(g, verts, tris, …)` — author-supplied verts+faces (the Blender
+    path): positions/UV/normals written ABSOLUTE from the caller.
+  **Polish DONE (offline-verified):** new verts now get **real per-vertex attributes** —
+  varied UVs (circular texture patch → textured, not the old one-texel dark look), outward
+  normals (catch light), and a **clean single-bone weight** (1.0 on `weight_slot`, default
+  the group's primary bone) instead of copying vertex0. **16-bit-index auto-promote**: an
+  8-bit group crossing 256 verts promotes its VTYPE index field (`B`→`H`), raising the cap
+  to 65536. Positions are bounded by the group's per-axis header scale (existing verts are
+  stored as fractions of `scale`, so coords past the bounding box saturate). Tested in
+  `tests/test_pmo_topology.py` (50-PMO geometry-preserving round-trip + grow + auto-promote
+  + explicit-attrs + hard cap).
 - Phase 4 = live in-RAM inject (reshape, same size) · Phase 5 = ADD geometry, delivered
   live via the relocate-source path (`framework/prx` `mhfu.inject_relocate` → a grown PAC
-  in xram); **PROVEN in-game 2026-06-18** (added geometry renders, no disk edits).
+  in xram). Synthetic-grow geometry **PROVEN in-game 2026-06-18**. The polished
+  attributes + 16-bit + the **Blender-authored** add path (extra verts in an existing mesh
+  → `pmo_topology`) are offline-verified; **live render re-confirmation pending** a HITL
+  cold-boot.
 
 ## Quick use
 

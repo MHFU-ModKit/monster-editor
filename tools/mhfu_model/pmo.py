@@ -225,7 +225,7 @@ def _walk(blob, header, scale, stride):
                 g = MeshGroup(
                     index=draw, material=material, mesh_record=i,
                     vertex_count=len(gv), face_count=len(gf), scale=scale,
-                    vertices=gv, faces=gf,
+                    vertices=gv, faces=gf, vg_rec=vgi,
                 )
                 g.enc = enc                       # private re-encode descriptor
                 groups.append(g)
@@ -276,7 +276,7 @@ def _append_unreferenced_vgroups(blob, header, scale, groups, seen_vg):
             material = struct.unpack_from("4I", blob, mo)[2]
         g = MeshGroup(index=draw, material=material, mesh_record=-1,
                       vertex_count=len(gv), face_count=len(gf), scale=scale,
-                      vertices=gv, faces=gf)
+                      vertices=gv, faces=gf, vg_rec=vgi)
         g.enc = enc
         groups.append(g)
         draw += 1

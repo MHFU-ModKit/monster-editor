@@ -124,6 +124,8 @@ class MeshGroup:
     vertices: List[dict] = field(default_factory=list)
     faces: List[dict] = field(default_factory=list)
     enc: Optional[dict] = None  # private PMO re-encode descriptor (vertex buffer layout)
+    vg_rec: int = -1            # source vgroup-table index (== pmo_topology rec_index);
+    #                            draw order != table index for split-mesh monsters
 
 
 @dataclass
@@ -135,6 +137,11 @@ class Model:
     scale: Vec3 = (1.0, 1.0, 1.0)      # header global scale (encoder re-quantizes with it)
     stride: int = 0                    # winning mesh-table stride (0x20/0x18)
     edited: bool = False               # set by an editor -> encode() re-emits vertex data
+    # ADDED geometry pending a topology grow (the Blender add path); each entry =
+    # {"vg_rec": int, "verts": [ {x,y,z,i,j,k,u,v} ], "tris": [(a,b,c)] }. The
+    # in-place pmo.encode ignores this; the exporter applies it via pmo_topology
+    # AFTER repack (a separate, size-changing pass).
+    additions: List[dict] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #

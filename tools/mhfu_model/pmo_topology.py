@@ -59,12 +59,28 @@ class VType:
     pos_off: int                       # byte offset of position within a vertex
     pos_char: str                      # 'b'/'h'/'f'
     bypass: bool                       # through-mode position layout (2bB/2hH/3f)
+    pos_trans: float = 1.0             # model-unit -> stored quantum (0x7f / 0x7fff / 1)
+    # texture (UV), normal and weight field locations — captured so grown verts get
+    # real values (not a copy of vertex0). None when the field is absent in this VTYPE.
+    uv_off: Optional[int] = None
+    uv_char: Optional[str] = None      # 'B'/'H'/'f'
+    uv_trans: float = 1.0
+    nrm_off: Optional[int] = None
+    nrm_char: Optional[str] = None     # 'b'/'h'/'f'
+    nrm_trans: float = 1.0
+    wt_off: Optional[int] = None
+    wt_char: Optional[str] = None      # 'B'/'H'/'f'
+    wt_count: int = 0                  # number of weight (bone-palette) components
+    wt_trans: float = 1.0
 
 
 def decode_vtype(word: int) -> VType:
-    """Decode a GE VTYPE (0x12) arg into vertex size + position field location.
+    """Decode a GE VTYPE (0x12) arg into vertex size + the field locations the grow
+    path writes (position, UV, normal, weights).
 
-    Mirrors the field walk in pmo.run_ge (native struct alignment, no '<')."""
+    Mirrors the field walk + quantization scalars in pmo.run_ge (native struct
+    alignment, no '<'). Field order in a vertex: weight, texture(UV), color, normal,
+    position."""
     off = 0
 
     def field(count: int, char: str) -> int:
@@ -74,37 +90,57 @@ def decode_vtype(word: int) -> VType:
         off = start + count * _COMP_SIZE[char]
         return start
 
-    weight = (word >> 9) & 3
-    if weight:
-        cnt = ((word >> 14) & 7) + 1
-        field(cnt, (None, "B", "H", "f")[weight])
     bypass = bool((word >> 23) & 1)
+    weight = (word >> 9) & 3
+    wt_off = wt_char = None
+    wt_count = 0
+    wt_trans = 1.0
+    if weight:
+        wt_count = ((word >> 14) & 7) + 1
+        wt_char = (None, "B", "H", "f")[weight]
+        wt_trans = (None, 0x80, 0x8000, 1)[weight]
+        wt_off = field(wt_count, wt_char)
     texture = word & 3
+    uv_off = uv_char = None
+    uv_trans = 1.0
     if texture:
-        field(2, (None, "B", "H", "f")[texture])
+        uv_char = (None, "B", "H", "f")[texture]
+        uv_trans = 1 if bypass else (None, 0x80, 0x8000, 1)[texture]
+        uv_off = field(2, uv_char)
     color = (word >> 2) & 7
     if color:
         field(1, (None, None, None, None, "H", "H", "H", "I")[color])
     normal = (word >> 5) & 3
+    nrm_off = nrm_char = None
+    nrm_trans = 1.0
     if normal:
-        field(3, (None, "b", "h", "f")[normal])
+        nrm_char = (None, "b", "h", "f")[normal]
+        nrm_trans = 1 if bypass else (None, 0x7f, 0x7fff, 1)[normal]
+        nrm_off = field(3, nrm_char)
     position = (word >> 7) & 3
     pos_off = pos_char = None
+    pos_trans = 1.0
     if position:
         if bypass:
             # 2bB / 2hH / 3f — position spans 3 components; first is the aligned start
             pchar = (None, "b", "h", "f")[position]
             pos_off = field(3, pchar) if position == 3 else _through_pos(off, position)
             pos_char = pchar
+            pos_trans = 1
         else:
             pchar = (None, "b", "h", "f")[position]
             pos_off = field(3, pchar)
             pos_char = pchar
+            pos_trans = (None, 0x7f, 0x7fff, 1)[position]
     if (word >> 18) & 7:
         raise ValueError("morph not supported")
     index_char = (None, "B", "H", "I")[(word >> 11) & 3]
     vsize = struct.calcsize(_vertex_struct(word))
-    return VType(word, vsize, index_char, pos_off or 0, pos_char or "b", bypass)
+    return VType(word, vsize, index_char, pos_off or 0, pos_char or "b", bypass,
+                 pos_trans=pos_trans,
+                 uv_off=uv_off, uv_char=uv_char, uv_trans=uv_trans,
+                 nrm_off=nrm_off, nrm_char=nrm_char, nrm_trans=nrm_trans,
+                 wt_off=wt_off, wt_char=wt_char, wt_count=wt_count, wt_trans=wt_trans)
 
 
 def _through_pos(off, position):
@@ -150,6 +186,7 @@ class VGroup:
     words: List[int]                   # GE command words (incl trailing RET)
     vaddr_widx: int                    # index of the VADDR (0x01) word
     iaddr_widx: Optional[int]          # index of the IADDR (0x02) word
+    vtype_widx: Optional[int]          # index of the VTYPE (0x12) word (for promote)
     prims: List[Tuple[int, int, int]]  # (word_index, prim_type, index_count)
     vtype: VType
     vbuf: bytearray                    # raw vertex bytes
@@ -165,7 +202,7 @@ def _parse_ge_list(blob: bytes, ge_start: int):
     """Parse one GE list -> (words, vaddr_widx, iaddr_widx, prims, vtype, vaddr_rel,
     iaddr_rel). prims = list of (word_index, prim_type, index_count)."""
     words: List[int] = []
-    vaddr_widx = iaddr_widx = None
+    vaddr_widx = iaddr_widx = vtype_widx = None
     vaddr_rel = iaddr_rel = None
     prims: List[Tuple[int, int, int]] = []
     vtype = None
@@ -186,12 +223,13 @@ def _parse_ge_list(blob: bytes, ge_start: int):
             prims.append((widx, (cmd >> 16) & 7, cmd & 0xFFFF))
         elif op == 0x12:               # VTYPE
             vtype = decode_vtype(arg)
+            vtype_widx = widx
         elif op == 0x0B:               # RET
             break
         p += 4
         if p - ge_start > 0x4000:
             raise ValueError("GE list runaway at 0x%X" % ge_start)
-    return words, vaddr_widx, iaddr_widx, prims, vtype, vaddr_rel, iaddr_rel
+    return words, vaddr_widx, iaddr_widx, vtype_widx, prims, vtype, vaddr_rel, iaddr_rel
 
 
 def parse(blob: bytes):
@@ -209,12 +247,13 @@ def parse(blob: bytes):
         geoff, vbuf_rel, ibuf_rel = rec[3], rec[4], rec[5]
         if geoff in by_geoff:
             g = VGroup(rec_index=i, rec=rec, geoff=geoff, words=[], vaddr_widx=0,
-                       iaddr_widx=None, prims=[], vtype=by_geoff[geoff].vtype,
+                       iaddr_widx=None, vtype_widx=None, prims=[],
+                       vtype=by_geoff[geoff].vtype,
                        vbuf=bytearray(), indices=[], shared_with=by_geoff[geoff].rec_index)
             groups.append(g)
             continue
         ge_start = ge_base + geoff
-        words, va, ia, prims, vt, va_rel, ia_rel = _parse_ge_list(blob, ge_start)
+        words, va, ia, vtw, prims, vt, va_rel, ia_rel = _parse_ge_list(blob, ge_start)
         if vt is None or va is None:
             raise ValueError("vgroup %d: no VTYPE/VADDR" % i)
         # index list: PRIMs read sequentially from the index buffer
@@ -228,7 +267,8 @@ def parse(blob: bytes):
         ncount = (max(indices) + 1) if indices else 0
         vbuf = bytearray(blob[ge_base + vbuf_rel: ge_base + vbuf_rel + ncount * vt.vsize])
         g = VGroup(rec_index=i, rec=rec, geoff=geoff, words=words, vaddr_widx=va,
-                   iaddr_widx=ia, prims=prims, vtype=vt, vbuf=vbuf, indices=indices)
+                   iaddr_widx=ia, vtype_widx=vtw, prims=prims, vtype=vt, vbuf=vbuf,
+                   indices=indices)
         by_geoff[geoff] = g
         groups.append(g)
     return header, groups
@@ -237,62 +277,118 @@ def parse(blob: bytes):
 # --------------------------------------------------------------------------- #
 # Grow operation
 # --------------------------------------------------------------------------- #
-def grow_group(g: VGroup, n_new: int, shift=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0),
-               src_vertex: int = 0, spread: float = 0.0):
-    """Append `n_new` vertices to group g (copied from `src_vertex`, position-shifted
-    by `shift` in MODEL units), and one triangle-list PRIM fanning them into
-    (n_new-2) triangles. Inherits VTYPE/weights/material. 8-bit-index safe (raises
-    past 256). The list's PRIM count + vbuf + indices are updated; final re-layout is
-    done in serialize().
+_LIM = {"b": (-128, 127), "B": (0, 255), "h": (-32768, 32767),
+        "H": (0, 65535), "f": (None, None)}
 
-    `spread` (MODEL units, >0): scatter the new verts on a ring of this radius around
-    `shift` (varying X/Z, alternating Y) so the fan triangles have AREA and are
-    visible — a uniform shift makes degenerate zero-area triangles that never render.
-    """
+
+def _pack_comps(v: bytearray, off: int, char: str, values):
+    """Quantize-clamp `values` (already in stored units) and pack at `off`."""
+    if char == "f":
+        struct.pack_into("<%df" % len(values), v, off, *(float(x) for x in values))
+        return
+    lo, hi = _LIM[char]
+    raw = [max(lo, min(hi, int(round(x)))) for x in values]
+    struct.pack_into("<%d%s" % (len(values), char), v, off, *raw)
+
+
+def promote_to_16bit(g: VGroup):
+    """Promote a group from 8-bit (`B`) to 16-bit (`H`) vertex indices so it can hold
+    >256 verts. Patches the VTYPE word's index field (bits 11-12: 1->2); the vertex
+    struct size is unchanged (index format is not part of a vertex). Shared groups
+    reuse the owner's GE words + vtype object, so this propagates to them."""
+    if g.vtype.index_char == "H":
+        return
+    if g.vtype.index_char != "B":
+        raise ValueError("group %d index fmt %r: only B->H promote supported"
+                         % (g.rec_index, g.vtype.index_char))
+    if g.vtype_widx is None:
+        raise ValueError("group %d has no own VTYPE word (shared?); promote the owner"
+                         % g.rec_index)
+    w = g.words[g.vtype_widx]
+    w = (w & ~(3 << 11)) | (2 << 11)
+    g.words[g.vtype_widx] = w
+    g.vtype.word = w
+    g.vtype.index_char = "H"
+
+
+def grow_group(g: VGroup, n_new: int, shift=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0),
+               src_vertex: int = 0, spread: float = 0.0, weight_slot: int = 0,
+               force_16bit: bool = False):
+    """Append `n_new` vertices to group g and one triangle-list PRIM fanning them into
+    (n_new-2) triangles. New verts inherit the group's VTYPE/material but get REAL
+    per-vertex attributes (not a copy of vertex0):
+
+      * position: `src_vertex`'s position + (`shift` + a `spread`-radius ring), MODEL
+        units — `spread`>0 gives the fan triangles AREA (a uniform shift makes
+        degenerate, invisible triangles);
+      * UV: a circular patch in texture space (so the surface samples real texels, not
+        one — fixes the dark/untextured look);
+      * normal: the outward ring direction (so the dome catches light correctly);
+      * bone weights: a CLEAN bind — 1.0 on palette slot `weight_slot` (the group's
+        primary bone by default), 0 elsewhere — instead of vertex0's arbitrary blend.
+
+    Index width: 8-bit groups auto-promote to 16-bit past 256 verts (or when
+    `force_16bit`); cap is then 65536. Final re-layout is done in serialize()."""
     if g.shared_with is not None:
         raise ValueError("group %d shares a GE block; grow the owner" % g.rec_index)
-    if g.vtype.index_char != "B":
-        raise ValueError("group %d index fmt != 8-bit (got %r); 16-bit promote TODO"
-                         % (g.rec_index, g.vtype.index_char))
+    if g.vtype.index_char not in ("B", "H"):
+        raise ValueError("group %d index fmt %r unsupported" % (g.rec_index,
+                                                                g.vtype.index_char))
     if n_new < 3:
         raise ValueError("need >=3 new verts for a triangle")
-    import math
-    vt = g.vtype
-    base = g.vcount
-    if base + n_new > 256:
-        raise ValueError("group %d would exceed 256 verts (8-bit index cap): %d+%d"
-                         % (g.rec_index, base, n_new))
     if not g.vbuf:
         raise ValueError("group %d has no vertex buffer" % g.rec_index)
+    import math
+    base = g.vcount
+    # index-width / cap handling
+    if force_16bit:
+        promote_to_16bit(g)
+    if base + n_new > 256 and g.vtype.index_char == "B":
+        promote_to_16bit(g)
+    cap = 256 if g.vtype.index_char == "B" else 65536
+    if base + n_new > cap:
+        raise ValueError("group %d would exceed %d verts (index cap): %d+%d"
+                         % (g.rec_index, cap, base, n_new))
+    vt = g.vtype
     src = bytes(g.vbuf[src_vertex * vt.vsize:(src_vertex + 1) * vt.vsize])
-
-    def q(model_units, axis):
-        if not vt.bypass and vt.pos_char in ("b", "h"):
-            ptrans = {"b": 0x7f, "h": 0x7fff}[vt.pos_char]
-            return int(round(model_units / scale[axis] * ptrans))
-        return int(round(model_units))
-
-    lim = {"b": (-128, 127), "h": (-32768, 32767), "f": (None, None)}[vt.pos_char]
     sx, sy, sz = shift
+
+    def qpos(model_units, axis):
+        # store = model_units / scale * pos_trans (matches pmo.run_ge inverse)
+        if not vt.bypass and vt.pos_char in ("b", "h"):
+            return model_units / scale[axis] * vt.pos_trans
+        return model_units
+
     for k in range(n_new):
         v = bytearray(src)
         if spread > 0.0:
             ang = (2.0 * math.pi * k) / max(1, n_new)
-            ox = sx + spread * math.cos(ang)
-            oz = sz + spread * math.sin(ang)
-            oy = sy + (spread * 0.5 if (k & 1) else -spread * 0.5)
+            dx, dy, dz = math.cos(ang), (0.5 if (k & 1) else -0.5), math.sin(ang)
+            ox, oy, oz = sx + spread * dx, sy + spread * dy, sz + spread * dz
         else:
+            dx, dy, dz = 0.0, 0.0, 0.0
             ox, oy, oz = sx, sy, sz
-        dq = (q(ox, 0), q(oy, 1), q(oz, 2))
+        # position (additive to src vertex)
         if vt.pos_char in ("b", "h", "f"):
             cur = list(struct.unpack_from("<3%s" % vt.pos_char, v, vt.pos_off))
-            nv = []
-            for c, d in zip(cur, dq):
-                x = c + d
-                if lim[0] is not None:
-                    x = max(lim[0], min(lim[1], x))
-                nv.append(x)
-            struct.pack_into("<3%s" % vt.pos_char, v, vt.pos_off, *nv)
+            dq = (qpos(ox, 0), qpos(oy, 1), qpos(oz, 2))
+            _pack_comps(v, vt.pos_off, vt.pos_char, [c + d for c, d in zip(cur, dq)])
+        # normal = outward ring direction (absolute)
+        if vt.nrm_off is not None:
+            nl = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+            nrm = [dx / nl * vt.nrm_trans, dy / nl * vt.nrm_trans, dz / nl * vt.nrm_trans]
+            _pack_comps(v, vt.nrm_off, vt.nrm_char, nrm)
+        # UV = circular patch in texture space (absolute)
+        if vt.uv_off is not None:
+            u = (0.5 + 0.5 * math.cos((2.0 * math.pi * k) / max(1, n_new)))
+            wv = (0.5 + 0.5 * math.sin((2.0 * math.pi * k) / max(1, n_new)))
+            _pack_comps(v, vt.uv_off, vt.uv_char, [u * vt.uv_trans, wv * vt.uv_trans])
+        # weights = clean single-bone bind on slot `weight_slot`
+        if vt.wt_off is not None and vt.wt_count:
+            slot = max(0, min(vt.wt_count - 1, weight_slot))
+            ws = [0.0] * vt.wt_count
+            ws[slot] = 1.0 * vt.wt_trans
+            _pack_comps(v, vt.wt_off, vt.wt_char, ws)
         g.vbuf.extend(v)
     # triangle fan over the new verts -> (n_new-2) triangles
     new_idx = list(range(base, base + n_new))
@@ -305,6 +401,83 @@ def grow_group(g: VGroup, n_new: int, shift=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.
     prim_word = 0x04000000 | (3 << 16) | (len(tri) & 0xFFFF)
     g.words.insert(ret_widx, prim_word)
     g.prims.append((ret_widx, 3, len(tri)))
+
+
+def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
+                        weight_slot: int = 0, force_16bit: bool = False):
+    """Append author-supplied vertices + triangles to group g (the Blender path).
+
+    `verts`  : list of dicts {x,y,z[, i,j,k normal][, u,v]} in ENGINE units / unit
+               normals / [0,1] UV (== the importer's decoded fields, inverse-converted
+               by the exporter).
+    `tris`   : list of (a,b,c) triangle vertex indices in the group's FULL index space
+               (existing verts keep indices [0,vcount); new verts get [vcount, ...) in
+               `verts` order — so a Blender face may reference old AND new verts).
+
+    Unlike grow_group (synthetic ring), positions/normals/UVs are written ABSOLUTE
+    from `verts`. Color/other inherited fields come from vertex0. Auto-promotes to
+    16-bit indices past 256 verts. Adds ONE triangle-list PRIM for the new faces."""
+    if g.shared_with is not None:
+        raise ValueError("group %d shares a GE block; grow the owner" % g.rec_index)
+    if g.vtype.index_char not in ("B", "H"):
+        raise ValueError("group %d index fmt %r unsupported" % (g.rec_index,
+                                                                g.vtype.index_char))
+    if not g.vbuf:
+        raise ValueError("group %d has no vertex buffer" % g.rec_index)
+    n_new = len(verts)
+    if n_new < 1 or not tris:
+        raise ValueError("need >=1 new vert and >=1 triangle")
+    vt = g.vtype
+    base = g.vcount
+    total = base + n_new
+    if force_16bit:
+        promote_to_16bit(g)
+    if total > 256 and g.vtype.index_char == "B":
+        promote_to_16bit(g)
+    cap = 256 if g.vtype.index_char == "B" else 65536
+    if total > cap:
+        raise ValueError("group %d would exceed %d verts (index cap): %d+%d"
+                         % (g.rec_index, cap, base, n_new))
+    maxidx = max(i for t in tris for i in t)
+    if maxidx >= total:
+        raise ValueError("triangle index %d out of range (have %d verts)"
+                         % (maxidx, total))
+    src = bytes(g.vbuf[0:vt.vsize])
+
+    def qpos(engine_units, axis):
+        if not vt.bypass and vt.pos_char in ("b", "h"):
+            return engine_units / scale[axis] * vt.pos_trans
+        return engine_units
+
+    for vd in verts:
+        v = bytearray(src)
+        if vt.pos_char in ("b", "h", "f"):
+            _pack_comps(v, vt.pos_off, vt.pos_char,
+                        [qpos(vd["x"], 0), qpos(vd["y"], 1), qpos(vd["z"], 2)])
+        if vt.nrm_off is not None and "i" in vd:
+            import math
+            nx, ny, nz = vd["i"], vd["j"], vd["k"]
+            nl = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+            _pack_comps(v, vt.nrm_off, vt.nrm_char,
+                        [nx / nl * vt.nrm_trans, ny / nl * vt.nrm_trans,
+                         nz / nl * vt.nrm_trans])
+        if vt.uv_off is not None and "u" in vd:
+            _pack_comps(v, vt.uv_off, vt.uv_char,
+                        [vd["u"] * vt.uv_trans, vd["v"] * vt.uv_trans])
+        if vt.wt_off is not None and vt.wt_count:
+            slot = max(0, min(vt.wt_count - 1, weight_slot))
+            ws = [0.0] * vt.wt_count
+            ws[slot] = 1.0 * vt.wt_trans
+            _pack_comps(v, vt.wt_off, vt.wt_char, ws)
+        g.vbuf.extend(v)
+    flat = []
+    for a, b, c in tris:
+        flat += [a, b, c]
+    g.indices.extend(flat)
+    ret_widx = len(g.words) - 1
+    prim_word = 0x04000000 | (3 << 16) | (len(flat) & 0xFFFF)
+    g.words.insert(ret_widx, prim_word)
+    g.prims.append((ret_widx, 3, len(flat)))
 
 
 # --------------------------------------------------------------------------- #
@@ -372,28 +545,61 @@ def roundtrip_region(blob: bytes) -> bytes:
     return serialize(blob, header, groups)
 
 
-def grow_pmo(blob: bytes, group: Optional[int], n_new: int,
-             shift=(0.0, 200.0, 0.0), spread: float = 0.0) -> bytes:
-    """Grow ONE owner vgroup (the first 8-bit-indexed one if `group` is None) by
-    `n_new` verts / (n_new-2) faces and return the new (bigger) PMO bytes."""
-    header, groups = parse(blob)
-    if group is None:
-        g = next(x for x in groups if x.shared_with is None and x.vtype.index_char == "B")
-    else:
+def vgroup_bone_table(blob: bytes):
+    """Return [(rec_index, is_owner, vcount, index_char, weight_components)] for every
+    vgroup. The vgroup's draw-order index == its primary bind (bone) index, so this is
+    the lookup a modder uses to pick the target group for a given body part / bone."""
+    _hdr, groups = parse(blob)
+    out = []
+    for g in groups:
+        out.append((g.rec_index, g.shared_with is None, g.vcount,
+                    g.vtype.index_char, g.vtype.wt_count))
+    return out
+
+
+def _resolve_group(groups, group, bone):
+    """Pick the owner VGroup to grow. `group` = explicit vgroup index; `bone` = bind
+    index (== vgroup draw order). If both None, the first 8-bit-indexed owner."""
+    if group is not None:
         g = groups[group]
-    grow_group(g, n_new, shift=shift, scale=header[2:5], spread=spread)
+        if g.shared_with is not None:
+            raise ValueError("vgroup %d shares a GE block; pick its owner %d"
+                             % (group, g.shared_with))
+        return g
+    if bone is not None:
+        if bone < len(groups) and groups[bone].shared_with is None:
+            return groups[bone]
+        # nearest owner at/after the bone index
+        for g in groups[bone:] + groups[:bone]:
+            if g.shared_with is None:
+                return g
+        raise ValueError("no owner vgroup for bone %d" % bone)
+    return next(x for x in groups if x.shared_with is None)
+
+
+def grow_pmo(blob: bytes, group: Optional[int], n_new: int,
+             shift=(0.0, 200.0, 0.0), spread: float = 0.0, weight_slot: int = 0,
+             bone: Optional[int] = None, force_16bit: bool = False) -> bytes:
+    """Grow ONE owner vgroup by `n_new` verts / (n_new-2) faces; return the new
+    (bigger) PMO bytes. Group is chosen by `group` (vgroup index) or `bone` (bind
+    index); default = first owner. New verts bind 100% to palette slot `weight_slot`."""
+    header, groups = parse(blob)
+    g = _resolve_group(groups, group, bone)
+    grow_group(g, n_new, shift=shift, scale=header[2:5], spread=spread,
+               weight_slot=weight_slot, force_16bit=force_16bit)
     return serialize(blob, header, groups)
 
 
 def grow_pac(pac_in: bytes, group: Optional[int], n_new: int,
-             shift=(0.0, 200.0, 0.0), spread: float = 0.0) -> bytes:
+             shift=(0.0, 200.0, 0.0), spread: float = 0.0, weight_slot: int = 0,
+             bone: Optional[int] = None, force_16bit: bool = False) -> bytes:
     """Grow the PMO sub-resource of a monster PAC and re-flow the container."""
     from . import pac as _pac
     P = _pac.MonsterPac.from_bytes(pac_in)
     sub = next((s for s in P.subs if s.magic == b"pmo\x00"), None)
     if sub is None:
         raise ValueError("no PMO sub-resource in this PAC")
-    grown = grow_pmo(sub.data, group, n_new, shift, spread)
+    grown = grow_pmo(sub.data, group, n_new, shift, spread, weight_slot, bone, force_16bit)
     P.subs[sub.index] = _pac.SubResource(sub.index, grown)
     return P.to_bytes()
 
@@ -402,9 +608,12 @@ def _main(argv):
     import argparse
     ap = argparse.ArgumentParser(description="Grow a monster PAC's geometry (Phase 5).")
     ap.add_argument("pac_in")
-    ap.add_argument("pac_out")
+    ap.add_argument("pac_out", nargs="?", help="(omit with --list)")
     ap.add_argument("-g", "--group", type=int, default=None,
-                    help="vgroup record index (default: first 8-bit-indexed owner)")
+                    help="vgroup record index (default: first owner)")
+    ap.add_argument("--bone", type=int, default=None,
+                    help="bind/bone index (== vgroup draw order) to attach to; "
+                         "alternative to -g")
     ap.add_argument("-n", "--verts", type=int, default=6,
                     help="number of vertices to add (>=3; makes n-2 triangles)")
     ap.add_argument("--shift", default="0,200,0",
@@ -412,10 +621,26 @@ def _main(argv):
     ap.add_argument("--spread", type=float, default=0.0,
                     help="model-unit ring radius to scatter new verts (>0 = visible, "
                          "non-degenerate triangles)")
+    ap.add_argument("--weight-slot", type=int, default=0,
+                    help="bone-palette slot the new verts bind 100%% to (default 0 = "
+                         "the group's primary bone)")
+    ap.add_argument("--force-16bit", action="store_true",
+                    help="promote the group to 16-bit indices even below 256 verts")
+    ap.add_argument("--list", action="store_true",
+                    help="just print the vgroup->bone table and exit")
     a = ap.parse_args(argv)
-    shift = tuple(float(x) for x in a.shift.split(","))
     data = open(a.pac_in, "rb").read()
-    out = grow_pac(data, a.group, a.verts, shift, a.spread)
+    if a.list:
+        from . import pac as _pac
+        sub = next(s for s in _pac.MonsterPac.from_bytes(data).subs
+                   if s.magic == b"pmo\x00")
+        print("vgroup  owner  verts  idx  wcomps")
+        for ri, own, vc, ic, wc in vgroup_bone_table(sub.data):
+            print("%6d  %5s  %5d  %3s  %5d" % (ri, "Y" if own else "-", vc, ic, wc))
+        return
+    shift = tuple(float(x) for x in a.shift.split(","))
+    out = grow_pac(data, a.group, a.verts, shift, a.spread, a.weight_slot,
+                   a.bone, a.force_16bit)
     open(a.pac_out, "wb").write(out)
     print("wrote %s (%d -> %d bytes, +%d)" % (a.pac_out, len(data), len(out),
                                               len(out) - len(data)))
