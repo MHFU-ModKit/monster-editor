@@ -35,7 +35,7 @@ See `specs/002-model-anim-pipeline/tasks.md` and `docs/ANIMATION_FORMAT.md`.
     100% to; `--force-16bit`; `--list` prints the vgroup→bone table.
   - `grow_group_explicit(g, verts, tris, …)` — author-supplied verts+faces (the Blender
     path): positions/UV/normals written ABSOLUTE from the caller.
-  **Polish DONE (offline-verified):** new verts now get **real per-vertex attributes** —
+  **Polish DONE + PROVEN IN-GAME (2026-06-18):** new verts now get **real per-vertex attributes** —
   varied UVs (circular texture patch → textured, not the old one-texel dark look), outward
   normals (catch light), and a **clean single-bone weight** (1.0 on `weight_slot`, default
   the group's primary bone) instead of copying vertex0. **16-bit-index auto-promote**: an
@@ -46,10 +46,10 @@ See `specs/002-model-anim-pipeline/tasks.md` and `docs/ANIMATION_FORMAT.md`.
   + explicit-attrs + hard cap).
 - Phase 4 = live in-RAM inject (reshape, same size) · Phase 5 = ADD geometry, delivered
   live via the relocate-source path (`framework/prx` `mhfu.inject_relocate` → a grown PAC
-  in xram). Synthetic-grow geometry **PROVEN in-game 2026-06-18**. The polished
-  attributes + 16-bit + the **Blender-authored** add path (extra verts in an existing mesh
-  → `pmo_topology`) are offline-verified; **live render re-confirmation pending** a HITL
-  cold-boot.
+  in xram). Synthetic-grow geometry **PROVEN in-game 2026-06-18**, as are the polished
+  attributes + 16-bit promote + the **Blender-authored** add path (extra verts in an existing
+  mesh → `pmo_topology`): a Blender-authored textured dome rendered on the live Tigrex's head,
+  reacting to light, no garbage.
 
 ## Quick use
 
