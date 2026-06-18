@@ -19,9 +19,21 @@ See `specs/002-model-anim-pipeline/tasks.md` and `docs/ANIMATION_FORMAT.md`.
   value / keyframe-count / new-slot / skeleton bind-pose **and PMO vertex-move**
   edits. PMO geometry is **in-place** (reshape: move verts/normals/UVs at the same
   topology — byte-exact re-encode incl. the parser's native struct-alignment pad
-  bytes); adding/removing geometry (a GE-list rebuild) is rejected and folded into
-  Phase 5. The in-PPSSPP visual check is the one human step (`examples/edit_anim_demo.py`).
-- Phase 4 = live in-RAM inject · Phase 5 = new geometry/monster.
+  bytes); adding/removing geometry (a GE-list rebuild) is rejected here and lives in
+  `pmo_topology.py` (Phase 5). The in-PPSSPP visual check is the one human step
+  (`examples/edit_anim_demo.py`).
+- **`pmo_topology.py` — topology-GROW encoder (Phase 5, kept separate from `pmo.py`).**
+  Byte-level rebuild of the PMO `geBase` GE-list region to ADD vertices/faces within an
+  existing vertex group (inherits its bone/material/VTYPE). `parse` / `grow_group(g, n,
+  shift, spread)` / `serialize` re-lay the region 16-byte-aligned, patch each list's
+  VADDR/IADDR + each vgroup record's I3/I4/I5, bump header size; everything before `geBase`
+  stays byte-identical. 8-bit-index 256-vert/group cap. CLI: `python -m
+  mhfu_model.pmo_topology in.bin out.bin -n <verts> --spread <r>` (**spread>0 required** —
+  a uniform shift makes degenerate, invisible triangles). New verts copy vertex0's
+  UV/normal/weights for now (polish TODO). Tested in `tests/test_pmo_topology.py`.
+- Phase 4 = live in-RAM inject (reshape, same size) · Phase 5 = ADD geometry, delivered
+  live via the relocate-source path (`framework/prx` `mhfu.inject_relocate` → a grown PAC
+  in xram); **PROVEN in-game 2026-06-18** (added geometry renders, no disk edits).
 
 ## Quick use
 
