@@ -46,6 +46,20 @@ def parse(blob: bytes) -> Skeleton:
     )
 
 
+def parse_p3rd(blob: bytes) -> Skeleton:
+    """Parse a 0x80000000 MHP3rd skeleton blob into the Skeleton data model.
+
+    Delegates to skeleton_p3rd.parse() which handles:
+    - Section magic 0x40000002 (in addition to 0x40000001)
+    - Optional extra 4-byte header word before bone sections (lobby PACs)
+
+    The returned Skeleton is compatible with the Blender armature builder
+    and exporter — same dataclass, same field layout.
+    """
+    from .skeleton_p3rd import parse as _p3rd
+    return _p3rd(blob)
+
+
 def _encode_bone(b: Bone) -> bytes:
     """Patch a bone's editable fields back into its raw section (same size).
 
@@ -80,6 +94,12 @@ def encode(skel: Skeleton) -> bytes:
     """
     header = bytearray(skel.header) if skel.header else bytearray(
         struct.pack("<3I", MAGIC, len(skel.bones), 0))
+    # If this skeleton came from a MHP3rd PAC (0x80000000 magic), flip the magic to
+    # MHFU's 0xC0000000 so the output PAC is recognised by the MHFU engine and by
+    # MonsterPac.role().  All other header bytes (bone_count, total_size, extra p3rd
+    # word at +0x1C if present) are preserved verbatim.
+    if len(header) >= 4 and struct.unpack_from("<I", header, 0)[0] == 0x80000000:
+        struct.pack_into("<I", header, 0, MAGIC)
     sections = b"".join(_encode_bone(b) for b in skel.bones)
     body = bytearray(header) + sections
     if skel.raw and len(skel.raw) > len(body):

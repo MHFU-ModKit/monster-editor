@@ -80,26 +80,86 @@ def parse(blob):
     return {'bone_count': bone_count, 'total_size': total_size, 'bones': bones}
 
 
+def parse_p3rd(blob):
+    """Parse a 0x80000000 MHP3rd skeleton blob; returns same dict shape as parse().
+
+    Delegates to mhfu_model.skeleton_p3rd which handles the two MHP3rd quirks:
+    - section magic 0x40000002 (in addition to 0x40000001)
+    - optional extra 4-byte header word before bone sections (lobby PACs)
+    """
+    import sys, os
+    # Import via the mhfu_model package so relative imports inside skeleton_p3rd work
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from mhfu_model.skeleton_p3rd import parse as _parse_p3rd
+    sk = _parse_p3rd(blob)
+    # Convert dataclass back to the dict shape used by this module's CLI/callers
+    bones = []
+    for i, b in enumerate(sk.bones):
+        bones.append({
+            'i': i, 'off': 0, 'section_magic': 0x40000001, 'size': b.section_size,
+            'index': b.index, 'parent': b.parent, 'child': b.child, 'sibling': b.sibling,
+            'scale': b.bind_scale, 'rotation': b.bind_rot, 'pos': b.bind_pos,
+        })
+    return {'bone_count': sk.bone_count, 'total_size': sk.total_size, 'bones': bones}
+
+
+def _find_skel_sub(data, magic):
+    """Find the first sub-resource with given u32 magic in a PAC blob."""
+    try:
+        cnt = struct.unpack_from('<I', data)[0]
+        if cnt == 0 or cnt > 64:
+            return None
+        for i in range(cnt):
+            off, sz = struct.unpack_from('<II', data, 4 + i * 8)
+            if off + 4 <= len(data):
+                m = struct.unpack_from('<I', data, off)[0]
+                if m == magic:
+                    return data[off:off + sz]
+    except struct.error:
+        pass
+    return None
+
+
 def main(argv):
     raw = False
+    game = 'mhfu'
     args = []
-    for a in argv:
+    i = 0
+    while i < len(argv):
+        a = argv[i]
         if a == '--raw':
             raw = True
+        elif a == '--game' and i + 1 < len(argv):
+            game = argv[i + 1]
+            i += 1
         else:
             args.append(a)
+        i += 1
     if not args:
         print(__doc__)
         return 1
     data = open(args[0], 'rb').read()
-    blob = data if raw else (extract_sub0(data) or data)
-    sk = parse(blob)
+    if raw:
+        blob = data
+    elif game == 'p3rd':
+        # MHP3rd: skeleton is 0x80000000, may be any sub; try to find it
+        blob = _find_skel_sub(data, 0x80000000)
+        if blob is None:
+            blob = data  # caller passed raw blob directly
+    else:
+        blob = extract_sub0(data) or data
+    if game == 'p3rd':
+        sk = parse_p3rd(blob)
+    else:
+        sk = parse(blob)
     print('skeleton: %d bones, blob size %d' % (sk['bone_count'], sk['total_size']))
     print('  idx  parent  child  sibling   bind position')
     for b in sk['bones']:
-        print('  %3d  %5d  %5d  %7d   (%9.2f %9.2f %9.2f)  rec@0x%x sz=0x%x'
+        print('  %3d  %5d  %5d  %7d   (%9.2f %9.2f %9.2f)  sz=0x%x'
               % (b['index'], b['parent'], b['child'], b['sibling'],
-                 b['pos'][0], b['pos'][1], b['pos'][2], b['off'], b['size']))
+                 b['pos'][0], b['pos'][1], b['pos'][2], b['size']))
     # sanity: root(s) = parent==-1
     roots = [b['index'] for b in sk['bones'] if b['parent'] == -1]
     print('  roots (parent==-1):', roots, ' parsed %d/%d bones'

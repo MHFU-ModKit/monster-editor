@@ -89,7 +89,8 @@ class MonsterPac:
     # ---- convenience --------------------------------------------------- #
     def role(self, sub: SubResource) -> str:
         m = sub.magic
-        if m[:4] == b"\x00\x00\x00\xc0":     # 0xC0000000 little-endian
+        if m[:4] in (b"\x00\x00\x00\xc0",    # 0xC0000000 MHFU skeleton
+                     b"\x00\x00\x00\x80"):    # 0x80000000 MHP3rd skeleton
             return "skeleton"
         if m == b"pmo\x00":
             return "model"
@@ -97,6 +98,16 @@ class MonsterPac:
             return "texture"
         if sub.data[:1] == b"\x64" and not sub.empty:
             return "anim"
+        # MHP3rd lobby anim: first word is species/anim index (small int, e.g. 0x21),
+        # total_size == len(sub.data), followed by slot_count and a slot offset table.
+        # Detect by: small magic (<= 0xFF), total_size == blob size, and a plausible
+        # slot_count (> 0, slot table fits in blob).
+        if not sub.empty and len(sub.data) >= 12:
+            import struct as _struct
+            magic_u32, total_sz, slot_count = _struct.unpack_from("<3I", sub.data, 0)
+            if (magic_u32 <= 0xFF and total_sz == len(sub.data) and
+                    0 < slot_count <= 512 and 0x0c + slot_count * 4 <= len(sub.data)):
+                return "anim"
         return "empty" if sub.empty else "unknown"
 
     def find(self, role: str) -> Optional[SubResource]:
