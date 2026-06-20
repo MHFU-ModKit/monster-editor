@@ -132,6 +132,7 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
             # Vgroup record: mat(u8) unk(u8) boneref(u16) ge_off(u32) I4(u32) I5(u32)
             vg = struct.unpack_from("<2BH3I", blob, vg_off)
             mat_pal_idx = vg[0]
+            boneref     = vg[2]   # REAL skeleton bone this rigid group binds to
             ge_rel      = vg[3]
 
             # Resolve texture/material index from the material table.
@@ -170,6 +171,7 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
                 faces=faces,
                 enc=None,       # no in-place re-encode (v102 passthrough)
                 vg_rec=vg_rec_idx,
+                boneref=boneref,
             )
             groups.append(g)
             draw_order += 1

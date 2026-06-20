@@ -126,6 +126,10 @@ class MeshGroup:
     enc: Optional[dict] = None  # private PMO re-encode descriptor (vertex buffer layout)
     vg_rec: int = -1            # source vgroup-table index (== pmo_topology rec_index);
     #                            draw order != table index for split-mesh monsters
+    boneref: int = -1           # vgroup record vg[2]: the skeleton bone this rigid group
+    #                            binds to (REAL skinning, not draw order). -1 = unknown.
+    #                            The MHFU engine transforms the group's verts by
+    #                            joint[boneref]; a wrong/OOB value collapses the mesh.
 
 
 @dataclass
