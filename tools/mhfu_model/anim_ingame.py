@@ -368,7 +368,8 @@ def swap_anim_to_bindpose(pac_bytes: bytes, anim_index: int = 3,
     return out, {"animated": n, "split": sp}
 
 
-def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100) -> InGameAnim:
+def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100,
+                   bone_map: Optional[Dict[int, Optional[int]]] = None) -> InGameAnim:
     """Convert a FLAT (lobby / P3rd, ``anim.py``) animation pack to the in-game
     recursive 3-stream format — the REAL-MOTION encoder.
 
@@ -419,14 +420,37 @@ def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100) -> InGameA
         # shortfall with rest bones (identity rotation) so every host joint has a
         # bone section — a stream shorter than its allocation desyncs the walk and
         # crashes (proven live: v20 42-bone vs host 45 → 0x088630d0 OOB).
-        tracks = list(anim.tracks)[:total]
+        #
+        # bone_map (cross-game porting): {target_joint -> source_track or None}.
+        # When given (from bone_match.match_skeletons), each TARGET joint is filled
+        # from the SOURCE track that drives it — so a source whose bone order /
+        # leading-static layout differs from the MHFU skeleton still lands each
+        # track on the joint it animates. Unmatched joints (None) get an EMPTY bone
+        # section (static, like native's leading root joints). Without a map, the
+        # legacy 1:1 flat-index split is used.
+        src_tracks = list(anim.tracks)
+        if bone_map is not None:
+            joint_tracks = []
+            for d in range(total):
+                s = bone_map.get(d)
+                joint_tracks.append(src_tracks[s] if (s is not None
+                                    and 0 <= s < len(src_tracks)) else None)
+        else:
+            joint_tracks = (src_tracks[:total]
+                            + [None] * max(0, total - len(src_tracks)))
         base = 0
         for k, bc in enumerate(split):
             if bc <= 0:
                 continue
-            seg = tracks[base:base + bc]
+            seg = joint_tracks[base:base + bc]
             base += bc
-            bones = [conv_track(t) for t in seg]
+            bones = []
+            for t in seg:
+                if t is None:
+                    bones.append(empty_bone() if bone_map is not None
+                                 else rest_bone())
+                else:
+                    bones.append(conv_track(t))
             while len(bones) < bc:                 # pad to the stream's allocation
                 bones.append(rest_bone())
             blk = Block(tag=BLOCK_TAG, loop=anim.loop,
@@ -439,7 +463,8 @@ def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100) -> InGameA
 def swap_anim_to_realmotion(pac_bytes: bytes, flat_pack, anim_index: int = 3,
                             skel_index: int = 0, split: Optional[List[int]] = None,
                             fill_slots: bool = True, keep_size: bool = True,
-                            host_count: Optional[int] = None):
+                            host_count: Optional[int] = None,
+                            bone_map: Optional[Dict[int, Optional[int]]] = None):
     """Replace a big-monster PAC's anim sub with REAL motion from a flat anim pack.
 
     The real-motion sibling of :func:`swap_anim_to_bindpose`. THE in-game joint walk
@@ -476,11 +501,15 @@ def swap_anim_to_realmotion(pac_bytes: bytes, flat_pack, anim_index: int = 3,
         raise ValueError("host_count %d > skeleton bone_count %d — too few bones"
                          % (n, skel_total))
     fp = copy.deepcopy(flat_pack)
-    for a in fp.animations:
-        if len(a.tracks) > n:
-            a.tracks = a.tracks[:n]
-        a.bone_count = len(a.tracks)
-    ig = from_flat_anim(fp, split=sp)          # pads short clips to n with rest bones
+    if bone_map is None:
+        # legacy 1:1 path: trim tracks to the host count by index
+        for a in fp.animations:
+            if len(a.tracks) > n:
+                a.tracks = a.tracks[:n]
+            a.bone_count = len(a.tracks)
+    # with a bone_map the selection is by correspondence (target joint -> source
+    # track), so keep all source tracks; from_flat_anim picks per the map.
+    ig = from_flat_anim(fp, split=sp, bone_map=bone_map)  # map/pad to n bones
     if fill_slots:
         for st in ig.streams:
             if st.clips:
