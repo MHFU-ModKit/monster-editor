@@ -48,6 +48,7 @@ def parse(blob: bytes) -> Skeleton:
             smag_probe2 = struct.unpack_from("<I", blob, o + 4)[0]
             if smag_probe2 in (SECTION_MAGIC, SECTION_MAGIC2):
                 o += 4  # skip the extra header word
+    hdr_size = o          # 0x1C or 0x20 — the bytes before the first bone section
 
     for _ in range(bone_count):
         if o + 0x10 > len(blob):
@@ -76,5 +77,5 @@ def parse(blob: bytes) -> Skeleton:
 
     return Skeleton(
         bone_count=bone_count, total_size=total_size, bones=bones,
-        header=blob[:HDR_SIZE], raw=blob,
+        header=blob[:hdr_size], raw=blob,
     )
