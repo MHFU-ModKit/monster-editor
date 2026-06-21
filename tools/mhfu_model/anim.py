@@ -88,32 +88,51 @@ ALIGN = 4   # anim block offsets are 4-byte aligned (verified across all 49 PACs
 #   ... possibly more hdr bytes ...
 #   [hsize - 4]          slot offset table (slot_count * u32, 0xffffffff = empty)
 #
-# Per-slot block header (MHP3rd, differs from MHFU):
+# Per-slot block header (MHP3rd, FULLY decoded 2026-06-21 on file_04004/04005):
 #   u32  bone_count
 #   u32  block_size     (exact byte count of this block including this header)
 #   u32  loop_flag      (0 = no loop)
-#   u32  pad/loop_frame
-#   ... per-bone keyframe data (format not yet fully decoded) ...
+#   u32  pad
+#   then bone_count BONE records:
+#     u16  num_channels
+#     u16  record_size  (total bytes of this bone record incl this 4-byte header)
+#     then num_channels CHANNEL records:
+#       u16  channel_bit (SAME bits as MHFU: 0x08/0x10/0x20 rot, 0x40/0x80/0x100 loc,
+#                         0x200/0x400/0x800 scl)
+#       u16  keyframe_count
+#       u32  channel_size (= 8 header + keyframe_count*8)
+#       then keyframe_count KEYFRAMES:  <4h> value, frame, ease_in, ease_out
+#                                        (IDENTICAL to the MHFU 0x64 keyframe)
 #
-# For now parse_p3rd() returns stub Animation objects (no channels) so the
-# blender agent can enumerate clips and display bone counts.  Full keyframe
-# decode requires additional RE and is deferred to v2.
+# i.e. the SAME recursive data as MHFU, just with compact u16 bone/channel headers
+# (vs MHFU's u32 + a per-bone FLAG|mask tag). The parser below produces the SAME
+# Animation/BoneTrack/Channel data model the MHFU side uses, so anim_ingame's
+# from_flat_anim / swap_anim_to_realmotion consume it directly (cross-game port).
 
 
 def _parse_anim_p3rd(blob: bytes, ao: int, slot: int) -> Animation:
-    """Parse one MHP3rd anim block into a stub Animation (bone_count + raw only)."""
+    """Parse one MHP3rd anim block (bones -> channels -> keyframes)."""
     bone_count, block_size, loop_flag = struct.unpack_from("<3I", blob, ao)
-    # Clamp block_size to sane range in case of corrupt data
+    o = ao + 0x10                            # past {bone_count,block_size,loop,pad}
+    tracks: list[BoneTrack] = []
+    for _b in range(bone_count):
+        nch, rec_size = struct.unpack_from("<2H", blob, o)
+        co = o + 4
+        channels = []
+        mask = 0
+        for _c in range(nch):
+            bit, nkf, csz = struct.unpack_from("<HHI", blob, co)
+            kfs = [Keyframe(*struct.unpack_from("<4h", blob, co + 8 + k * 8))
+                   for k in range(nkf)]
+            channels.append(Channel(type=bit, keyframes=kfs))   # low bits = transform bit
+            mask |= bit
+            co += csz
+        tracks.append(BoneTrack(tag=mask, channels=channels))   # tag low bits = mask
+        o += rec_size
     end = ao + min(block_size, len(blob) - ao)
-    raw = blob[ao:end]
     return Animation(
-        slot=slot,
-        tag=0,                  # no FLAG|tag in MHP3rd format
-        bone_count=bone_count,
-        loop=loop_flag,
-        loop_start=0.0,
-        tracks=[],              # not yet decoded
-        raw=raw,
+        slot=slot, tag=0, bone_count=bone_count, loop=loop_flag,
+        loop_start=0.0, tracks=tracks, raw=blob[ao:end],
     )
 
 
@@ -125,22 +144,26 @@ def parse_p3rd(blob: bytes) -> AnimationPack:
     This function decodes the header and slot table, then creates stub Animation
     objects with bone_count and raw bytes populated (no channel decode yet).
 
-    The returned AnimationPack is compatible with the Blender importer's
-    enumerate-clips path (``pack.animations``, ``anim.slot``, ``anim.bone_count``).
+    The returned AnimationPack carries fully-decoded tracks/channels/keyframes
+    (the MHFU data model), so anim_ingame.from_flat_anim / swap_anim_to_realmotion
+    consume it directly for the cross-game animation port.
     """
     if len(blob) < 0x0c:
         return AnimationPack(magic=0, slot_count=0, animations=[], header=blob, raw=blob)
+    # MHP3rd header: word0 = anim_count (== the slot-table entry count), word1 = hsize
+    # (0x18 in-quest), word2 = a secondary count (NOT the table size — that was the
+    # old bug; MHFU uses word2 but MHP3rd's table is sized by anim_count/word0).
     anim_count, hsize, slot_count = struct.unpack_from("<3I", blob, 0)
     # Two known sub-formats:
     #   in-quest: hsize is a small header size (e.g. 0x18); slot table at hsize-4.
     #   lobby:    hsize == total blob size; slot table starts immediately at byte 0x0c.
-    # Detect the lobby variant by checking whether tbase is out of bounds.
+    n = anim_count
     tbase = hsize - 4
-    if not (0 <= tbase and tbase + slot_count * 4 <= len(blob)):
+    if not (0 <= tbase and tbase + n * 4 <= len(blob)):
         tbase = 0x0c   # lobby format: slot table right after the 3-word header
     anims: list[Animation] = []
-    if 0 <= tbase and tbase + slot_count * 4 <= len(blob):
-        table = struct.unpack_from("<%dI" % slot_count, blob, tbase)
+    if 0 <= tbase and 0 < n and tbase + n * 4 <= len(blob):
+        table = struct.unpack_from("<%dI" % n, blob, tbase)
         for i, off in enumerate(table):
             if off == EMPTY or not (0 < off < len(blob)):
                 continue
@@ -151,7 +174,7 @@ def parse_p3rd(blob: bytes) -> AnimationPack:
     hdr_end = hsize if 0 < hsize <= len(blob) else min(0x18, len(blob))
     return AnimationPack(
         magic=anim_count,       # store raw count field as magic (not 0x64)
-        slot_count=slot_count,
+        slot_count=n,           # table entry count (== anim_count)
         animations=anims,
         header=blob[:hdr_end],
         raw=blob,
