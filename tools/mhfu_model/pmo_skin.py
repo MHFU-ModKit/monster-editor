@@ -399,6 +399,62 @@ def build(scale, vgroups, materials, version=b"1.0\x00", clip=0.0) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# auto-skinning (derive blend weights from geometry + skeleton)
+# --------------------------------------------------------------------------- #
+def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8):
+    """Derive smooth blend skinning for a mesh that has NO source weights.
+
+    For a ported monster whose source model is rigid-piece (no per-vertex weights
+    — e.g. MHP3rd monsters), weight each vertex to its ``nb`` nearest skeleton
+    bones (inverse-distance), instead of one rigid bone. This removes the
+    rigid-binding splay at extreme animation poses (e.g. the Brute's wings during
+    a roar). Per-vgroup palette is capped at ``max_pal`` (PSP's 8-matrix limit):
+    the most-influential bones are kept and weights re-normalised over them.
+
+    Parameters
+    ----------
+    mesh_groups : list of model.MeshGroup (vertices with x/y/z[/u/v/i/j/k], faces).
+    bone_world  : list[(x,y,z)] of each bone's BIND-WORLD position (same space as
+                  the verts). Compute via bone_match.bind_world_positions.
+    materials_of: callable(group)->material index, or None (-> 0).
+    Returns a list of SkinVGroup ready for ``build``/``encode``.
+    """
+    import math
+    bw = list(bone_world)
+    out = []
+    for g in mesh_groups:
+        infl = []
+        for v in g.vertices:
+            ds = [((v["x"] - b[0]) ** 2 + (v["y"] - b[1]) ** 2 + (v["z"] - b[2]) ** 2, i)
+                  for i, b in enumerate(bw)]
+            ds.sort()
+            near = ds[:nb]
+            ws = [(i, 1.0 / (math.sqrt(d) + 1e-3)) for d, i in near]
+            s = sum(w for _, w in ws) or 1.0
+            infl.append([(i, w / s) for i, w in ws])
+        # per-vgroup palette = most-influential bones, capped
+        acc = {}
+        for vi in infl:
+            for b, w in vi:
+                acc[b] = acc.get(b, 0.0) + w
+        palette = [b for b, _ in sorted(acc.items(), key=lambda x: -x[1])[:max_pal]]
+        pset = set(palette)
+        infl2 = []
+        for vi in infl:
+            kept = [(b, w) for b, w in vi if b in pset]
+            if not kept:
+                kept = [(palette[0], 1.0)]
+            s = sum(w for _, w in kept) or 1.0
+            infl2.append([(b, w / s) for b, w in kept])
+        out.append(SkinVGroup(
+            index=len(out), bone_count=0, cum_bone_count=0, palette=palette,
+            material=(materials_of(g) if materials_of else 0),
+            mesh_offset=0, vertex_offset=0, index_offset=0,
+            vertices=g.vertices, faces=g.faces, influences=infl2))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # CLI / quick validation
 # --------------------------------------------------------------------------- #
 def _summary(sm: SkinModel) -> str:

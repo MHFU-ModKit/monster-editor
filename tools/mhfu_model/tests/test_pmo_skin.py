@@ -83,6 +83,33 @@ def test_roundtrip_exact_geometry_and_skinning():
             assert (f1["v1"], f1["v2"], f1["v3"]) == (f2["v1"], f2["v2"], f2["v3"])
 
 
+def test_auto_skin_weights_nearest_bones():
+    # a vertex between bones 0 and 1 should blend them; one far bone ignored.
+    class _G:
+        def __init__(s, vs): s.vertices = vs; s.faces = []
+    bones = [(0, 0, 0), (10, 0, 0), (100, 0, 0)]   # bone2 far away
+    g = _G([{"x": 5, "y": 0, "z": 0}])             # midway between bone0 and bone1
+    vgs = PS.auto_skin([g], bones, nb=2, max_pal=8)
+    inf = vgs[0].influences[0]
+    bset = {b for b, w in inf}
+    assert bset == {0, 1}                            # the two nearest, not the far one
+    assert abs(sum(w for _, w in inf) - 1.0) < 1e-6  # normalised
+    # equidistant -> ~equal weights
+    assert abs(dict(inf)[0] - dict(inf)[1]) < 0.1
+
+
+def test_auto_skin_palette_cap():
+    # many bones around a cluster -> palette capped at max_pal
+    class _G:
+        def __init__(s, vs): s.vertices = vs; s.faces = []
+    bones = [(i, 0, 0) for i in range(20)]
+    verts = [{"x": float(i), "y": 0, "z": 0} for i in range(20)]
+    vgs = PS.auto_skin([_G(verts)], bones, nb=3, max_pal=8)
+    assert len(vgs[0].palette) <= 8
+    for inf in vgs[0].influences:
+        assert abs(sum(w for _, w in inf) - 1.0) < 1e-6
+
+
 def test_encoded_is_valid_pmo():
     sm = PS.read(_pmo_sub(_DATA))
     enc = PS.encode(sm)
