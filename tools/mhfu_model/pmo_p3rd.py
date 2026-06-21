@@ -34,6 +34,161 @@ PMO_MAGIC = b"pmo\x00"
 P3RD_VER = b"102\x00"
 
 
+# --------------------------------------------------------------------------- #
+# v102 GE-display-list walker (faithful port of AsteriskAmpersand's PMO-Importer
+# pmo_parse.build_prim — fixes the strip over-expansion of the MHFU run_ge: v102
+# vertices are addressed THROUGH the index buffer and DEDUPED by address, not read
+# flat/sequentially). See docs + /tmp/pmoimp/struct/pmo_parse.py.
+# --------------------------------------------------------------------------- #
+# VTYPE bit fields (GE command 0x12). NOTE weightCount is 4 bits (14..18) and
+# there is a `bypass` bit (23) selecting normalized(U)/raw(R) value scaling — the
+# MHFU walker used a 3-bit weightCount and no bypass, which mis-sized v102 verts.
+_VT = {
+    "uv": (0, 2), "color": (2, 4), "colorUse": (4, 5), "normal": (5, 7),
+    "pos": (7, 9), "weight": (9, 11), "index": (11, 13),
+    "wcount": (14, 18), "morph": (18, 21), "bypass": (23, 24),
+}
+
+
+def _bits(cmd, lo, hi):
+    return (cmd >> lo) & ((1 << (hi - lo)) - 1)
+
+
+def _vtype_layout(cmd):
+    """Decode a VTYPE command -> (stride, field descriptors, index_size).
+
+    Field byte sizes mirror PMO-Importer's construct structs exactly (incl. the
+    int16 pad on 8-bit UV and the trailing w on 8/16-bit normals)."""
+    f = {k: _bits(cmd, lo, hi) for k, (lo, hi) in _VT.items()}
+    if f["morph"]:
+        raise ValueError("morph class not supported")
+    wcls, wcnt = f["weight"], f["wcount"] + 1
+    wsz = [0, 1, 2, 4][wcls] * wcnt
+    wpad = (-([0, 1, 2, 4][wcls] * wcnt)) % 2
+    uvsz = [0, 4, 4, 8][f["uv"]]                 # 8-bit uv = 1+1+2pad
+    csz = 0 if not f["colorUse"] else [2, 2, 2, 4][f["color"]]
+    nsz = [0, 4, 8, 12][f["normal"]]             # 8/16-bit normal carry a w
+    psz = [0, 3, 6, 12][f["pos"]]
+    stride = wsz + wpad + uvsz + csz + nsz + psz
+    isz = [0, 1, 2, 4][f["index"]]
+    return stride, f, isz
+
+
+def _read_vertex(data, off, f, scale):
+    """Decode one vertex at ``off`` per the VTYPE field descriptors ``f``.
+    Returns a dict with x/y/z (scaled), u/v, i/j/k (normal) and weights[]."""
+    wcls, wcnt = f["weight"], f["wcount"] + 1
+    bypass = f["bypass"]
+    o = off
+    weights = []
+    if wcls:
+        wfmt = {1: "B", 2: "H", 3: "f"}[wcls]
+        wnorm = {1: 0x80, 2: 0x8000, 3: 1}[wcls]
+        for _ in range(wcnt):
+            weights.append(struct.unpack_from("<" + wfmt, data, o)[0] / wnorm)
+            o += {1: 1, 2: 2, 3: 4}[wcls]
+        o += (-([0, 1, 2, 4][wcls] * wcnt)) % 2          # weight pad
+    u = v = 0.0
+    if f["uv"]:
+        if f["uv"] == 1:
+            ru, rv = struct.unpack_from("<BB", data, o); o += 4   # +2 pad
+            n = 1 if bypass else 0x80
+        elif f["uv"] == 2:
+            ru, rv = struct.unpack_from("<HH", data, o); o += 4
+            n = 1 if bypass else 0x8000
+        else:
+            ru, rv = struct.unpack_from("<ff", data, o); o += 8; n = 1
+        u, v = ru / n, rv / n
+    if f["colorUse"]:
+        o += [2, 2, 2, 4][f["color"]]
+    nx = ny = nz = 0.0
+    if f["normal"]:
+        if f["normal"] == 1:
+            nx, ny, nz, _w = struct.unpack_from("<bbbb", data, o); o += 4
+            nn = 1 if bypass else 0x7F
+        elif f["normal"] == 2:
+            nx, ny, nz, _w = struct.unpack_from("<hhhh", data, o); o += 8
+            nn = 1 if bypass else 0x7FFF
+        else:
+            nx, ny, nz = struct.unpack_from("<fff", data, o); o += 12; nn = 1
+        nx, ny, nz = nx / nn, ny / nn, nz / nn
+    px = py = pz = 0.0
+    if f["pos"]:
+        if f["pos"] == 1:
+            px, py, pz = struct.unpack_from("<bbb", data, o); o += 3
+            pn = 1 if bypass else 0x7F
+        elif f["pos"] == 2:
+            px, py, pz = struct.unpack_from("<hhh", data, o); o += 6
+            pn = 1 if bypass else 0x7FFF
+        else:
+            px, py, pz = struct.unpack_from("<fff", data, o); o += 12; pn = 1
+        px, py, pz = px / pn, py / pn, pz / pn
+    return {"x": px * scale[0], "y": py * scale[1], "z": pz * scale[2],
+            "u": u, "v": v, "i": nx, "j": ny, "k": nz, "weights": weights}
+
+
+def run_ge_v102(data, base, scale):
+    """Walk the v102 GE display list for one vgroup starting at byte ``base``.
+
+    Returns (vertices, faces) — vertices deduped by source address (so a tristrip's
+    shared verts are one vertex), faces as {v1,v2,v3} dicts. ``data`` is the whole
+    GE source bytes; ``base`` the vgroup's mesh-data offset."""
+    pos = base
+    vaddr = iaddr = None
+    stride = isz = 0
+    fdesc = None
+    face_order = 0
+    verts = []
+    faces = []
+    addr2idx = {}
+    while pos + 4 <= len(data):
+        cmd = struct.unpack_from("<I", data, pos)[0]; pos += 4
+        ct = cmd >> 24
+        low = cmd & 0xFFFFFF
+        if ct == 0x10:                                   # BASE (high addr bits)
+            pass
+        elif ct == 0x14 or ct == 0x13:                   # ORIGIN / OFFSET
+            pass
+        elif ct == 0x01:                                 # VADDR (relative to base)
+            vaddr = base + low
+        elif ct == 0x02:                                 # IADDR (relative to base)
+            iaddr = base + low
+        elif ct == 0x12:                                 # VTYPE
+            stride, fdesc, isz = _vtype_layout(cmd)
+        elif ct == 0x9B:                                 # FFACE (cull order)
+            face_order = low & 1
+        elif ct == 0x04:                                 # PRIM
+            count = cmd & 0xFFFF
+            ptype = (cmd >> 16) & 7
+            # index list
+            if iaddr is not None and isz:
+                ifmt = {1: "B", 2: "H", 4: "I"}[isz]
+                idxs = list(struct.unpack_from("<%d%s" % (count, ifmt), data, iaddr))
+                iaddr += count * isz
+            else:
+                idxs = list(range(count))
+            rng = range(0, count, 3) if ptype == 3 else range(count - 2)
+            signum = face_order
+            for k in rng:
+                tri = (idxs[k + signum], idxs[k + 1 - signum], idxs[k + 2])
+                signum ^= 1
+                out = []
+                for vi in tri:
+                    addr = vaddr + vi * stride
+                    di = addr2idx.get(addr)
+                    if di is None:
+                        di = len(verts)
+                        addr2idx[addr] = di
+                        verts.append(_read_vertex(data, addr, fdesc, scale))
+                    out.append(di)
+                if out[0] != out[1] and out[1] != out[2] and out[0] != out[2]:
+                    faces.append({"v1": out[0], "v2": out[1], "v3": out[2]})
+        elif ct == 0x0B:                                 # RET
+            break
+        # ignore other GPU/bool state commands
+    return verts, faces
+
+
 def _read_header(blob: bytes):
     """Parse the 14-element v102 PMO fixed header (offsets 0..0x38).
 
@@ -155,16 +310,10 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
             if ge_abs >= len(ge_source):
                 continue
 
-            geo_buf.seek(ge_abs)
             try:
-                verts_raw, faces_raw, enc = run_ge(geo_buf, mesh_scale)
-            except (ValueError, struct.error):
+                verts, faces = run_ge_v102(ge_source, ge_abs, mesh_scale)
+            except (ValueError, struct.error, IndexError):
                 continue
-
-            # run_ge returns a sparse list (None slots for out-of-order indices);
-            # filter them out so the MeshGroup has a dense vertex list.
-            verts = [v for v in verts_raw if v is not None]
-            faces = list(faces_raw)
 
             g = MeshGroup(
                 index=draw_order,
