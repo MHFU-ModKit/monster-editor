@@ -120,6 +120,7 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
         mh = struct.unpack_from("<8f2I4H", blob, mesh_rec_off)
         # Per-mesh scale overrides the global header scale for this record.
         mesh_scale = mh[0:3]   # (sx, sy, sz)
+        cum_mat    = mh[11]    # u16 cumulativeMaterialCount (material base for this mesh)
         vg_count   = mh[12]    # u16
         vg_start   = mh[13]    # u16
 
@@ -136,8 +137,13 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
             ge_rel      = vg[3]
 
             # Resolve texture/material index from the material table.
+            # The material-data index is the mesh's cumulativeMaterialCount + the
+            # vgroup's per-mesh materialOffset (vg[0]); there is no materialRemap
+            # in these monster PMOs (header field 9 == 0). Omitting cum_mat was a
+            # bug that collapsed every group onto materialData[0..2] (tex 9/17).
             tex_idx = 0
-            mat_off = mat_tab + mat_pal_idx * 16
+            mat_idx = cum_mat + mat_pal_idx
+            mat_off = mat_tab + mat_idx * 16
             if mat_off + 16 <= len(blob):
                 tex_idx = struct.unpack_from("<4I", blob, mat_off)[2]
 
