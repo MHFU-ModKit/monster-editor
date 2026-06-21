@@ -67,35 +67,34 @@ def _find_sub_magic(pac_path: str, magic: int) -> bytes | None:
 class TestAnimParseP3rdSynthetic(unittest.TestCase):
     """Tests that do NOT require extracted MHP3rd data."""
 
-    def _make_blob(self, anim_count: int, slots: dict, tracks=None) -> bytes:
-        """Build a minimal synthetic MHP3rd anim blob.
+    def _make_blob(self, anim_count: int, slots: dict, tracks=None, hsize=0x18) -> bytes:
+        """Build a synthetic MHP3rd anim blob in the authoritative (Kurogami) layout.
 
-        The slot offset table is sized by ``anim_count`` (word0) — the MHP3rd table
-        size (MHFU uses word2; that was the old parse bug). Layout: prefix
-        {anim_count, hsize=0x18, slot_count_word2=0} + 8B pad = 0x14, then
-        anim_count*u32 table, then per-slot blocks. Blocks default to bone_count=0
-        (decode to a valid empty-track anim) unless ``tracks[slot_id]`` supplies
+        Header (``hsize`` bytes): word0 = count field, word1 = hsize, the last header
+        word (at hsize-4) = first_anim offset; then one null word; then the slot
+        offset table of ``anim_count`` u32 at hsize+4; then the per-slot blocks
+        starting at first_anim = hsize + 4 + anim_count*4. Blocks default to
+        bone_count=0 (a valid empty-track anim) unless ``tracks[slot_id]`` supplies
         pre-encoded bone-record bytes.
         """
-        hsize = 0x18
-        tbase = hsize - 4  # 0x14 = 20
-        prefix = struct.pack("<3I", anim_count, hsize, 0) + b"\x00" * 8
-        assert len(prefix) == tbase
-        data_start = tbase + anim_count * 4
+        first_anim = hsize + 4 + anim_count * 4
+        header = bytearray(hsize)
+        struct.pack_into("<2I", header, 0, anim_count, hsize)
+        struct.pack_into("<I", header, hsize - 4, first_anim)
         table = [0xFFFFFFFF] * anim_count
         blobs = {}
         for slot_id, (bone_count, _bs) in slots.items():
             body = (tracks or {}).get(slot_id, b"")
             block_size = 0x10 + len(body)
             blobs[slot_id] = struct.pack("<4I", bone_count, block_size, 0, 0) + body
-        pos = data_start
+        pos = first_anim
         slot_data = b""
         for slot_id in sorted(blobs):
             table[slot_id] = pos
             slot_data += blobs[slot_id]
             pos += len(blobs[slot_id])
-        tbl_bytes = struct.pack("<%dI" % anim_count, *table)
-        return prefix + tbl_bytes + slot_data
+        return (bytes(header) + struct.pack("<I", 0)
+                + struct.pack("<%dI" % anim_count, *table) + slot_data)
 
     @staticmethod
     def _bone(channels):
@@ -175,12 +174,15 @@ class TestAnimParseP3rdLive(unittest.TestCase):
     """Tests against actual extracted MHP3rd PAC data."""
 
     def test_anim_sub_quest_pac(self):
-        """file_04016 sub[3]: anim_count=53; table sized by anim_count; real decode."""
+        """file_04016 sub[3]: real decode via the reference (Kurogami) header logic.
+        The slot table is sized by (first_anim-hsize-4)/4 (= 100 here), NOT word0."""
         anim_blob = _read_pac_sub(QUEST_PAC, 3)
         pack = anim_parse_p3rd(anim_blob)
-        anim_count = struct.unpack_from("<I", anim_blob)[0]
-        self.assertEqual(pack.magic, anim_count)              # 53
-        self.assertEqual(pack.slot_count, anim_count)         # table size == anim_count
+        word0 = struct.unpack_from("<I", anim_blob)[0]
+        self.assertEqual(pack.magic, word0)                   # raw count field (53)
+        hsize = struct.unpack_from("<I", anim_blob, 4)[0]
+        first_anim = struct.unpack_from("<I", anim_blob, hsize - 4)[0]
+        self.assertEqual(pack.slot_count, (first_anim - hsize - 4) // 4)
         self.assertGreaterEqual(len(pack.animations), 5)
         # real keyframes decoded (not a stub)
         nkf = sum(len(c.keyframes) for a in pack.animations
@@ -201,14 +203,16 @@ class TestAnimParseP3rdLive(unittest.TestCase):
             self.assertEqual(len(anim.tracks), anim.bone_count)
 
     def test_anim_quest_pac2(self):
-        """file_04000 sub[3]: anim_count=5; word2(slot_count) is 0 here — the table is
-        correctly sized by anim_count (word0), so the anims still decode."""
+        """file_04000 sub[3]: word0(count) is small (5) but the slot table is sized by
+        the reference logic (first_anim-hsize-4)/4, so the anims still decode."""
         if not os.path.isfile(QUEST_PAC2):
             self.skipTest("file_04000 not present")
         anim_blob = _read_pac_sub(QUEST_PAC2, 3)
         pack = anim_parse_p3rd(anim_blob)
-        self.assertLess(pack.magic, 20)                       # anim_count == 5
-        self.assertEqual(pack.slot_count, pack.magic)         # table sized by anim_count
+        self.assertLess(pack.magic, 20)                       # raw word0 count == 5
+        hsize = struct.unpack_from("<I", anim_blob, 4)[0]
+        first_anim = struct.unpack_from("<I", anim_blob, hsize - 4)[0]
+        self.assertEqual(pack.slot_count, (first_anim - hsize - 4) // 4)
         self.assertGreaterEqual(len(pack.animations), 1)      # decodes (old stub got 0)
         # frames non-decreasing in every decoded channel
         for a in pack.animations:

@@ -148,33 +148,50 @@ def parse_p3rd(blob: bytes) -> AnimationPack:
     (the MHFU data model), so anim_ingame.from_flat_anim / swap_anim_to_realmotion
     consume it directly for the cross-game animation port.
     """
-    if len(blob) < 0x0c:
+    if len(blob) < 0x10:
         return AnimationPack(magic=0, slot_count=0, animations=[], header=blob, raw=blob)
-    # MHP3rd header: word0 = anim_count (== the slot-table entry count), word1 = hsize
-    # (0x18 in-quest), word2 = a secondary count (NOT the table size — that was the
-    # old bug; MHFU uses word2 but MHP3rd's table is sized by anim_count/word0).
-    anim_count, hsize, slot_count = struct.unpack_from("<3I", blob, 0)
-    # Two known sub-formats:
-    #   in-quest: hsize is a small header size (e.g. 0x18); slot table at hsize-4.
-    #   lobby:    hsize == total blob size; slot table starts immediately at byte 0x0c.
-    n = anim_count
-    tbase = hsize - 4
-    if not (0 <= tbase and tbase + n * 4 <= len(blob)):
-        tbase = 0x0c   # lobby format: slot table right after the 3-word header
+    # Authoritative MHP3rd container layout (Kurogami2134/blender_p3rd_anim
+    # p3rd_monster_anim.bt + anim_pack_tools.py):
+    #   word0 = count (informational), word1 = header_size (varies: 0x18 / 0x20 / ...),
+    #   the LAST header word (at header_size-4) = first_anim offset,
+    #   one null word at header_size, then the slot offset table at header_size+4
+    #   with length = (first_anim - header_size - 4) / 4. 0xFFFFFFFF = empty slot.
+    # (The old hsize-4 / word0-count guess worked only for 0x18 headers and mis-
+    #  indexed slots; this matches the reference template + handles big monsters.)
+    count_field, hsize = struct.unpack_from("<2I", blob, 0)
     anims: list[Animation] = []
-    if 0 <= tbase and 0 < n and tbase + n * 4 <= len(blob):
-        table = struct.unpack_from("<%dI" % n, blob, tbase)
-        for i, off in enumerate(table):
-            if off == EMPTY or not (0 < off < len(blob)):
-                continue
-            try:
-                anims.append(_parse_anim_p3rd(blob, off, i))
-            except (struct.error, IndexError):
-                pass
+    n = 0
+    if 0x10 <= hsize <= 0x400 and hsize % 4 == 0 and hsize <= len(blob):
+        first_anim = struct.unpack_from("<I", blob, hsize - 4)[0]
+        if hsize + 4 < first_anim <= len(blob):
+            n = (first_anim - hsize - 4) // 4
+            tbase = hsize + 4
+            if 0 < n <= 1024 and tbase + n * 4 <= len(blob):
+                table = struct.unpack_from("<%dI" % n, blob, tbase)
+                for i, off in enumerate(table):
+                    if off == EMPTY or not (0 < off < len(blob)):
+                        continue
+                    try:
+                        anims.append(_parse_anim_p3rd(blob, off, i))
+                    except (struct.error, IndexError):
+                        pass
+    if not anims:
+        # lobby fallback: slot table right after the 3-word header (no first_anim word)
+        n = count_field
+        tbase = 0x0c
+        if 0 < n <= 1024 and tbase + n * 4 <= len(blob):
+            table = struct.unpack_from("<%dI" % n, blob, tbase)
+            for i, off in enumerate(table):
+                if off == EMPTY or not (0 < off < len(blob)):
+                    continue
+                try:
+                    anims.append(_parse_anim_p3rd(blob, off, i))
+                except (struct.error, IndexError):
+                    pass
     hdr_end = hsize if 0 < hsize <= len(blob) else min(0x18, len(blob))
     return AnimationPack(
-        magic=anim_count,       # store raw count field as magic (not 0x64)
-        slot_count=n,           # table entry count (== anim_count)
+        magic=count_field,      # raw count field (not 0x64)
+        slot_count=n,           # slot-table entry count
         animations=anims,
         header=blob[:hdr_end],
         raw=blob,
