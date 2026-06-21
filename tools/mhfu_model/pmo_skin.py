@@ -401,7 +401,40 @@ def build(scale, vgroups, materials, version=b"1.0\x00", clip=0.0) -> bytes:
 # --------------------------------------------------------------------------- #
 # auto-skinning (derive blend weights from geometry + skeleton)
 # --------------------------------------------------------------------------- #
-def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8):
+def _tree_neighborhoods(parents, hops):
+    """For each bone, the set of bones within ``hops`` tree edges (parent/child).
+
+    ``parents[i]`` = parent index of bone i (-1 = root). Returns ``list[set[int]]``
+    where entry i = {i} plus every bone reachable from i in <= hops steps along the
+    undirected skeleton tree. Used to keep a vertex's blend bones anatomically
+    connected (a tail vertex blends only adjacent tail joints, never a euclidean-
+    near leg bone) — fixes cross-region scramble (e.g. the Brute tail).
+    """
+    n = len(parents)
+    adj = [set() for _ in range(n)]
+    for i, p in enumerate(parents):
+        if 0 <= p < n:
+            adj[i].add(p)
+            adj[p].add(i)
+    nbr = []
+    for i in range(n):
+        seen = {i}
+        frontier = {i}
+        for _ in range(hops):
+            nxt = set()
+            for f in frontier:
+                nxt |= adj[f]
+            nxt -= seen
+            seen |= nxt
+            frontier = nxt
+            if not frontier:
+                break
+        nbr.append(seen)
+    return nbr
+
+
+def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8,
+              parents=None, hops=2):
     """Derive smooth blend skinning for a mesh that has NO source weights.
 
     For a ported monster whose source model is rigid-piece (no per-vertex weights
@@ -411,16 +444,28 @@ def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8):
     a roar). Per-vgroup palette is capped at ``max_pal`` (PSP's 8-matrix limit):
     the most-influential bones are kept and weights re-normalised over them.
 
+    Chain-aware mode (``parents`` given): each vertex is first bound to its single
+    nearest bone (the *primary*), then its blend partners are chosen ONLY from the
+    primary's tree-neighborhood (bones within ``hops`` skeleton edges). This keeps
+    the blend anatomically connected — a tail vertex blends adjacent tail joints,
+    not a leg bone that merely happens to be euclidean-near — fixing the tail
+    scramble + any cross-region bleed. Without ``parents`` it falls back to the
+    plain nearest-``nb``-anywhere behavior (backward compatible).
+
     Parameters
     ----------
     mesh_groups : list of model.MeshGroup (vertices with x/y/z[/u/v/i/j/k], faces).
     bone_world  : list[(x,y,z)] of each bone's BIND-WORLD position (same space as
                   the verts). Compute via bone_match.bind_world_positions.
     materials_of: callable(group)->material index, or None (-> 0).
+    parents     : optional list[int] of each bone's parent index (-1 = root) for
+                  chain-aware weighting. None -> nearest-anywhere.
+    hops        : tree radius for the chain-aware candidate set (default 2).
     Returns a list of SkinVGroup ready for ``build``/``encode``.
     """
     import math
     bw = list(bone_world)
+    nbr = _tree_neighborhoods(parents, hops) if parents is not None else None
     out = []
     for g in mesh_groups:
         infl = []
@@ -428,7 +473,12 @@ def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8):
             ds = [((v["x"] - b[0]) ** 2 + (v["y"] - b[1]) ** 2 + (v["z"] - b[2]) ** 2, i)
                   for i, b in enumerate(bw)]
             ds.sort()
-            near = ds[:nb]
+            if nbr is not None:
+                primary = ds[0][1]                 # single nearest bone
+                cand = nbr[primary]
+                near = [(d, i) for d, i in ds if i in cand][:nb]
+            else:
+                near = ds[:nb]
             ws = [(i, 1.0 / (math.sqrt(d) + 1e-3)) for d, i in near]
             s = sum(w for _, w in ws) or 1.0
             infl.append([(i, w / s) for i, w in ws])
@@ -452,6 +502,82 @@ def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8):
             mesh_offset=0, vertex_offset=0, index_offset=0,
             vertices=g.vertices, faces=g.faces, influences=infl2))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# high-level: re-skin geometry onto a native frame's skeleton, splice into frame
+# --------------------------------------------------------------------------- #
+def _pac_subs(blob):
+    n = struct.unpack_from("<I", blob, 0)[0]
+    return [struct.unpack_from("<II", blob, 4 + i * 8) for i in range(n)]
+
+
+def skeleton_tree(skel_blob):
+    """(parents, local_pos) from a 0xC0000000 skeleton, scanning section magics
+    (header/stride-robust; file_06185 has a 0x20 header, not 0x1C)."""
+    magics = (0x40000001, 0x40000002)
+    offs = [i for i in range(0, len(skel_blob) - 4, 4)
+            if struct.unpack_from("<I", skel_blob, i)[0] in magics]
+    parents, local = [], []
+    for so in offs:
+        _idx, par, _ch, _sib = struct.unpack_from("<4i", skel_blob, so + 0xC)
+        parents.append(par)
+        local.append(struct.unpack_from("<3f", skel_blob, so + 0x3C))
+    return parents, local
+
+
+def frame_skeleton(frame_blob, skel_sub_index=0):
+    """(parents, local_pos, bind_world) for the frame PAC's skeleton sub."""
+    from .bone_match import bind_world_positions
+    so, ss = _pac_subs(frame_blob)[skel_sub_index]
+    parents, local = skeleton_tree(frame_blob[so:so + ss])
+    return parents, local, bind_world_positions(parents, local)
+
+
+def splice_pmo_into_frame(frame_blob, pmo_bytes, pmo_sub_index=1):
+    """Overwrite the frame PAC's PMO sub with ``pmo_bytes`` (zero-padded to the slot),
+    keeping every other sub (skeleton/textures/animation/secondary) byte-identical.
+    Returns a same-size PAC (the proven in-place inject path). Raises if the PMO
+    exceeds the slot."""
+    po, psz = _pac_subs(frame_blob)[pmo_sub_index]
+    if len(pmo_bytes) > psz:
+        raise ValueError("PMO %d B > frame slot %d B (lower nb / split vgroups, or "
+                         "use the relocate inject path)" % (len(pmo_bytes), psz))
+    out = bytearray(frame_blob)
+    out[po:po + psz] = pmo_bytes + b"\x00" * (psz - len(pmo_bytes))
+    return bytes(out)
+
+
+def splice_skinned_pmo(frame_blob, geo_model, nb=3, hops=1,
+                       pmo_sub_index=1, skel_sub_index=0):
+    """Re-skin a geometry PMO onto the frame's skeleton and splice it into the frame.
+
+    Shared core of the offline CLI (tools/build_brute_pac.py) and the Blender
+    exporter, so both reproduce byte-for-byte:
+
+      1. parse the frame's skeleton sub -> bone bind-world + parents,
+      2. chain-aware blend-skin ``geo_model``'s geometry against it (auto_skin, hops),
+      3. encode a native MHFU monster PMO reusing ``geo_model``'s OWN mesh-header /
+         material tables + scale (so the Brute's textures/material binding survive —
+         NOT the frame's native tables), and
+      4. overwrite the frame's PMO sub (zero-padded), keeping all other subs identical.
+
+    ``geo_model`` is a SkinModel (from ``read`` of the source Brute PMO) — only its
+    geometry + tables are used; its skinning is discarded and re-derived. Returns
+    ``(pac_bytes, stats_dict)``.
+    """
+    parents, _local, bw = frame_skeleton(frame_blob, skel_sub_index)
+    vgs = auto_skin(geo_model.vgroups, bw, materials_of=lambda g: g.material,
+                    nb=nb, max_pal=8, parents=parents, hops=hops)
+    geo_model.vgroups = vgs
+    pmo = encode(geo_model)                       # uses geo_model's tables, not frame's
+    out = splice_pmo_into_frame(frame_blob, pmo, pmo_sub_index)
+    stats = dict(bones=len(parents), vgroups=len(vgs),
+                 verts=sum(len(g.vertices) for g in vgs),
+                 pmo_bytes=len(pmo), slot=_pac_subs(frame_blob)[pmo_sub_index][1],
+                 total=len(out),
+                 avg_pal=sum(len(g.palette) for g in vgs) / max(1, len(vgs)))
+    return out, stats
 
 
 # --------------------------------------------------------------------------- #

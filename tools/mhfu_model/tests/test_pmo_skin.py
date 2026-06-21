@@ -98,6 +98,25 @@ def test_auto_skin_weights_nearest_bones():
     assert abs(dict(inf)[0] - dict(inf)[1]) < 0.1
 
 
+def test_auto_skin_chain_aware_excludes_euclidean_near_offchain_bone():
+    # tail chain 0-1-2 along +x; an "off-chain" bone 3 sits euclidean-near the
+    # middle tail vertex but is NOT a tree neighbor -> chain mode must ignore it.
+    class _G:
+        def __init__(s, vs): s.vertices = vs; s.faces = []
+    bones = [(0, 0, 0), (10, 0, 0), (20, 0, 0), (10, 1, 0)]  # bone3 hugs bone1
+    parents = [-1, 0, 1, -1]                                  # 0->1->2 chain; 3 separate root
+    g = _G([{"x": 12, "y": 0, "z": 0}])                       # near bone1/bone2 (and bone3)
+    # plain mode would grab bone3 (it's euclidean-close); chain mode must not.
+    plain = PS.auto_skin([g], bones, nb=3)[0].influences[0]
+    assert 3 in {b for b, _ in plain}
+    chained = PS.auto_skin([_G([{"x": 12, "y": 0, "z": 0}])], bones,
+                           nb=3, parents=parents, hops=2)[0].influences[0]
+    bset = {b for b, w in chained if w != 0}
+    assert 3 not in bset                       # off-chain bone excluded
+    assert bset <= {0, 1, 2}                    # only tail-chain bones
+    assert abs(sum(w for _, w in chained) - 1.0) < 1e-6
+
+
 def test_auto_skin_palette_cap():
     # many bones around a cluster -> palette capped at max_pal
     class _G:
