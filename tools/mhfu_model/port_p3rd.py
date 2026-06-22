@@ -138,6 +138,10 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                 sl = [tuple(b.bind_pos) for b in ssk.bones]
                 dp, dl, _dw = _skin.frame_skeleton(frame_pac)
                 bone_map = _bm.match_skeletons(sp, sl, dp, dl)
+                # fill gaps where the host chain is longer than the source (e.g. the
+                # Tigrex tail has 5 joints, the Brute 4) so an unmatched chain-tip
+                # joint inherits its neighbour's source instead of kinking at bind.
+                bone_map = _bm.fill_unmatched(bone_map, dp, dl)
             except Exception:
                 bone_map = None
         out, ainfo = _ig.swap_anim_to_realmotion(

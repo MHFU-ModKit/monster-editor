@@ -142,6 +142,44 @@ def match_skeletons(src_parents: Sequence[int], src_local: Sequence[Vec3],
     return out
 
 
+def fill_unmatched(bone_map: Dict[int, Optional[int]],
+                   dst_parents: Sequence[int], dst_local: Sequence[Vec3],
+                   max_dist: Optional[float] = None) -> Dict[int, Optional[int]]:
+    """Fill ``None`` (unmatched) target joints from their nearest MATCHED neighbour.
+
+    When the target rig has a LONGER chain than the source (e.g. the MHFU Tigrex tail
+    has 5 joints but the MHP3rd Brute tail has 4), greedy 1:1 matching leaves the extra
+    target joint unmatched — it then stays at bind pose while its animated neighbours
+    move, kinking the chain and scrambling the chain-skinned geometry (the Brute tail
+    bug). This post-pass assigns each unmatched joint the source bone of the closest
+    matched joint by bind-WORLD distance, so a too-long target chain is driven
+    coherently (the source's last bone covers the extra tips). Returns a NEW map.
+    """
+    dw = bind_world_positions(dst_parents, dst_local)
+    out = dict(bone_map)
+    matched = [d for d, s in out.items() if s is not None]
+    if not matched:
+        return out
+    xs = [p[0] for p in dw]; ys = [p[1] for p in dw]; zs = [p[2] for p in dw]
+    diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2
+            + (max(zs) - min(zs)) ** 2) ** 0.5 if xs else 1e9
+    if max_dist is None:
+        max_dist = 0.5 * diag
+    for d, s in list(out.items()):
+        if s is not None:
+            continue
+        dx, dy, dz = dw[d]
+        best = None
+        for m in matched:
+            mx, my, mz = dw[m]
+            dist = ((dx - mx) ** 2 + (dy - my) ** 2 + (dz - mz) ** 2) ** 0.5
+            if dist <= max_dist and (best is None or dist < best[0]):
+                best = (dist, m)
+        if best is not None:
+            out[d] = out[best[1]]
+    return out
+
+
 def remap_tracks(tracks: list, bone_map: Dict[int, Optional[int]],
                  n_dst: int, empty_factory=None) -> list:
     """Reorder a source ``tracks`` list into target-joint order via ``bone_map``.

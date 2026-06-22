@@ -117,6 +117,19 @@ def test_auto_skin_chain_aware_excludes_euclidean_near_offchain_bone():
     assert abs(sum(w for _, w in chained) - 1.0) < 1e-6
 
 
+def test_fill_unmatched_chain_tip():
+    # target tail chain 0-1-2-3 (longer); source only reaches joint 2 -> joint 3 (tip)
+    # is unmatched and must inherit its nearest matched neighbour's source.
+    from mhfu_model import bone_match as BM
+    parents = [-1, 0, 1, 2]
+    local = [(0, 0, 0), (0, 0, -10), (0, 0, -10), (0, 0, -10)]   # extends in -z
+    bone_map = {0: 0, 1: 1, 2: 2, 3: None}                       # tip unmatched
+    filled = BM.fill_unmatched(bone_map, parents, local)
+    assert filled[3] is not None                                  # gap filled
+    assert filled[3] == 2                                          # nearest matched = joint2's src
+    assert filled[0] == 0 and filled[1] == 1 and filled[2] == 2   # others unchanged
+
+
 def test_auto_skin_palette_cap():
     # many bones around a cluster -> palette capped at max_pal
     class _G:
