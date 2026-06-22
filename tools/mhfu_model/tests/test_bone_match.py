@@ -69,9 +69,11 @@ def test_from_flat_anim_bone_map_places_tracks():
     ig = from_flat_anim(pack, split=[7], num_slots=4, bone_map=bm)
     blk = ig.streams[0].clips[0]
     assert len(blk.bones) == 7
-    # joints 0,1 static (no channels), 2..6 carry the source tracks
-    assert (blk.bones[0].mask & 0xFFFF) == 0
-    assert (blk.bones[1].mask & 0xFFFF) == 0
+    # joints 0,1 unmatched -> REST pose (identity rotation channels, all value 0), NOT
+    # an empty section (empty zeroes the matrix -> collapse). 2..6 carry source tracks.
+    for j in (0, 1):
+        assert blk.bones[j].channels, "unmatched joint must get rest channels, not empty"
+        assert all(k.value == 0 for c in blk.bones[j].channels for k in c.keyframes)
     assert (blk.bones[2].mask & 0xFFFF) != 0
     assert blk.bones[2].channels[0].keyframes[0].value == 100
     assert blk.bones[6].channels[0].keyframes[0].value == 104

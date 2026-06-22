@@ -434,7 +434,7 @@ def _tree_neighborhoods(parents, hops):
 
 
 def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8,
-              parents=None, hops=2):
+              parents=None, hops=2, region_lock=True, region_hops=3, exclude=None):
     """Derive smooth blend skinning for a mesh that has NO source weights.
 
     For a ported monster whose source model is rigid-piece (no per-vertex weights
@@ -464,19 +464,46 @@ def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8,
     Returns a list of SkinVGroup ready for ``build``/``encode``.
     """
     import math
+    from collections import Counter
     bw = list(bone_world)
+    excl = set(exclude or ())          # host joints that won't be animated (rest/dead):
+    #                                    never bind geometry to them or it pins to an
+    #                                    un-rotating joint and tears (the Brute tail).
     nbr = _tree_neighborhoods(parents, hops) if parents is not None else None
+    # region neighborhoods (wider) for the per-vgroup region lock
+    rnbr = _tree_neighborhoods(parents, region_hops) if parents is not None else None
     out = []
     for g in mesh_groups:
-        infl = []
+        # per-vertex sorted distances to every bone (excluded bones removed)
+        allds = []
         for v in g.vertices:
             ds = [((v["x"] - b[0]) ** 2 + (v["y"] - b[1]) ** 2 + (v["z"] - b[2]) ** 2, i)
-                  for i, b in enumerate(bw)]
+                  for i, b in enumerate(bw) if i not in excl]
             ds.sort()
+            allds.append(ds)
+        # REGION LOCK: a source vgroup is one rigid body PART, so confine ALL its verts
+        # to the dominant bone's tree-neighborhood. Without this, tail-base verts whose
+        # euclidean-nearest bone is a WING root (the parts overlap in space) bind to wing
+        # bones and fly off under wing animation (the Brute tail shards). The dominant
+        # bone = the majority per-vertex nearest; its region_hops neighborhood spans the
+        # whole part (e.g. all 5 tail joints) but never reaches another limb (that needs
+        # crossing the spine fork, > region_hops away).
+        region = None
+        if nbr is not None and region_lock and allds:
+            votes = Counter(ds[0][1] for ds in allds)
+            dominant = votes.most_common(1)[0][0]
+            region = rnbr[dominant]
+        infl = []
+        for ds in allds:
             if nbr is not None:
-                primary = ds[0][1]                 # single nearest bone
-                cand = nbr[primary]
-                near = [(d, i) for d, i in ds if i in cand][:nb]
+                if region is not None:
+                    cand = region
+                    near = [(d, i) for d, i in ds if i in cand][:nb]
+                    if not near:                      # vert outside the region: nearest in-region
+                        near = [(ds[0])]
+                else:
+                    cand = nbr[ds[0][1]]
+                    near = [(d, i) for d, i in ds if i in cand][:nb]
             else:
                 near = ds[:nb]
             ws = [(i, 1.0 / (math.sqrt(d) + 1e-3)) for d, i in near]

@@ -447,8 +447,11 @@ def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100,
             bones = []
             for t in seg:
                 if t is None:
-                    bones.append(empty_bone() if bone_map is not None
-                                 else rest_bone())
+                    # unmatched host joint -> REST (identity rot + bind pos), NOT
+                    # empty (empty zeroes the matrix -> collapse). A rest joint poses
+                    # at bind so its animated children keep the correct parent frame
+                    # (e.g. an unmatched middle tail joint between two driven ones).
+                    bones.append(rest_bone())
                 else:
                     bones.append(conv_track(t))
             while len(bones) < bc:                 # pad to the stream's allocation

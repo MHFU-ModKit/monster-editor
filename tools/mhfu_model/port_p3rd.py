@@ -94,11 +94,37 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     info["src_groups"] = len(model.mesh_groups)
     info["src_verts"] = sum(len(g.vertices) for g in model.mesh_groups)
 
-    # --- skin geometry onto the host (frame) skeleton, chain-aware ---
     parents, _local, bw = _skin.frame_skeleton(frame_pac)
+
+    # --- cross-rig bone correspondence (computed FIRST so skinning can avoid the
+    #     host joints that the moveset won't drive). When the host chain is LONGER
+    #     than the source (Tigrex tail 5 joints vs Brute 4) the extra joint is left
+    #     UNMATCHED (rest pose) — and geometry must NOT bind to it, else it pins to
+    #     an un-rotating joint and tears (the tail shards). We do NOT fill the gap
+    #     (filling makes a parent+child share one source -> FK compounds rotation ->
+    #     the tip whips out). ---
+    bone_map = None
+    if anim_blob is not None:
+        src_skel_sub = _find_sub(model_pac, b"\x00\x00\x00\x80")
+        if src_skel_sub:
+            try:
+                ssk = _skp.parse(model_pac[src_skel_sub[0]:src_skel_sub[0] + src_skel_sub[1]])
+                sp = [b.parent for b in ssk.bones]
+                sl = [tuple(b.bind_pos) for b in ssk.bones]
+                bone_map = _bm.match_skeletons(sp, sl, parents, _local)
+            except Exception:
+                bone_map = None
+    # host joints the anim leaves at rest (unmatched within the animated count) ->
+    # exclude from skinning so no geometry pins to an un-rotating joint.
+    dead = set()
+    if bone_map is not None:
+        dead = {d for d in range(host_count) if bone_map.get(d) is None}
+    info["dead_joints"] = sorted(dead)
+
+    # --- skin geometry onto the host (frame) skeleton, chain-aware, skipping dead joints ---
     vgs = _skin.auto_skin(model.mesh_groups, bw,
                           materials_of=lambda g: g.material,
-                          nb=nb, max_pal=8, parents=parents, hops=hops)
+                          nb=nb, max_pal=8, parents=parents, hops=hops, exclude=dead)
     # materials = one per distinct texID the groups reference (identity material table)
     texids = sorted({g.material for g in model.mesh_groups})
     tex_to_idx = {t: i for i, t in enumerate(texids)}
@@ -110,40 +136,19 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     info["materials"] = texids
 
     # --- assemble the output PAC: frame subs, swapping in our PMO + Brute TMH (+anim) ---
-    out_subs = []  # list of (magic_unused, bytes)
-    # we rebuild the sub table from the frame, replacing sub1(pmo) and sub2(tmh) and
-    # optionally sub3(anim); everything else verbatim.
     brute_tmh = _find_sub(model_pac, b".TMH")
     tmh_bytes = model_pac[brute_tmh[0]:brute_tmh[0] + brute_tmh[1]] if brute_tmh else None
 
     new = bytearray(frame_pac)
-    # replace PMO sub (frame sub1)
-    new = bytearray(_replace_sub(bytes(new), 1, pmo))
-    # replace TMH sub (frame sub2) with the monster's own atlas
+    new = bytearray(_replace_sub(bytes(new), 1, pmo))            # PMO sub
     if tmh_bytes is not None:
-        new = bytearray(_replace_sub(bytes(new), 2, tmh_bytes))
+        new = bytearray(_replace_sub(bytes(new), 2, tmh_bytes))  # his own TMH
         info["tmh_bytes"] = len(tmh_bytes)
 
-    # --- animation: retarget the monster's moveset to the host, in-game encode ---
+    # --- animation: retarget the monster's moveset to the host (unmatched -> rest) ---
     if anim_blob is not None:
         flat = _flatanim.parse_p3rd(anim_blob)
         info["anim_clips"] = len(flat.animations)
-        # source skeleton (the monster's own) for the cross-rig bone correspondence
-        src_skel_sub = _find_sub(model_pac, b"\x00\x00\x00\x80")
-        bone_map = None
-        if src_skel_sub:
-            try:
-                ssk = _skp.parse(model_pac[src_skel_sub[0]:src_skel_sub[0] + src_skel_sub[1]])
-                sp = [b.parent for b in ssk.bones]
-                sl = [tuple(b.bind_pos) for b in ssk.bones]
-                dp, dl, _dw = _skin.frame_skeleton(frame_pac)
-                bone_map = _bm.match_skeletons(sp, sl, dp, dl)
-                # fill gaps where the host chain is longer than the source (e.g. the
-                # Tigrex tail has 5 joints, the Brute 4) so an unmatched chain-tip
-                # joint inherits its neighbour's source instead of kinking at bind.
-                bone_map = _bm.fill_unmatched(bone_map, dp, dl)
-            except Exception:
-                bone_map = None
         out, ainfo = _ig.swap_anim_to_realmotion(
             bytes(new), flat, anim_index=3, skel_index=0,
             host_count=host_count, split=split,
