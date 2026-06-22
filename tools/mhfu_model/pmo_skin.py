@@ -433,8 +433,22 @@ def _tree_neighborhoods(parents, hops):
     return nbr
 
 
+def _seg_dist2(p, a, b):
+    """Squared distance from point p to the line SEGMENT a-b."""
+    ax, ay, az = a; bx, by, bz = b; px, py, pz = p
+    dx, dy, dz = bx - ax, by - ay, bz - az
+    L2 = dx * dx + dy * dy + dz * dz
+    if L2 < 1e-9:
+        return (px - ax) ** 2 + (py - ay) ** 2 + (pz - az) ** 2
+    t = ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / L2
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    cx, cy, cz = ax + t * dx, ay + t * dy, az + t * dz
+    return (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2
+
+
 def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8,
-              parents=None, hops=2, region_lock=True, region_hops=3, exclude=None):
+              parents=None, hops=2, region_lock=True, region_hops=3, exclude=None,
+              segment=True):
     """Derive smooth blend skinning for a mesh that has NO source weights.
 
     For a ported monster whose source model is rigid-piece (no per-vertex weights
@@ -472,13 +486,29 @@ def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8,
     nbr = _tree_neighborhoods(parents, hops) if parents is not None else None
     # region neighborhoods (wider) for the per-vgroup region lock
     rnbr = _tree_neighborhoods(parents, region_hops) if parents is not None else None
+    # bone "segments" (joint -> its parent's joint) for segment-distance weighting:
+    # a chest vertex is far from the WING joints but close to the SPINE segment it lies
+    # along, so segment distance keeps it on the spine and off the wings (vs joint
+    # distance, which pulls chest verts toward the euclidean-near wing-root joint ->
+    # 679u stretch flaps). Root bones have no segment -> fall back to the point.
+    seg = None
+    if segment and parents is not None:
+        seg = []
+        for i, b in enumerate(bw):
+            p = parents[i]
+            seg.append(bw[p] if (0 <= p < len(bw)) else b)
     out = []
     for g in mesh_groups:
         # per-vertex sorted distances to every bone (excluded bones removed)
         allds = []
         for v in g.vertices:
-            ds = [((v["x"] - b[0]) ** 2 + (v["y"] - b[1]) ** 2 + (v["z"] - b[2]) ** 2, i)
-                  for i, b in enumerate(bw) if i not in excl]
+            pt = (v["x"], v["y"], v["z"])
+            if seg is not None:
+                ds = [(_seg_dist2(pt, bw[i], seg[i]), i)
+                      for i in range(len(bw)) if i not in excl]
+            else:
+                ds = [((v["x"] - b[0]) ** 2 + (v["y"] - b[1]) ** 2 + (v["z"] - b[2]) ** 2, i)
+                      for i, b in enumerate(bw) if i not in excl]
             ds.sort()
             allds.append(ds)
         # REGION LOCK: a source vgroup is one rigid body PART, so confine ALL its verts
