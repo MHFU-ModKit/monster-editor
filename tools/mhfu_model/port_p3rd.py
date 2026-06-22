@@ -65,7 +65,7 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                  anim_blob: Optional[bytes] = None,
                  nb: int = 3, hops: int = 1,
                  host_count: int = 45, split=None,
-                 keep_anim_size: bool = False):
+                 keep_anim_size: bool = False, ground_lift: float = 0.0):
     """Port an MHP3rd big monster onto an MHFU host frame. Returns (pac_bytes, info).
 
     Parameters
@@ -149,6 +149,14 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     if anim_blob is not None:
         flat = _flatanim.parse_p3rd(anim_blob)
         info["anim_clips"] = len(flat.animations)
+        # GROUND LIFT: a swap-spawned monster is NOT terrain-placed — the engine pins
+        # its world Y at 0 (verified live), so the body (root + pelvis-lift ~300) sits
+        # mostly below the snow floor (~270). Baking +ground_lift units into the pelvis
+        # locY channel raises the whole body+feet onto the ground (the relocate inject
+        # can't rely on a per-frame Y write — the engine resets it every frame).
+        if ground_lift:
+            _apply_ground_lift(flat, ground_lift)
+            info["ground_lift"] = ground_lift
         out, ainfo = _ig.swap_anim_to_realmotion(
             bytes(new), flat, anim_index=3, skel_index=0,
             host_count=host_count, split=split,
@@ -162,6 +170,33 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     info["native_total"] = len(frame_pac)
     info["needs_relocate"] = len(new) != len(frame_pac)
     return bytes(new), info
+
+
+def _apply_ground_lift(flat, lift_units):
+    """Add ``lift_units`` (world units) to the pelvis bone's locY across every clip.
+
+    The pelvis = the bone whose locY channel carries the body height (the big ~300-unit
+    value; the root above it stays ~0). Loc quant = /16, so we add lift_units*16 raw.
+    Shifts the whole body+legs up uniformly (the relative bob is preserved)."""
+    LOCY = 0x80
+    raw = int(round(lift_units * 16))
+    # identify the pelvis bone index = the one with the largest mean |locY| over clips
+    import collections
+    score = collections.Counter()
+    for a in flat.animations:
+        for bi, t in enumerate(a.tracks):
+            for c in t.channels:
+                if (c.type & 0xFFF) == LOCY and c.keyframes:
+                    score[bi] += sum(abs(k.value) for k in c.keyframes) / len(c.keyframes)
+    if not score:
+        return
+    pelvis = score.most_common(1)[0][0]
+    for a in flat.animations:
+        if pelvis < len(a.tracks):
+            for c in a.tracks[pelvis].channels:
+                if (c.type & 0xFFF) == LOCY:
+                    for k in c.keyframes:
+                        k.value = max(-32768, min(32767, k.value + raw))
 
 
 def _replace_sub(pac: bytes, idx: int, data: bytes) -> bytes:

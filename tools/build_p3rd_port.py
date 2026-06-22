@@ -27,6 +27,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--nb", type=int, default=3)
     ap.add_argument("--hops", type=int, default=1)
+    ap.add_argument("--ground-lift", type=float, default=0.0,
+                    help="raise the body N world-units (swap-spawn isn't terrain-placed)")
     a = ap.parse_args()
 
     model = open(a.model, "rb").read()
@@ -35,7 +37,7 @@ def main():
     anim = open(a.anim, "rb").read() if a.anim else None
 
     pac, info = PORT.port_monster(model, frame, geo_companion=geo, anim_blob=anim,
-                                  nb=a.nb, hops=a.hops)
+                                  nb=a.nb, hops=a.hops, ground_lift=a.ground_lift)
     open(a.out, "wb").write(pac)
     print("wrote %s" % a.out)
     for k in ("src_groups", "src_verts", "pmo_bytes", "tmh_bytes", "materials",
