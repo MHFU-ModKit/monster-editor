@@ -65,7 +65,8 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                  anim_blob: Optional[bytes] = None,
                  nb: int = 3, hops: int = 1,
                  host_count: int = 45, split=None,
-                 keep_anim_size: bool = False, ground_lift: float = 0.0):
+                 keep_anim_size: bool = False, ground_lift: float = 0.0,
+                 weld: bool = True, weld_min_bonedist: float = 150.0):
     """Port an MHP3rd big monster onto an MHFU host frame. Returns (pac_bytes, info).
 
     Parameters
@@ -125,6 +126,11 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     vgs = _skin.auto_skin(model.mesh_groups, bw,
                           materials_of=lambda g: g.material,
                           nb=nb, max_pal=8, parents=parents, hops=hops, exclude=dead)
+    # Weld skinning-tear seams: coincident cross-vgroup verts skinned to far-apart
+    # bones separate when posed and open HOLES (the chest/wing-root red gaps). Re-bind
+    # each such cluster to one shared bone so they can't split. See pmo_skin.weld_seams.
+    if weld:
+        info["welded_seams"] = _skin.weld_seams(vgs, bw, min_bonedist=weld_min_bonedist)
     # materials = one per distinct texID the groups reference (identity material table)
     texids = sorted({g.material for g in model.mesh_groups})
     tex_to_idx = {t: i for i, t in enumerate(texids)}

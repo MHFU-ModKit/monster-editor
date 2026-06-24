@@ -191,6 +191,108 @@ def _vertex_fmt(nw: int) -> str:
     return "%dB2H3b3h" % nw
 
 
+def weld_seams(vgroups, bone_world, eps: float = 1.5,
+               min_bonedist: float = 150.0, max_bonedist: float = 300.0):
+    """Fix skinning-tear HOLES by welding seam vertices to a single shared bone.
+
+    A tear = vertices COINCIDENT in bind pose (so no gap at rest) that live in
+    DIFFERENT vgroups skinned to DIFFERENT, FAR-APART bones: when the skeleton is
+    posed they separate and open a hole (the red backface in-game). This finds each
+    such coincident cluster (spanning >1 vgroup, with bone-world spread >
+    ``min_bonedist``) and re-binds ALL its verts to ONE shared bone (the most-weighted
+    across the cluster) at weight 1.0 — identical influences ⇒ they transform together
+    ⇒ no gap, in EVERY pose (pose-independent, unlike a render check). Modifies
+    ``vgroups[*].influences`` in place; returns the number of clusters welded.
+
+    The shared bone is the cluster's dominant bone, so it is already in the affected
+    vgroups' palettes in the common case (no palette growth past the 8-bone cap).
+    Welding to a single bone makes the thin seam strip rigid (a faint crease at worst)
+    — far better than a hole. Tune ``min_bonedist`` up to weld only the worst tears.
+    """
+    from collections import Counter
+
+    def d(a, b):
+        return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
+
+    items = []                                   # (gi, vi, pos)
+    for gi, vg in enumerate(vgroups):
+        for vi, v in enumerate(vg.vertices):
+            if v is not None:
+                items.append((gi, vi, (v["x"], v["y"], v["z"])))
+    # current palette (distinct bones) per vgroup — weld must not push any past 8
+    palettes = []
+    for vg in vgroups:
+        s = set()
+        for infl in vg.influences:
+            for (b, w) in infl:
+                if w != 0 and b >= 0:
+                    s.add(b)
+        palettes.append(s)
+    cell = max(eps, 2.0)
+    grid = {}
+    for k, (_gi, _vi, p) in enumerate(items):
+        grid.setdefault((round(p[0]/cell), round(p[1]/cell), round(p[2]/cell)), []).append(k)
+
+    visited = set()
+    welded = 0
+    for k, (gi, vi, p) in enumerate(items):
+        if k in visited:
+            continue
+        kx, ky, kz = round(p[0]/cell), round(p[1]/cell), round(p[2]/cell)
+        cluster = [k]
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for j in grid.get((kx+dx, ky+dy, kz+dz), []):
+                        if j != k and j not in visited and d(items[j][2], p) <= eps:
+                            cluster.append(j)
+        if len({items[c][0] for c in cluster}) < 2:
+            continue
+        wsum = Counter()
+        doms = []                                # dominant bone of each cluster vert
+        for c in cluster:
+            g2, v2, _ = items[c]
+            infl = vgroups[g2].influences[v2]
+            for (b, w) in infl:
+                if w > 0.01 and 0 <= b < len(bone_world):
+                    wsum[b] += w
+            if infl:
+                db = max(infl, key=lambda bw_: bw_[1])[0]
+                if 0 <= db < len(bone_world):
+                    doms.append(db)
+        if len(wsum) < 2 or len(set(doms)) < 2:
+            continue
+        # TEAR MAGNITUDE = max distance between the cluster verts' DOMINANT bones (the
+        # actual separation when posed) — NOT the union of all blended bones (a chest
+        # vert that also lightly blends a far bone must not be judged a wing tear).
+        spread = max(d(bone_world[a], bone_world[b]) for a in doms for b in doms)
+        # BAND: weld only mid-range tears. Below min = adjacent bones (no visible gap).
+        # Above max = a legitimately stretchy membrane spanning far bones (e.g. the wing
+        # root, dominant-dist ~333) that the engine poses gently and does NOT visibly
+        # tear — welding it to one bone over-stiffens the membrane (the v54 upper-wing
+        # distortion). So skip those; only weld the genuine chest/hip tears (~150-300).
+        if not (min_bonedist <= spread <= max_bonedist):
+            continue
+        affected = {items[c][0] for c in cluster}
+        # Weld to ONE shared bone: the most-weighted that fits every affected vgroup's
+        # 8-bone palette cap (prefer one already present -> no growth). Identical single
+        # bone on all cluster verts ⇒ they transform together ⇒ no gap, in every pose.
+        wb = None
+        for cand, _w in wsum.most_common():
+            if all(cand in palettes[g] or len(palettes[g]) < 8 for g in affected):
+                wb = cand
+                break
+        if wb is None:
+            continue
+        for c in cluster:
+            g2, v2, _ = items[c]
+            vgroups[g2].influences[v2] = [(wb, 1.0)]
+            palettes[g2].add(wb)
+            visited.add(c)
+        welded += 1
+    return welded
+
+
 def _vgroup_palette(vg: SkinVGroup) -> List[int]:
     """Distinct bones influencing this vgroup, in first-seen order (== slot order)."""
     seen: List[int] = []
