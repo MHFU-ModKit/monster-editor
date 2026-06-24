@@ -139,7 +139,54 @@ def match_skeletons(src_parents: Sequence[int], src_local: Sequence[Vec3],
         if out[di] is None and si not in used_src:
             out[di] = si
             used_src.add(si)
+
+    _fix_leading_root_chain(out, sw, dw)
     return out
+
+
+def _fix_leading_root_chain(out: Dict[int, Optional[int]],
+                            sw: Sequence[Vec3], dw: Sequence[Vec3],
+                            eps: float = 1.0) -> None:
+    """Correct the matching of the leading *structural root chain* in-place.
+
+    Both skeletons store bones topologically (parent before child), so the leading
+    run of bones whose bind-WORLD position is the origin is the structural root
+    chain (zero-length joints). Pure position matching can't tell these apart (all
+    at the same point), so the greedy matcher pairs them in storage order — which is
+    WRONG when the two chains differ in length (e.g. the MHFU Tigrex host has 3
+    origin bones, the MHP3rd Brute source 2): it then pairs host0↔src0, host1↔src1
+    and STARVES host2 (the hip — the bone that carries the vertical positioning
+    ``locY``), so the ported monster never lifts and sinks into the floor.
+
+    The chains correspond from the TAIL (nearest the first real, distinctly-positioned
+    bone), not the head: align host[Lh-1]↔src[Ls-1], host[Lh-2]↔src[Ls-2], …; any
+    surplus LEADING host bones (the extra structural roots) stay unmatched (None) —
+    exactly the native layout (leading empty placeholder joints). No-op when the two
+    chains are the same length (1:1, unchanged) — safe for same-rig / equal-root ports.
+    """
+    def lead_origin(world: Sequence[Vec3]) -> int:
+        c = 0
+        for w in world:
+            if (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) ** 0.5 < eps:
+                c += 1
+            else:
+                break
+        return c
+
+    Lh = lead_origin(dw)
+    Ls = lead_origin(sw)
+    if Lh <= 0 or Ls <= 0:
+        return
+    k = min(Lh, Ls)
+    for d in range(Lh):                       # clear current (mis)assignments
+        out[d] = None
+    for j in range(k):                        # re-align from the tail
+        d = Lh - 1 - j
+        s = Ls - 1 - j
+        for dd in list(out):                  # free this src from any other dst
+            if out[dd] == s:
+                out[dd] = None
+        out[d] = s
 
 
 def fill_unmatched(bone_map: Dict[int, Optional[int]],
