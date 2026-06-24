@@ -664,6 +664,192 @@ def auto_skin(mesh_groups, bone_world, materials_of=None, nb=3, max_pal=8,
 
 
 # --------------------------------------------------------------------------- #
+# reference weight transfer (same-family port: copy a native monster's skinning)
+# --------------------------------------------------------------------------- #
+def _ref_triangle_soup(ref: "SkinModel"):
+    """Flatten a fully-skinned reference SkinModel into parallel arrays:
+    (A, B, C) triangle corner positions + (iA, iB, iC) per-corner influence dicts.
+    Degenerate (zero-area) triangles are dropped. Returns numpy arrays + lists."""
+    import numpy as np
+    A, B, C, iA, iB, iC = [], [], [], [], [], []
+    for vg in ref.vgroups:
+        verts = vg.vertices
+        infl = vg.influences
+        nv = len(verts)
+        for f in vg.faces:
+            i1, i2, i3 = f["v1"], f["v2"], f["v3"]
+            if i1 >= nv or i2 >= nv or i3 >= nv:
+                continue
+            va, vb, vc = verts[i1], verts[i2], verts[i3]
+            if va is None or vb is None or vc is None:
+                continue
+            pa = (va["x"], va["y"], va["z"])
+            pb = (vb["x"], vb["y"], vb["z"])
+            pc = (vc["x"], vc["y"], vc["z"])
+            # skip degenerate triangles (no surface to sample)
+            e1 = (pb[0]-pa[0], pb[1]-pa[1], pb[2]-pa[2])
+            e2 = (pc[0]-pa[0], pc[1]-pa[1], pc[2]-pa[2])
+            cx = e1[1]*e2[2] - e1[2]*e2[1]
+            cy = e1[2]*e2[0] - e1[0]*e2[2]
+            cz = e1[0]*e2[1] - e1[1]*e2[0]
+            if cx*cx + cy*cy + cz*cz < 1e-6:
+                continue
+            A.append(pa); B.append(pb); C.append(pc)
+            iA.append(infl[i1] if i1 < len(infl) else [])
+            iB.append(infl[i2] if i2 < len(infl) else [])
+            iC.append(infl[i3] if i3 < len(infl) else [])
+    if not A:
+        raise ValueError("reference mesh has no non-degenerate triangles")
+    return (np.asarray(A, dtype=np.float64), np.asarray(B, dtype=np.float64),
+            np.asarray(C, dtype=np.float64), iA, iB, iC)
+
+
+def _closest_bary_all(P, A, B, C):
+    """Barycentric coords of the closest point on every triangle (A,B,C) to point P.
+
+    Vectorized Ericson ClosestPtPointTriangle (Real-Time Collision Detection),
+    applied to all T triangles at once. Returns bary (T,3) = (u,v,w) such that the
+    closest point on triangle t is u*A[t] + v*B[t] + w*C[t]."""
+    import numpy as np
+    ab = B - A; ac = C - A
+    ap = P[None, :] - A
+    d1 = (ab * ap).sum(1); d2 = (ac * ap).sum(1)
+    bp = P[None, :] - B
+    d3 = (ab * bp).sum(1); d4 = (ac * bp).sum(1)
+    cp = P[None, :] - C
+    d5 = (ab * cp).sum(1); d6 = (ac * cp).sum(1)
+
+    vc = d1 * d4 - d3 * d2
+    vb = d5 * d2 - d1 * d6
+    va = d3 * d6 - d5 * d4
+
+    # face region (default): denom = va+vb+vc
+    denom = va + vb + vc
+    sden = np.where(np.abs(denom) > 1e-20, denom, 1.0)
+    fv = vb / sden; fw = vc / sden
+    bary = np.stack([1.0 - fv - fw, fv, fw], axis=1)
+
+    def _set(mask, u, v, w):
+        m = mask[:, None]
+        cand = np.stack([np.broadcast_to(u, va.shape),
+                         np.broadcast_to(v, va.shape),
+                         np.broadcast_to(w, va.shape)], axis=1)
+        return np.where(m, cand, bary)
+
+    # apply in REVERSE priority (lowest first) so highest-priority region wins
+    # edge BC: w=(d4-d3)/((d4-d3)+(d5-d6)), bary (0,1-w,w)
+    den_bc = (d4 - d3) + (d5 - d6)
+    wbc = (d4 - d3) / np.where(den_bc != 0, den_bc, 1.0)
+    m_bc = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0)
+    bary = _set(m_bc, 0.0, 1.0 - wbc, wbc)
+    # edge AC: w=d2/(d2-d6), bary (1-w,0,w)
+    wac = d2 / np.where((d2 - d6) != 0, (d2 - d6), 1.0)
+    m_ac = (vb <= 0) & (d2 >= 0) & (d6 <= 0)
+    bary = _set(m_ac, 1.0 - wac, 0.0, wac)
+    # vertex C: (0,0,1)
+    m_c = (d6 >= 0) & (d5 <= d6)
+    bary = _set(m_c, 0.0, 0.0, 1.0)
+    # edge AB: v=d1/(d1-d3), bary (1-v,v,0)
+    vab = d1 / np.where((d1 - d3) != 0, (d1 - d3), 1.0)
+    m_ab = (vc <= 0) & (d1 >= 0) & (d3 <= 0)
+    bary = _set(m_ab, 1.0 - vab, vab, 0.0)
+    # vertex B: (0,1,0)
+    m_b = (d3 >= 0) & (d4 <= d3)
+    bary = _set(m_b, 0.0, 1.0, 0.0)
+    # vertex A: (1,0,0)
+    m_a = (d1 <= 0) & (d2 <= 0)
+    bary = _set(m_a, 1.0, 0.0, 0.0)
+    return bary
+
+
+def _live_ancestor(bone, parents, dead):
+    """Walk up the parent chain until a non-dead joint (a joint the retargeted anim
+    actually drives). Returns the live ancestor, or the original bone if none found."""
+    if dead is None or bone not in dead:
+        return bone
+    seen = set()
+    b = bone
+    while 0 <= b < len(parents) and b in dead and b not in seen:
+        seen.add(b)
+        b = parents[b]
+    return b if (0 <= b < len(parents) and b not in dead) else bone
+
+
+def transfer_weights_from_reference(mesh_groups, ref, materials_of=None,
+                                    max_pal=8, parents=None, dead=None,
+                                    smooth_passes=0):
+    """Transfer blend skinning onto rigid-piece geometry from a fully-skinned
+    REFERENCE monster sharing the SAME model space + skeleton.
+
+    The principled replacement for ``auto_skin`` (nearest-bone guess) + ``weld_seams``
+    (single-bone patch) on **same-family** ports: the native MHFU monster (e.g. the
+    Tigrex ``file_06185`` sub1 for a Brute) is already perfectly skinned to the exact
+    host rig, so it is the ground-truth oracle. For each target vertex we find the
+    closest point on the reference mesh SURFACE (min over all reference triangles) and
+    barycentric-blend the three reference vertices' (bone, weight) influences there.
+    The result is smooth + anatomically correct by construction — no seam tears (the
+    reference doesn't tear) and no rigid spikes.
+
+    ``dead`` / ``parents``: host joints the retargeted animation will NOT drive
+    (unmatched in the bone map) are reassigned to their nearest LIVE ancestor, so no
+    vertex pins to an un-rotating joint (preserves the Brute-tail fix). Per-vgroup
+    palette is capped at ``max_pal`` (PSP 8-matrix limit); weights re-normalized.
+
+    Returns a list of SkinVGroup ready for ``build``/``encode``.
+    """
+    import numpy as np
+    A, B, C, iA, iB, iC = _ref_triangle_soup(ref)
+    parents = list(parents) if parents is not None else None
+    deadset = set(dead) if dead else None
+
+    out: List[SkinVGroup] = []
+    for g in mesh_groups:
+        infl: List[List[Tuple[int, float]]] = []
+        for v in g.vertices:
+            P = np.array([v["x"], v["y"], v["z"]], dtype=np.float64)
+            bary = _closest_bary_all(P, A, B, C)
+            cp = (bary[:, 0:1] * A + bary[:, 1:2] * B + bary[:, 2:3] * C)
+            d2 = ((P[None, :] - cp) ** 2).sum(1)
+            t = int(np.argmin(d2))
+            u, vv, w = float(bary[t, 0]), float(bary[t, 1]), float(bary[t, 2])
+            acc: dict = {}
+            for src, bw in ((iA[t], u), (iB[t], vv), (iC[t], w)):
+                if bw <= 0:
+                    continue
+                for (b, wt) in src:
+                    if wt == 0 or b < 0:
+                        continue
+                    rb = _live_ancestor(b, parents, deadset) if deadset else b
+                    acc[rb] = acc.get(rb, 0.0) + bw * wt
+            if not acc:
+                # closest triangle had no influence (shouldn't happen) -> nearest corner
+                acc = {0: 1.0}
+            s = sum(acc.values()) or 1.0
+            infl.append([(b, wv / s) for b, wv in acc.items()])
+
+        # per-vgroup palette cap (most-influential bones), then per-vertex renormalize
+        accg: dict = {}
+        for vi in infl:
+            for b, wt in vi:
+                accg[b] = accg.get(b, 0.0) + wt
+        palette = [b for b, _ in sorted(accg.items(), key=lambda x: -x[1])[:max_pal]]
+        pset = set(palette)
+        infl2 = []
+        for vi in infl:
+            kept = [(b, wt) for b, wt in vi if b in pset]
+            if not kept:
+                kept = [(palette[0], 1.0)]
+            s = sum(wt for _, wt in kept) or 1.0
+            infl2.append([(b, wt / s) for b, wt in kept])
+        out.append(SkinVGroup(
+            index=len(out), bone_count=0, cum_bone_count=0, palette=palette,
+            material=(materials_of(g) if materials_of else 0),
+            mesh_offset=0, vertex_offset=0, index_offset=0,
+            vertices=g.vertices, faces=g.faces, influences=infl2))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # high-level: re-skin geometry onto a native frame's skeleton, splice into frame
 # --------------------------------------------------------------------------- #
 def _pac_subs(blob):

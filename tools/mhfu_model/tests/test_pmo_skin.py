@@ -142,6 +142,58 @@ def test_auto_skin_palette_cap():
         assert abs(sum(w for _, w in inf) - 1.0) < 1e-6
 
 
+def test_transfer_picks_exact_vertex_influence():
+    # reference = one triangle whose 3 corners carry distinct single-bone weights;
+    # a target vertex coincident with a corner must transfer THAT corner's influence.
+    class _G:
+        def __init__(s, vs): s.vertices = vs; s.faces = []
+
+    class _Ref:
+        pass
+    ref = _Ref()
+    vg = PS.SkinVGroup(
+        index=0, bone_count=0, cum_bone_count=0, palette=[],
+        material=0, mesh_offset=0, vertex_offset=0, index_offset=0,
+        vertices=[{"x": 0, "y": 0, "z": 0},
+                  {"x": 10, "y": 0, "z": 0},
+                  {"x": 0, "y": 10, "z": 0}],
+        faces=[{"v1": 0, "v2": 1, "v3": 2}],
+        influences=[[(5, 1.0)], [(6, 1.0)], [(7, 1.0)]])
+    ref.vgroups = [vg]
+    g = _G([{"x": 0.0, "y": 0.0, "z": 0.0},      # == corner0 -> bone 5
+            {"x": 10.0, "y": 0.0, "z": 0.0},     # == corner1 -> bone 6
+            {"x": 5.0, "y": 5.0, "z": 0.0}])     # edge midpoint 1-2 -> blend 6/7
+    out = PS.transfer_weights_from_reference([g], ref)[0]
+    assert dict(out.influences[0]) == {5: 1.0}
+    assert dict(out.influences[1]) == {6: 1.0}
+    mid = dict(out.influences[2])
+    assert set(mid) == {6, 7} and abs(mid[6] - 0.5) < 0.05
+    assert all(abs(sum(w for _, w in inf) - 1.0) < 1e-6 for inf in out.influences)
+
+
+def test_transfer_reassigns_dead_joint_to_live_ancestor():
+    # reference binds a vert to bone 3; bone 3 is "dead" (anim won't drive it) with
+    # parent 1 (live) -> the transferred weight must land on bone 1, never bone 3.
+    class _G:
+        def __init__(s, vs): s.vertices = vs; s.faces = []
+
+    class _Ref:
+        pass
+    ref = _Ref()
+    ref.vgroups = [PS.SkinVGroup(
+        index=0, bone_count=0, cum_bone_count=0, palette=[], material=0,
+        mesh_offset=0, vertex_offset=0, index_offset=0,
+        vertices=[{"x": 0, "y": 0, "z": 0}, {"x": 10, "y": 0, "z": 0},
+                  {"x": 0, "y": 10, "z": 0}],
+        faces=[{"v1": 0, "v2": 1, "v3": 2}],
+        influences=[[(3, 1.0)], [(3, 1.0)], [(3, 1.0)]])]
+    g = _G([{"x": 1.0, "y": 1.0, "z": 0.0}])
+    parents = [-1, 0, 1, 1]                       # bone3's parent = bone1
+    out = PS.transfer_weights_from_reference(
+        [g], ref, parents=parents, dead={3})[0]
+    assert dict(out.influences[0]) == {1: 1.0}    # reassigned off the dead joint
+
+
 def test_encoded_is_valid_pmo():
     sm = PS.read(_pmo_sub(_DATA))
     enc = PS.encode(sm)

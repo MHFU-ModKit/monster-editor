@@ -66,7 +66,8 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                  nb: int = 3, hops: int = 1,
                  host_count: int = 45, split=None,
                  keep_anim_size: bool = False, ground_lift: float = 0.0,
-                 weld: bool = True, weld_min_bonedist: float = 150.0):
+                 weld: bool = True, weld_min_bonedist: float = 150.0,
+                 skin: str = "auto"):
     """Port an MHP3rd big monster onto an MHFU host frame. Returns (pac_bytes, info).
 
     Parameters
@@ -79,6 +80,14 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     anim_blob     : the MHP3rd raw moveset bytes (file_<model+2>) to retarget; None =
                     keep the frame's native animation.
     host_count    : the host overlay slot's animated-bone count (Tigrex = 45).
+    skin          : "auto" = nearest-bone blend (auto_skin) + optional seam weld
+                    (no native reference needed — the no-similar-monster path).
+                    "transfer" = copy the host frame's OWN native skinning (frame
+                    sub1) onto the source geometry via closest-surface weight
+                    transfer — the principled SAME-FAMILY path (Brute<-Tigrex): the
+                    native monster is the perfect oracle, so NO guess + NO weld
+                    (drops the rigid-spike/hole whack-a-mole). Falls back to "auto"
+                    if the frame has no usable PMO reference.
     Result fits-in-place when possible; otherwise the caller uses the relocate inject.
     """
     subs = _pac_subs(frame_pac)
@@ -122,15 +131,30 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         dead = {d for d in range(host_count) if bone_map.get(d) is None}
     info["dead_joints"] = sorted(dead)
 
-    # --- skin geometry onto the host (frame) skeleton, chain-aware, skipping dead joints ---
-    vgs = _skin.auto_skin(model.mesh_groups, bw,
-                          materials_of=lambda g: g.material,
-                          nb=nb, max_pal=8, parents=parents, hops=hops, exclude=dead)
-    # Weld skinning-tear seams: coincident cross-vgroup verts skinned to far-apart
-    # bones separate when posed and open HOLES (the chest/wing-root red gaps). Re-bind
-    # each such cluster to one shared bone so they can't split. See pmo_skin.weld_seams.
-    if weld:
-        info["welded_seams"] = _skin.weld_seams(vgs, bw, min_bonedist=weld_min_bonedist)
+    # --- skin geometry onto the host (frame) skeleton ---
+    info["skin_mode"] = skin
+    ref_pmo = _find_sub(frame_pac, b"pmo\x00", which=0) if skin == "transfer" else None
+    if skin == "transfer" and ref_pmo is not None:
+        # SAME-FAMILY: transfer the native monster's own (perfect) skinning from the
+        # frame's PMO sub onto the source geometry by closest-surface barycentric
+        # weight transfer. No nearest-bone guess, no seam weld -> no spikes/holes.
+        ref = _skin.read(frame_pac[ref_pmo[0]:ref_pmo[0] + ref_pmo[1]])
+        vgs = _skin.transfer_weights_from_reference(
+            model.mesh_groups, ref, materials_of=lambda g: g.material,
+            max_pal=8, parents=parents, dead=dead)
+        info["skin_mode"] = "transfer"
+    else:
+        if skin == "transfer":
+            info["skin_mode"] = "auto(fallback:no-ref-pmo)"
+        # NO-REFERENCE path: nearest-bone blend, chain-aware, skipping dead joints.
+        vgs = _skin.auto_skin(model.mesh_groups, bw,
+                              materials_of=lambda g: g.material,
+                              nb=nb, max_pal=8, parents=parents, hops=hops, exclude=dead)
+        # Weld skinning-tear seams: coincident cross-vgroup verts skinned to far-apart
+        # bones separate when posed and open HOLES (the chest/wing-root red gaps). Re-bind
+        # each such cluster to one shared bone so they can't split. See weld_seams.
+        if weld:
+            info["welded_seams"] = _skin.weld_seams(vgs, bw, min_bonedist=weld_min_bonedist)
     # materials = one per distinct texID the groups reference (identity material table)
     texids = sorted({g.material for g in model.mesh_groups})
     tex_to_idx = {t: i for i, t in enumerate(texids)}

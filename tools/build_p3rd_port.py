@@ -29,6 +29,10 @@ def main():
     ap.add_argument("--hops", type=int, default=1)
     ap.add_argument("--ground-lift", type=float, default=0.0,
                     help="raise the body N world-units (swap-spawn isn't terrain-placed)")
+    ap.add_argument("--skin", choices=("auto", "transfer"), default="auto",
+                    help="auto = nearest-bone blend + seam weld (no native ref needed); "
+                         "transfer = copy the host frame's own native skinning onto the "
+                         "geometry (same-family path, e.g. Brute<-Tigrex; no weld)")
     a = ap.parse_args()
 
     model = open(a.model, "rb").read()
@@ -37,12 +41,13 @@ def main():
     anim = open(a.anim, "rb").read() if a.anim else None
 
     pac, info = PORT.port_monster(model, frame, geo_companion=geo, anim_blob=anim,
-                                  nb=a.nb, hops=a.hops, ground_lift=a.ground_lift)
+                                  nb=a.nb, hops=a.hops, ground_lift=a.ground_lift,
+                                  skin=a.skin)
     open(a.out, "wb").write(pac)
     print("wrote %s" % a.out)
-    for k in ("src_groups", "src_verts", "pmo_bytes", "tmh_bytes", "materials",
-              "anim_clips", "bone_map_matched", "anim", "total", "native_total",
-              "needs_relocate"):
+    for k in ("src_groups", "src_verts", "skin_mode", "welded_seams", "pmo_bytes",
+              "tmh_bytes", "materials", "anim_clips", "bone_map_matched", "anim",
+              "total", "native_total", "needs_relocate"):
         if k in info:
             print("  %-16s %s" % (k, info[k]))
 
