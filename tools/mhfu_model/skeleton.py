@@ -104,6 +104,66 @@ def assign_stream_ids(skel: Skeleton, split) -> Skeleton:
     return skel
 
 
+def _default_split(n: int):
+    """3-stream split mirroring native Tigrex's tail-stream sizes (…/9/5)."""
+    if n >= 9 + 5 + 1:
+        return [n - 14, 9, 5]
+    return [n]
+
+
+def p3rd_to_mhfu(p3rd_blob: bytes, split=None) -> bytes:
+    """Convert a MHP3rd (0x80000000) skeleton to a native MHFU 0xC0000000 skeleton.
+
+    The MHP3rd skeleton uses **0x5C** bone sections; the MHFU engine's joint builder
+    needs **0x10C** sections (`0x40000001` magic). We rebuild each section from the
+    parsed transform fields (idx/parent/child/sibling/scale/rot/pos at the canonical
+    offsets — identical across both games) into the full 0x10C layout. The matrix/aux
+    region `+0x54..0x10C` is left ZERO (the engine recomputes it at load — verified on
+    native `file_06185`). Stream-ids (`+0x50`) are assigned contiguously per ``split``
+    so the anim FK partitions cleanly (see :func:`assign_stream_ids`).
+
+    This is the source-skeleton (no-down-rig) path: a ported monster ships its OWN
+    skeleton, so its own anim drives it 1:1 (the joint count is data-driven — the engine
+    `malloc`s `bone_count*0x250` with no clamp). Returns the 0xC0000000 skeleton bytes.
+    """
+    from . import skeleton_p3rd as _skp
+    ssk = _skp.parse(p3rd_blob)
+    bones = ssk.bones
+    n = len(bones)
+    # preserve the source header's bone_count + animated-count fields
+    src_bone_count = struct.unpack_from("<I", p3rd_blob, 4)[0]
+    src_animated = struct.unpack_from("<I", p3rd_blob, 0x1C)[0]
+    animated = src_animated if 0 < src_animated <= n else n
+    sp = split or _default_split(animated)
+
+    runs = []
+    for sid, c in enumerate(sp):
+        runs += [sid] * c
+    while len(runs) < n:
+        runs.append(len(sp))                       # non-animated tail -> own stream id
+
+    secs = bytearray()
+    for i, b in enumerate(bones):
+        sec = bytearray(0x10C)
+        struct.pack_into("<I", sec, 0x00, SECTION_MAGIC)
+        struct.pack_into("<I", sec, 0x04, b.flag if getattr(b, "flag", 0) else 1)
+        struct.pack_into("<I", sec, 0x08, 0x10C)
+        struct.pack_into("<4i", sec, 0x0C, b.index, b.parent, b.child, b.sibling)
+        struct.pack_into("<3f", sec, 0x1C, *b.bind_scale)
+        struct.pack_into("<f",  sec, 0x28, 1.0)
+        struct.pack_into("<3f", sec, 0x2C, *b.bind_rot)
+        struct.pack_into("<f",  sec, 0x38, 1.0)
+        struct.pack_into("<3f", sec, 0x3C, *b.bind_pos)
+        struct.pack_into("<f",  sec, 0x48, 1.0)
+        struct.pack_into("<i",  sec, 0x4C, -1)
+        struct.pack_into("<I",  sec, 0x50, runs[i] & 0xFFFF)
+        secs += sec
+
+    total = 0x20 + len(secs)
+    hdr = struct.pack("<8I", MAGIC, src_bone_count, total, 0, 2, 0x14, 0, animated)
+    return bytes(hdr + secs)
+
+
 def encode(skel: Skeleton) -> bytes:
     """Serialize a skeleton blob from the data model.
 

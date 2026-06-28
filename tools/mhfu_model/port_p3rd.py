@@ -29,6 +29,7 @@ from . import anim as _flatanim
 from . import anim_ingame as _ig
 from . import bone_match as _bm
 from . import skeleton_p3rd as _skp
+from . import skeleton as _sk
 
 
 # --------------------------------------------------------------------------- #
@@ -67,7 +68,7 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                  host_count: int = 45, split=None,
                  keep_anim_size: bool = False, ground_lift: float = 0.0,
                  weld: bool = True, weld_min_bonedist: float = 150.0,
-                 skin: str = "auto"):
+                 skin: str = "auto", source_skeleton: bool = False):
     """Port an MHP3rd big monster onto an MHFU host frame. Returns (pac_bytes, info).
 
     Parameters
@@ -88,6 +89,13 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                     native monster is the perfect oracle, so NO guess + NO weld
                     (drops the rigid-spike/hole whack-a-mole). Falls back to "auto"
                     if the frame has no usable PMO reference.
+    source_skeleton : when True, ship the monster's OWN skeleton (no down-rig). sub0 is
+                    rebuilt from the MHP3rd 0x80000000 skeleton into the MHFU 0x10C
+                    format (`skeleton.p3rd_to_mhfu`, stream-ids assigned), the geometry
+                    is skinned to the SOURCE rig, and the anim plays 1:1 (no bone_map /
+                    host_count). Use for monsters whose shape differs from the host
+                    (the joint count is data-driven, so no FK overrun). Default False =
+                    the proven retarget-onto-host path.
     Result fits-in-place when possible; otherwise the caller uses the relocate inject.
     """
     subs = _pac_subs(frame_pac)
@@ -104,32 +112,48 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     info["src_groups"] = len(model.mesh_groups)
     info["src_verts"] = sum(len(g.vertices) for g in model.mesh_groups)
 
-    parents, _local, bw = _skin.frame_skeleton(frame_pac)
+    src_skel_sub = _find_sub(model_pac, b"\x00\x00\x00\x80")
+    src_skel_blob = (model_pac[src_skel_sub[0]:src_skel_sub[0] + src_skel_sub[1]]
+                     if src_skel_sub else None)
 
-    # --- cross-rig bone correspondence (computed FIRST so skinning can avoid the
-    #     host joints that the moveset won't drive). When the host chain is LONGER
-    #     than the source (Tigrex tail 5 joints vs Brute 4) the extra joint is left
-    #     UNMATCHED (rest pose) — and geometry must NOT bind to it, else it pins to
-    #     an un-rotating joint and tears (the tail shards). We do NOT fill the gap
-    #     (filling makes a parent+child share one source -> FK compounds rotation ->
-    #     the tip whips out). ---
-    bone_map = None
-    if anim_blob is not None:
-        src_skel_sub = _find_sub(model_pac, b"\x00\x00\x00\x80")
-        if src_skel_sub:
+    if source_skeleton:
+        # --- SOURCE-SKELETON path: rig = the monster's OWN skeleton (no down-rig). ---
+        if src_skel_blob is None:
+            raise ValueError("source_skeleton mode needs a 0x80000000 skeleton sub")
+        from .bone_match import bind_world_positions
+        ssk = _skp.parse(src_skel_blob)
+        parents = [b.parent for b in ssk.bones]
+        _local = [tuple(b.bind_pos) for b in ssk.bones]
+        bw = bind_world_positions(parents, _local)
+        bone_map = None
+        dead = set()
+        info["mode"] = "source_skeleton"
+        info["src_bones"] = len(ssk.bones)
+    else:
+        parents, _local, bw = _skin.frame_skeleton(frame_pac)
+        info["mode"] = "retarget_to_host"
+        # --- cross-rig bone correspondence (computed FIRST so skinning can avoid the
+        #     host joints that the moveset won't drive). When the host chain is LONGER
+        #     than the source (Tigrex tail 5 joints vs Brute 4) the extra joint is left
+        #     UNMATCHED (rest pose) — and geometry must NOT bind to it, else it pins to
+        #     an un-rotating joint and tears (the tail shards). We do NOT fill the gap
+        #     (filling makes a parent+child share one source -> FK compounds rotation ->
+        #     the tip whips out). ---
+        bone_map = None
+        if anim_blob is not None and src_skel_blob is not None:
             try:
-                ssk = _skp.parse(model_pac[src_skel_sub[0]:src_skel_sub[0] + src_skel_sub[1]])
+                ssk = _skp.parse(src_skel_blob)
                 sp = [b.parent for b in ssk.bones]
                 sl = [tuple(b.bind_pos) for b in ssk.bones]
                 bone_map = _bm.match_skeletons(sp, sl, parents, _local)
             except Exception:
                 bone_map = None
-    # host joints the anim leaves at rest (unmatched within the animated count) ->
-    # exclude from skinning so no geometry pins to an un-rotating joint.
-    dead = set()
-    if bone_map is not None:
-        dead = {d for d in range(host_count) if bone_map.get(d) is None}
-    info["dead_joints"] = sorted(dead)
+        # host joints the anim leaves at rest (unmatched within the animated count) ->
+        # exclude from skinning so no geometry pins to an un-rotating joint.
+        dead = set()
+        if bone_map is not None:
+            dead = {d for d in range(host_count) if bone_map.get(d) is None}
+        info["dead_joints"] = sorted(dead)
 
     # --- skin geometry onto the host (frame) skeleton ---
     info["skin_mode"] = skin
@@ -174,6 +198,10 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     if tmh_bytes is not None:
         new = bytearray(_replace_sub(bytes(new), 2, tmh_bytes))  # his own TMH
         info["tmh_bytes"] = len(tmh_bytes)
+    if source_skeleton:
+        conv = _sk.p3rd_to_mhfu(src_skel_blob)                   # the monster's OWN skeleton
+        new = bytearray(_replace_sub(bytes(new), 0, conv))
+        info["skeleton_bytes"] = len(conv)
 
     # --- animation: retarget the monster's moveset to the host (unmatched -> rest) ---
     if anim_blob is not None:
@@ -189,7 +217,8 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
             info["ground_lift"] = ground_lift
         out, ainfo = _ig.swap_anim_to_realmotion(
             bytes(new), flat, anim_index=3, skel_index=0,
-            host_count=host_count, split=split,
+            host_count=(None if source_skeleton else host_count),
+            split=(None if source_skeleton else split),
             keep_size=keep_anim_size, bone_map=bone_map)
         new = bytearray(out)
         info["anim"] = ainfo

@@ -33,6 +33,9 @@ def main():
                     help="auto = nearest-bone blend + seam weld (no native ref needed); "
                          "transfer = copy the host frame's own native skinning onto the "
                          "geometry (same-family path, e.g. Brute<-Tigrex; no weld)")
+    ap.add_argument("--source-skeleton", action="store_true",
+                    help="ship the monster's OWN skeleton (no lossy down-rig to the host "
+                         "rig) — for shapes that differ from the host; anim plays 1:1")
     a = ap.parse_args()
 
     model = open(a.model, "rb").read()
@@ -42,10 +45,11 @@ def main():
 
     pac, info = PORT.port_monster(model, frame, geo_companion=geo, anim_blob=anim,
                                   nb=a.nb, hops=a.hops, ground_lift=a.ground_lift,
-                                  skin=a.skin)
+                                  skin=a.skin, source_skeleton=a.source_skeleton)
     open(a.out, "wb").write(pac)
     print("wrote %s" % a.out)
-    for k in ("src_groups", "src_verts", "skin_mode", "welded_seams", "pmo_bytes",
+    for k in ("mode", "src_bones", "skeleton_bytes", "src_groups", "src_verts",
+              "skin_mode", "welded_seams", "pmo_bytes",
               "tmh_bytes", "materials", "anim_clips", "bone_map_matched", "anim",
               "total", "native_total", "needs_relocate"):
         if k in info:
