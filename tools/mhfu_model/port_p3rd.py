@@ -116,6 +116,7 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     src_skel_blob = (model_pac[src_skel_sub[0]:src_skel_sub[0] + src_skel_sub[1]]
                      if src_skel_sub else None)
 
+    lead_pad = 0
     if source_skeleton:
         # --- SOURCE-SKELETON path: rig = the monster's OWN skeleton (no down-rig). ---
         if src_skel_blob is None:
@@ -125,7 +126,32 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         parents = [b.parent for b in ssk.bones]
         _local = [tuple(b.bind_pos) for b in ssk.bones]
         bw = bind_world_positions(parents, _local)
-        bone_map = None
+
+        # The native big-mon OVERLAY hardcodes the hip/ground joint index (Tigrex = the
+        # tail of a 3-bone leading-origin chain = joint 2). A source skeleton with a
+        # SHORTER leading-origin chain lands its hip at a lower joint -> the overlay's
+        # lift misses it -> the body sinks. Pad the leading origin chain to match the
+        # host's count so the hip aligns; shift the anim + skinning by the same amount.
+        def _lead_origin(world, eps=1.0):
+            c = 0
+            for w in world:
+                if (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) ** 0.5 < eps:
+                    c += 1
+                else:
+                    break
+            return c
+        hp, hl, hbw = _skin.frame_skeleton(frame_pac)
+        lead_pad = max(0, _lead_origin(hbw) - _lead_origin(bw))
+        info["lead_pad"] = lead_pad
+        if lead_pad:
+            # prepend lead_pad origin bones to the rig used for skinning
+            parents = [(-1 if j == 0 else j - 1) for j in range(lead_pad)] + \
+                      [(p + lead_pad if p >= 0 else lead_pad - 1) for p in parents]
+            bw = [(0.0, 0.0, 0.0)] * lead_pad + list(bw)
+            # anim: source track i drives joint i+lead_pad; placeholders stay at rest
+            bone_map = {i + lead_pad: i for i in range(len(ssk.bones))}
+        else:
+            bone_map = None
         dead = set()
         info["mode"] = "source_skeleton"
         info["src_bones"] = len(ssk.bones)
@@ -199,7 +225,7 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         new = bytearray(_replace_sub(bytes(new), 2, tmh_bytes))  # his own TMH
         info["tmh_bytes"] = len(tmh_bytes)
     if source_skeleton:
-        conv = _sk.p3rd_to_mhfu(src_skel_blob)                   # the monster's OWN skeleton
+        conv = _sk.p3rd_to_mhfu(src_skel_blob, lead_pad=lead_pad)  # own skeleton (+origin pad)
         new = bytearray(_replace_sub(bytes(new), 0, conv))
         info["skeleton_bytes"] = len(conv)
 

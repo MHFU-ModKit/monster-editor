@@ -111,7 +111,7 @@ def _default_split(n: int):
     return [n]
 
 
-def p3rd_to_mhfu(p3rd_blob: bytes, split=None) -> bytes:
+def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0) -> bytes:
     """Convert a MHP3rd (0x80000000) skeleton to a native MHFU 0xC0000000 skeleton.
 
     The MHP3rd skeleton uses **0x5C** bone sections; the MHFU engine's joint builder
@@ -122,18 +122,26 @@ def p3rd_to_mhfu(p3rd_blob: bytes, split=None) -> bytes:
     native `file_06185`). Stream-ids (`+0x50`) are assigned contiguously per ``split``
     so the anim FK partitions cleanly (see :func:`assign_stream_ids`).
 
+    ``lead_pad`` prepends N zero-length **placeholder origin bones** after which the
+    source bones follow (a single-child chain root->ph1->...->src_root). The native
+    big-mon OVERLAY hardcodes which joint index is the hip/ground anchor (Tigrex = joint
+    2, after a 3-bone leading-origin chain); a source skeleton with a SHORTER leading
+    chain lands its hip at the wrong joint → the overlay's lift never reaches it and the
+    body sinks. Pad the leading chain to match the host's leading-origin count so the
+    hip aligns (the caller shifts the anim/skin by the same ``lead_pad``).
+
     This is the source-skeleton (no-down-rig) path: a ported monster ships its OWN
     skeleton, so its own anim drives it 1:1 (the joint count is data-driven — the engine
     `malloc`s `bone_count*0x250` with no clamp). Returns the 0xC0000000 skeleton bytes.
     """
     from . import skeleton_p3rd as _skp
     ssk = _skp.parse(p3rd_blob)
-    bones = ssk.bones
-    n = len(bones)
-    # preserve the source header's bone_count + animated-count fields
+    src = ssk.bones
+    nsrc = len(src)
+    n = nsrc + lead_pad
     src_bone_count = struct.unpack_from("<I", p3rd_blob, 4)[0]
     src_animated = struct.unpack_from("<I", p3rd_blob, 0x1C)[0]
-    animated = src_animated if 0 < src_animated <= n else n
+    animated = (src_animated if 0 < src_animated <= nsrc else nsrc) + lead_pad
     sp = split or _default_split(animated)
 
     runs = []
@@ -142,25 +150,38 @@ def p3rd_to_mhfu(p3rd_blob: bytes, split=None) -> bytes:
     while len(runs) < n:
         runs.append(len(sp))                       # non-animated tail -> own stream id
 
+    # unified bone list: lead_pad placeholders (origin chain) then the shifted source.
+    def sh(v):                                      # shift a bone link by lead_pad (-1 stays)
+        return v + lead_pad if v is not None and v >= 0 else -1
+    bl = []   # (flag, idx, parent, child, sibling, scale, rot, pos)
+    for j in range(lead_pad):
+        bl.append((1, j, j - 1 if j > 0 else -1, j + 1, -1,
+                   (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+    for b in src:
+        parent = sh(b.parent) if b.parent >= 0 else (lead_pad - 1 if lead_pad else -1)
+        bl.append((b.flag if getattr(b, "flag", 0) else 1,
+                   b.index + lead_pad, parent, sh(b.child), sh(b.sibling),
+                   tuple(b.bind_scale), tuple(b.bind_rot), tuple(b.bind_pos)))
+
     secs = bytearray()
-    for i, b in enumerate(bones):
+    for i, (flag, idx, par, chld, sib, sc, ro, po) in enumerate(bl):
         sec = bytearray(0x10C)
         struct.pack_into("<I", sec, 0x00, SECTION_MAGIC)
-        struct.pack_into("<I", sec, 0x04, b.flag if getattr(b, "flag", 0) else 1)
+        struct.pack_into("<I", sec, 0x04, flag)
         struct.pack_into("<I", sec, 0x08, 0x10C)
-        struct.pack_into("<4i", sec, 0x0C, b.index, b.parent, b.child, b.sibling)
-        struct.pack_into("<3f", sec, 0x1C, *b.bind_scale)
+        struct.pack_into("<4i", sec, 0x0C, idx, par, chld, sib)
+        struct.pack_into("<3f", sec, 0x1C, *sc)
         struct.pack_into("<f",  sec, 0x28, 1.0)
-        struct.pack_into("<3f", sec, 0x2C, *b.bind_rot)
+        struct.pack_into("<3f", sec, 0x2C, *ro)
         struct.pack_into("<f",  sec, 0x38, 1.0)
-        struct.pack_into("<3f", sec, 0x3C, *b.bind_pos)
+        struct.pack_into("<3f", sec, 0x3C, *po)
         struct.pack_into("<f",  sec, 0x48, 1.0)
         struct.pack_into("<i",  sec, 0x4C, -1)
         struct.pack_into("<I",  sec, 0x50, runs[i] & 0xFFFF)
         secs += sec
 
     total = 0x20 + len(secs)
-    hdr = struct.pack("<8I", MAGIC, src_bone_count, total, 0, 2, 0x14, 0, animated)
+    hdr = struct.pack("<8I", MAGIC, src_bone_count + lead_pad, total, 0, 2, 0x14, 0, animated)
     return bytes(hdr + secs)
 
 
