@@ -78,6 +78,32 @@ def _encode_bone(b: Bone) -> bytes:
     return bytes(sec)
 
 
+def assign_stream_ids(skel: Skeleton, split) -> Skeleton:
+    """Set each bone's stream-id (`bone+0x50`, u16 → `joint+0x114`) so the anim FK
+    partitions all bones into streams without overrunning.
+
+    RE (2026-06-28, disasm `0x0886010c lw a2,0x50(a1)` → `0x08860110 sh a2,0x114(a0)`
+    + native Tigrex `file_06185`): the stream-id is `bone+0x50`; a valid partition is
+    **contiguous runs by bone index**. Native Tigrex = `{0:31, 1:9, 2:5, 3:3}`. An
+    MHP3rd source skeleton ships `+0x50`=0 on every bone (all stream 0 → FK overrun
+    crash), so a ported skeleton MUST be assigned before injection.
+
+    `split` = per-stream bone counts (e.g. [31, 9, 5, 3]); must match the anim's
+    stream partition. Patches each bone's raw section at +0x50 in place. Returns skel.
+    """
+    runs = []
+    for sid, n in enumerate(split):
+        runs += [sid] * n
+    if len(runs) < len(skel.bones):
+        runs += [len(split) - 1] * (len(skel.bones) - len(runs))   # trailing -> last stream
+    for b, sid in zip(skel.bones, runs):
+        if len(b.raw) >= 0x52:
+            sec = bytearray(b.raw)
+            struct.pack_into("<H", sec, 0x50, sid & 0xFFFF)
+            b.raw = bytes(sec)
+    return skel
+
+
 def encode(skel: Skeleton) -> bytes:
     """Serialize a skeleton blob from the data model.
 
