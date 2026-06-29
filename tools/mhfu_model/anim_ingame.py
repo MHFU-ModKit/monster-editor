@@ -428,6 +428,23 @@ def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100,
         # track on the joint it animates. Unmatched joints (None) get an EMPTY bone
         # section (static, like native's leading root joints). Without a map, the
         # legacy 1:1 flat-index split is used.
+        # Real clip length = the max keyframe frame over this clip's SOURCE tracks.
+        # The rest-bone padding (unmatched / shortfall joints) must span exactly this,
+        # NOT a fixed 180: a SHORT clip padded to 180 plays its real motion then the
+        # joints FREEZE holding the last pose until frame 180 before it loops/ends —
+        # the "plays then freezes / stops abruptly" artifact. The engine plays each clip
+        # to its own keyframe length + loop flag (there is no separate descriptor
+        # duration — RE'd 2026-06-29), so trimming the pad to the real length restores
+        # the monster's AUTHORED timing. (Source-skeleton ports are the worst case: the
+        # lead_pad placeholder joints are all rest bones.)
+        clip_end = 0
+        for tr in anim.tracks:
+            for c in tr.channels:
+                for k in c.keyframes:
+                    if k.frame > clip_end:
+                        clip_end = k.frame
+        if clip_end <= 0:
+            clip_end = 2          # degenerate empty clip — give the interpolator a span
         src_tracks = list(anim.tracks)
         if bone_map is not None:
             joint_tracks = []
@@ -451,11 +468,13 @@ def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100,
                     # empty (empty zeroes the matrix -> collapse). A rest joint poses
                     # at bind so its animated children keep the correct parent frame
                     # (e.g. an unmatched middle tail joint between two driven ones).
-                    bones.append(rest_bone())
+                    # Span the clip's REAL length (not 180) so a short clip isn't
+                    # stretched into a freeze-pad — see clip_end note above.
+                    bones.append(rest_bone(clip_end))
                 else:
                     bones.append(conv_track(t))
             while len(bones) < bc:                 # pad to the stream's allocation
-                bones.append(rest_bone())
+                bones.append(rest_bone(clip_end))
             blk = Block(tag=BLOCK_TAG, loop=anim.loop,
                         loop_start=float(getattr(anim, "loop_start", 0.0) or 0.0),
                         bones=bones)
