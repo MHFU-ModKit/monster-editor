@@ -34,6 +34,12 @@ GEO_FILE = os.path.join(P3RD_DATA, "file_04899.bin")
 # Lobby Tigrex (em058m0) — self-contained (ge_base < blob size for sub[5])
 LOBBY_FILE = os.path.join(P3RD_DATA, "file_05248.bin")
 
+# Brute Tigrex hi-detail model (file_05248) + its GE companion (file_05249) — the
+# blend-skinned monster used for the v102 bone-palette decode (see PMO_MODEL_FORMAT.md).
+BRUTE_MODEL = os.path.join(P3RD_DATA, "file_05248.bin")
+BRUTE_GEO = os.path.join(P3RD_DATA, "file_05249.bin")
+BRUTE_AVAILABLE = os.path.isfile(BRUTE_MODEL) and os.path.isfile(BRUTE_GEO)
+
 DATA_AVAILABLE = os.path.isfile(PAC_FILE) and os.path.isfile(GEO_FILE)
 LOBBY_AVAILABLE = os.path.isfile(LOBBY_FILE)
 
@@ -246,6 +252,75 @@ def test_skeleton_mhfu_compat():
     print("PASS test_skeleton_mhfu_compat")
 
 
+# --- v102 bone palette / authentic source skinning ----------------------------
+
+def test_v102_palette_influences():
+    """parse() attaches authentic per-vertex (bone, weight) influences from the v102
+    bone palette (header field 10). Validates the 2026-06-29 decode on the real Brute:
+    blend-skinned (NOT rigid), every bone index in skeleton range, weights sum ~1."""
+    if not BRUTE_AVAILABLE:
+        print("SKIP test_v102_palette_influences (no Brute model+geo)")
+        return
+    model_pac = open(BRUTE_MODEL, "rb").read()
+    geo = open(BRUTE_GEO, "rb").read()
+    pmo = _extract_pmo_sub(model_pac)          # largest-geometry v102 pmo sub
+    assert pmo is not None
+    m = pmo_p3rd.parse(pmo, geo_blob=geo)
+    assert m.mesh_groups, "geometry parsed empty"
+
+    nv = sum(len(g.vertices) for g in m.mesh_groups)
+    with_infl = sum(1 for g in m.mesh_groups for v in g.vertices if v.get("influences"))
+    multi = sum(1 for g in m.mesh_groups for v in g.vertices
+                if len(v.get("influences", [])) > 1)
+    # every vertex skinned, and a real majority is multi-bone (NOT rigid)
+    assert with_infl == nv, "not all verts got influences (%d/%d)" % (with_infl, nv)
+    assert multi > nv // 2, "expected blend skinning, got mostly single-bone (%d/%d)" % (multi, nv)
+
+    # bone indices in the source skeleton's range; weights normalizable
+    skel = _extract_skeleton_sub(model_pac)
+    nbones = skeleton_p3rd.parse(skel).bone_count if skel else 46
+    maxb = -1
+    for g in m.mesh_groups:
+        for v in g.vertices:
+            inf = v.get("influences", [])
+            assert inf, "vertex with empty influences"
+            for (b, w) in inf:
+                assert 0 <= b < nbones, "bone idx %d out of range 0..%d" % (b, nbones - 1)
+                maxb = max(maxb, b)
+    assert maxb >= 0
+    print("PASS test_v102_palette_influences (%d verts, %d multi-bone, max bone %d/%d)"
+          % (nv, multi, maxb, nbones - 1))
+
+
+def test_from_source_influences_builds():
+    """pmo_skin.from_source_influences turns parsed influences into valid SkinVGroups
+    (palette capped at 8, weights renormalized) that build() accepts."""
+    if not BRUTE_AVAILABLE:
+        print("SKIP test_from_source_influences_builds (no Brute model+geo)")
+        return
+    from mhfu_model import pmo_skin
+    model_pac = open(BRUTE_MODEL, "rb").read()
+    geo = open(BRUTE_GEO, "rb").read()
+    m = pmo_p3rd.parse(_extract_pmo_sub(model_pac), geo_blob=geo)
+    vgs = pmo_skin.from_source_influences(
+        m.mesh_groups, bone_remap=lambda b: b + 1,   # source-skeleton lead_pad=1
+        materials_of=lambda g: g.material, max_pal=8)
+    assert len(vgs) == len(m.mesh_groups)
+    for vg in vgs:
+        assert len(vg.palette) <= 8, "palette exceeds PSP 8-matrix cap"
+        for inf in vg.influences:
+            s = sum(w for _, w in inf)
+            assert abs(s - 1.0) < 1e-3, "influence weights not normalized (sum=%.4f)" % s
+            for b, _w in inf:
+                assert b >= 1, "bone_remap +1 not applied"
+    # the remapped vgroups encode to a valid PMO (would raise on a >8-bone vgroup)
+    materials = [{"texID": 0}]
+    pmo = pmo_skin.build(m.scale, vgs, [{"texID": t} for t in
+                         sorted({g.material for g in m.mesh_groups})] or materials)
+    assert pmo[:4] == b"pmo\x00"
+    print("PASS test_from_source_influences_builds (%d vgroups, %d B)" % (len(vgs), len(pmo)))
+
+
 # --- run all tests ------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -258,4 +333,6 @@ if __name__ == "__main__":
     test_skeleton_p3rd_parse()
     test_skeleton_p3rd_lobby()
     test_skeleton_mhfu_compat()
+    test_v102_palette_influences()
+    test_from_source_influences_builds()
     print("\nAll tests done.")

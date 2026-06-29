@@ -850,6 +850,74 @@ def transfer_weights_from_reference(mesh_groups, ref, materials_of=None,
 
 
 # --------------------------------------------------------------------------- #
+# authentic source skinning (port the monster's OWN blend weights)
+# --------------------------------------------------------------------------- #
+def from_source_influences(mesh_groups, bone_remap=None, materials_of=None,
+                           max_pal=8):
+    """Build SkinVGroups from the source mesh's OWN per-vertex (bone, weight)
+    influences — the authentic skin, NOT a nearest-bone guess.
+
+    Each vertex dict must carry ``influences`` = ``[(source_bone, weight), ...]`` as
+    resolved from the source PMO's bone palette (e.g. ``pmo_p3rd.parse``, which reads
+    the v102 ``Weight{slot,bone}[]`` palette). This is the principled path when the
+    source rig is SHIPPED (source-skeleton mode): the source bone indices map onto the
+    output rig 1:1 (offset by the leading-origin pad), so no oracle and no guess.
+
+    Parameters
+    ----------
+    mesh_groups : list of model.MeshGroup; each vertex has ``influences`` (and the
+                  usual x/y/z, u/v, i/j/k). Groups/verts WITHOUT influences fall back
+                  to a single bone (palette[0]) — they should not occur on a fully
+                  skinned source.
+    bone_remap  : callable(src_bone) -> out_bone, or None for identity. Returning a
+                  value < 0 drops that influence (its weight redistributes over the
+                  vertex's remaining influences). Use to shift source bone indices onto
+                  the output rig (source-skeleton: src i -> i + lead_pad; retarget:
+                  invert the host<-source bone map).
+    Returns a list of SkinVGroup ready for ``build`` / ``encode``.
+    """
+    def rm(b):
+        return b if bone_remap is None else bone_remap(b)
+    out: List[SkinVGroup] = []
+    for g in mesh_groups:
+        infl: List[List[Tuple[int, float]]] = []
+        for v in g.vertices:
+            src = v.get("influences") or []
+            acc: dict = {}
+            for (b, w) in src:
+                if w == 0 or b is None or b < 0:
+                    continue
+                ob = rm(b)
+                if ob is None or ob < 0:
+                    continue
+                acc[ob] = acc.get(ob, 0.0) + w
+            if not acc:
+                acc = {0: 1.0}
+            s = sum(acc.values()) or 1.0
+            infl.append([(b, w / s) for b, w in acc.items()])
+        # per-vgroup palette cap (PSP 8-matrix limit): keep the most-influential bones
+        accg: dict = {}
+        for vi in infl:
+            for b, w in vi:
+                accg[b] = accg.get(b, 0.0) + w
+        palette = [b for b, _ in sorted(accg.items(), key=lambda x: -x[1])[:max_pal]]
+        pset = set(palette)
+        infl2 = []
+        for vi in infl:
+            kept = [(b, w) for b, w in vi if b in pset]
+            if not kept:
+                kept = [(palette[0], 1.0)]
+            s = sum(w for _, w in kept) or 1.0
+            infl2.append([(b, w / s) for b, w in kept])
+        out.append(SkinVGroup(
+            index=len(out), bone_count=0, cum_bone_count=0, palette=palette,
+            material=(materials_of(g) if materials_of else 0),
+            mesh_offset=0, vertex_offset=0, index_offset=0,
+            vertices=g.vertices, faces=g.faces, influences=infl2))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # high-level: re-skin geometry onto a native frame's skeleton, splice into frame
 # --------------------------------------------------------------------------- #
 def _pac_subs(blob):

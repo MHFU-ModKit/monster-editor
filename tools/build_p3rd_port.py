@@ -29,10 +29,12 @@ def main():
     ap.add_argument("--hops", type=int, default=1)
     ap.add_argument("--ground-lift", type=float, default=0.0,
                     help="raise the body N world-units (swap-spawn isn't terrain-placed)")
-    ap.add_argument("--skin", choices=("auto", "transfer"), default="auto",
+    ap.add_argument("--skin", choices=("auto", "transfer", "source"), default="auto",
                     help="auto = nearest-bone blend + seam weld (no native ref needed); "
                          "transfer = copy the host frame's own native skinning onto the "
-                         "geometry (same-family path, e.g. Brute<-Tigrex; no weld)")
+                         "geometry (same-family path, e.g. Brute<-Tigrex; no weld); "
+                         "source = ship the monster's OWN authentic skin from its v102 "
+                         "bone palette (best with --source-skeleton; auto-selected there)")
     ap.add_argument("--source-skeleton", action="store_true",
                     help="ship the monster's OWN skeleton (no lossy down-rig to the host "
                          "rig) — for shapes that differ from the host; anim plays 1:1")

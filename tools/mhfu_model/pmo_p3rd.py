@@ -264,6 +264,40 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
 
     geo_buf = io.BytesIO(ge_source)
 
+    # --- bone palette (header field 10) -> authentic per-vertex blend skinning ----
+    # v102 uses the SAME palette model as MHFU (decoded + zero-error validated
+    # 2026-06-29 on file_05248; see docs/PMO_MODEL_FORMAT.md "skinning"): the vgroup
+    # record `2BH3I` carries bc=vg[1] (boneCount) + cum=vg[2] (cumulativeBoneCount);
+    # header field 10 points at a `Weight{slot:u8,bone:u8}[]` array; the engine keeps
+    # a running `aux[slot]=bone` and each vertex's weightCount fractions blend
+    # `aux[0..wc-1]`. Resolving it here lets the porter ship the monster's REAL skin
+    # (source-skeleton bone indices) instead of a nearest-bone guess. NOTE: header
+    # field 6 (nvg) is unreliable (e.g. 24 vs real 88); the true vgroup count is the
+    # max (vg_start+vg_count) over the mesh table.
+    pal_off = hdr[10]
+    eff_palettes = None
+    if pal_off and pal_off < len(blob):
+        nvg_real = 0
+        for i in range(nmesh):
+            mr = mesh_tab + i * 0x30
+            if mr + 0x30 > len(blob):
+                break
+            mh = struct.unpack_from("<8f2I4H", blob, mr)
+            nvg_real = max(nvg_real, mh[13] + mh[12])   # vg_start + vg_count
+        vg_records = []
+        for k in range(nvg_real):
+            off = vg_tab + k * 0x10
+            if off + 0x10 > len(blob):
+                break
+            vg_records.append(struct.unpack_from("<2BH3I", blob, off))
+        if vg_records:
+            pal_len = vg_records[-1][2] + vg_records[-1][1]
+            if pal_off + pal_len * 2 <= len(blob):
+                patches = [struct.unpack_from("<2B", blob, pal_off + p * 2)
+                           for p in range(pal_len)]
+                from .pmo_skin import _resolve_running_palette
+                eff_palettes = _resolve_running_palette(patches, vg_records)
+
     groups: List[MeshGroup] = []
     draw_order = 0
 
@@ -314,6 +348,18 @@ def parse(blob: bytes, geo_blob: Optional[bytes] = None) -> Model:
                 verts, faces = run_ge_v102(ge_source, ge_abs, mesh_scale)
             except (ValueError, struct.error, IndexError):
                 continue
+
+            # Attach each vertex's authentic (source_bone, weight) influences from
+            # the resolved palette for this vgroup record (parallel to vertex weights).
+            if eff_palettes is not None and vg_rec_idx < len(eff_palettes):
+                pal = eff_palettes[vg_rec_idx]
+                for v in verts:
+                    w = v.get("weights")
+                    if w:
+                        v["influences"] = [(pal[k] if k < len(pal) else -1, w[k])
+                                           for k in range(len(w))]
+                    elif pal:
+                        v["influences"] = [(pal[0], 1.0)]
 
             g = MeshGroup(
                 index=draw_order,

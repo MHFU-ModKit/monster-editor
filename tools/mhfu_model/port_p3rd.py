@@ -61,6 +61,28 @@ def _p3rd_main_pmo(blob):
 
 
 # --------------------------------------------------------------------------- #
+def _source_bone_remap(source_skeleton: bool, lead_pad: int, bone_map):
+    """Return callable(src_bone) -> out_bone mapping the SOURCE skeleton's bone
+    indices onto the OUTPUT rig's joint indices, for the authentic-skin path.
+
+    source_skeleton: the output ships the source rig with ``lead_pad`` origin bones
+    prepended (skeleton.p3rd_to_mhfu), so src bone i -> i + lead_pad (1:1).
+    retarget: the output rig is the HOST; invert the host<-source bone_map
+    (host_joint -> source_track) to source -> host_joint. A source bone with no host
+    correspondence returns -1 (dropped; its weight redistributes over the rest)."""
+    if source_skeleton:
+        pad = lead_pad or 0
+        return (lambda b: b + pad) if pad else (lambda b: b)
+    if bone_map:
+        inv: dict = {}
+        for host_j, src_t in bone_map.items():
+            if src_t is not None and src_t not in inv:
+                inv[src_t] = host_j
+        return lambda b: inv.get(b, -1)
+    return lambda b: b
+
+
+# --------------------------------------------------------------------------- #
 def port_monster(model_pac: bytes, frame_pac: bytes,
                  geo_companion: Optional[bytes] = None,
                  anim_blob: Optional[bytes] = None,
@@ -89,6 +111,13 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                     native monster is the perfect oracle, so NO guess + NO weld
                     (drops the rigid-spike/hole whack-a-mole). Falls back to "auto"
                     if the frame has no usable PMO reference.
+                    "source" = ship the monster's OWN authentic skin — pair each
+                    vertex's source bone-palette (bone, weight) influences (parsed
+                    from the v102 palette by pmo_p3rd) with the output rig. The
+                    principled path when the source rig is shipped (source_skeleton):
+                    bone indices map 1:1 (+lead_pad), so NO guess and NO oracle. In
+                    source_skeleton mode "auto" auto-upgrades to "source" when the
+                    source carries weights; falls back to "auto" if it doesn't.
     source_skeleton : when True, ship the monster's OWN skeleton (no down-rig). sub0 is
                     rebuilt from the MHP3rd 0x80000000 skeleton into the MHFU 0x10C
                     format (`skeleton.p3rd_to_mhfu`, stream-ids assigned), the geometry
@@ -181,10 +210,28 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
             dead = {d for d in range(host_count) if bone_map.get(d) is None}
         info["dead_joints"] = sorted(dead)
 
-    # --- skin geometry onto the host (frame) skeleton ---
+    # --- skin geometry onto the output skeleton ---
+    # AUTHENTIC-SKIN path: when the source carries its OWN per-vertex blend weights
+    # (v102 bone palette, parsed by pmo_p3rd) and we ship the source rig, prefer them
+    # over any guess/transfer. Auto-upgrade the default in source-skeleton mode so a
+    # plain `--source-skeleton` build ships the real skin.
+    has_src_infl = any(v.get("influences") for g in model.mesh_groups for v in g.vertices)
+    if source_skeleton and skin == "auto" and has_src_infl:
+        skin = "source"
     info["skin_mode"] = skin
     ref_pmo = _find_sub(frame_pac, b"pmo\x00", which=0) if skin == "transfer" else None
-    if skin == "transfer" and ref_pmo is not None:
+    if skin == "source" and has_src_infl:
+        # SHIP THE MONSTER'S OWN SKIN: pair each vertex's source-palette (bone, weight)
+        # influences with the output rig (source-skeleton: src bone i -> i + lead_pad;
+        # retarget: invert the host<-source bone map). No nearest-bone guess, no oracle.
+        remap = _source_bone_remap(source_skeleton, lead_pad, bone_map)
+        vgs = _skin.from_source_influences(
+            model.mesh_groups, bone_remap=remap,
+            materials_of=lambda g: g.material, max_pal=8)
+        info["skin_mode"] = "source"
+        info["source_weight_verts"] = sum(
+            1 for g in model.mesh_groups for v in g.vertices if v.get("influences"))
+    elif skin == "transfer" and ref_pmo is not None:
         # SAME-FAMILY: transfer the native monster's own (perfect) skinning from the
         # frame's PMO sub onto the source geometry by closest-surface barycentric
         # weight transfer. No nearest-bone guess, no seam weld -> no spikes/holes.
@@ -194,7 +241,9 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
             max_pal=8, parents=parents, dead=dead)
         info["skin_mode"] = "transfer"
     else:
-        if skin == "transfer":
+        if skin == "source":
+            info["skin_mode"] = "auto(fallback:no-source-weights)"
+        elif skin == "transfer":
             info["skin_mode"] = "auto(fallback:no-ref-pmo)"
         # NO-REFERENCE path: nearest-bone blend, chain-aware, skipping dead joints.
         vgs = _skin.auto_skin(model.mesh_groups, bw,
