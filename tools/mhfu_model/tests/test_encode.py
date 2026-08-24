@@ -44,7 +44,7 @@ def _unaliased_slots(pack):
     """Slots whose anim offset is not shared with another slot."""
     import struct
     raw, hsize = pack.raw, len(pack.header)
-    tbl = struct.unpack_from("<%dI" % pack.slot_count, raw, hsize - 4)
+    tbl = struct.unpack_from("<%dI" % pack.slot_count, raw, hsize)   # NOT hsize-4
     seen = {}
     for i, off in enumerate(tbl):
         if off in (0, 0xFFFFFFFF):

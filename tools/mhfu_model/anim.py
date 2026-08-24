@@ -47,18 +47,69 @@ def _parse_anim(a: bytes, ao: int, slot: int) -> Animation:
     )
 
 
-def parse(blob: bytes) -> AnimationPack:
+def parse_container(blob: bytes):
+    """Decode the anim container header shared by MHFU and MHP3rd.
+
+    🔴 The header is **N × (u32 slot_count, u32 table_offset)** followed by two
+    words, and ``hsize`` is nothing but the FIRST pair's table offset::
+
+        +0x00   N × (u32 slot_count, u32 table_offset)   # N = hsize/8 - 1
+        +hsize-8  u32 0
+        +hsize-4  u32 data_start   (= end of the last slot table)
+        +hsize    the tables, back to back, then the blocks
+
+    Verified across every anim sub in both games: MHFU has hsize 0x18 / 0x28 /
+    0x38 (2 / 4 / 6 streams; 47 / 18 / 36 files) and MHP3rd 0x20 (3 streams), and
+    in every one of them ``pairs[0].offset == hsize``, the offsets chain exactly
+    (``off[i+1] == off[i] + count[i]*4``) and the last table ends at ``data_start``.
+
+    That makes both of the older readings off by one slot: ``hsize - 4`` (used
+    here until 2026-08-24) lands on ``data_start``, and the reference template's
+    ``hsize + 4`` skips the first stream's slot 0 *and* merges every stream into
+    one flat table. Either one shifts a monster's whole moveset by a slot.
+
+    Returns ``(pairs, word30, data_start)`` or ``None`` if the bytes do not
+    validate as this layout — callers fall back to their legacy reading.
+    """
+    if len(blob) < 0x10:
+        return None
+    hsize = struct.unpack_from("<I", blob, 4)[0]
+    if not (0x10 <= hsize <= 0x400 and hsize % 8 == 0 and hsize <= len(blob)):
+        return None
+    n = hsize // 8 - 1
+    if n < 1:
+        return None
+    pairs = [struct.unpack_from("<2I", blob, i * 8) for i in range(n)]
+    if pairs[0][1] != hsize:
+        return None
+    run = hsize
+    for cnt, off in pairs:
+        if off != run or cnt > 4096:
+            return None
+        run += cnt * 4
+    if run > len(blob):
+        return None
+    word30, data_start = struct.unpack_from("<2I", blob, hsize - 8)
+    if data_start != run:
+        return None
+    return pairs, word30, data_start
+
+
+def parse(blob: bytes, stream: int = 0) -> AnimationPack:
     """Parse a P3rd-style animation pack into the data model.
 
-    Header: u32 magic(0x64) ; u32 hsize ; u32 slot_count ; ... ; the offset table
-    sits at **hsize - 4** (validated on all 49 big-monster PACs: single-set
-    hsize=0x18 → table @0x14; dual-model-set variant hsize=0x38 → table @0x34).
-    Each populated slot (≠ 0xFFFFFFFF) points to an anim block; the nested
-    `{flag|tag, count, size}` sections chain exactly. Per-anim decode is guarded so
-    one malformed block never aborts the whole parse.
+    Reads the container header (:func:`parse_container`) and decodes ``stream``'s
+    slot table — stream 0 (the main one) by default. Each populated slot
+    (≠ 0xFFFFFFFF) points to an anim block; the nested `{flag|tag, count, size}`
+    sections chain exactly. Per-anim decode is guarded so one malformed block never
+    aborts the whole parse.
     """
     magic, hsize, slot_count = struct.unpack_from("<3I", blob, 0)
-    tbase = hsize - 4
+    hdr = parse_container(blob)
+    if hdr is not None:
+        slot_count, tbase = hdr[0][min(stream, len(hdr[0]) - 1)]
+    else:
+        tbase = hsize - 4                      # legacy fallback
     anims = []
     if 0 <= tbase and tbase + slot_count * 4 <= len(blob):
         table = struct.unpack_from("<%dI" % slot_count, blob, tbase)
@@ -136,13 +187,19 @@ def _parse_anim_p3rd(blob: bytes, ao: int, slot: int) -> Animation:
     )
 
 
-def parse_p3rd(blob: bytes) -> AnimationPack:
+def parse_p3rd(blob: bytes, stream: int = 0) -> AnimationPack:
     """Parse an MHP3rd animation sub[3] blob into the AnimationPack data model.
 
-    MHP3rd uses the same outer container as MHFU (anim_count, hsize, slot_count;
-    slot offset table at hsize-4) but a different per-slot block format.
-    This function decodes the header and slot table, then creates stub Animation
-    objects with bone_count and raw bytes populated (no channel decode yet).
+    MHP3rd uses the same outer container as MHFU (:func:`parse_container`) but a
+    different per-slot block format. ``stream`` selects which of the container's
+    tables to decode; stream 0 is the monster's main moveset.
+
+    ⚠️ The Brute Tigrex's ``file_05250`` declares 3 streams — 70 slots, 20 slots
+    and an empty one — and BOTH populated streams carry the full 43-bone rig, so
+    they are two independent clip sets, not a bone partition (MHFU's 0x38 layout
+    is the other way round: streams 0/2/4 partition one rig 31+9+5). Reading them
+    as one 89-slot table, as the older code did, interleaved set 1 behind set 0 at
+    a +69 offset and shifted set 0 by one slot.
 
     The returned AnimationPack carries fully-decoded tracks/channels/keyframes
     (the MHFU data model), so anim_ingame.from_flat_anim / swap_anim_to_realmotion
@@ -150,31 +207,21 @@ def parse_p3rd(blob: bytes) -> AnimationPack:
     """
     if len(blob) < 0x10:
         return AnimationPack(magic=0, slot_count=0, animations=[], header=blob, raw=blob)
-    # Authoritative MHP3rd container layout (Kurogami2134/blender_p3rd_anim
-    # p3rd_monster_anim.bt + anim_pack_tools.py):
-    #   word0 = count (informational), word1 = header_size (varies: 0x18 / 0x20 / ...),
-    #   the LAST header word (at header_size-4) = first_anim offset,
-    #   one null word at header_size, then the slot offset table at header_size+4
-    #   with length = (first_anim - header_size - 4) / 4. 0xFFFFFFFF = empty slot.
-    # (The old hsize-4 / word0-count guess worked only for 0x18 headers and mis-
-    #  indexed slots; this matches the reference template + handles big monsters.)
     count_field, hsize = struct.unpack_from("<2I", blob, 0)
     anims: list[Animation] = []
     n = 0
-    if 0x10 <= hsize <= 0x400 and hsize % 4 == 0 and hsize <= len(blob):
-        first_anim = struct.unpack_from("<I", blob, hsize - 4)[0]
-        if hsize + 4 < first_anim <= len(blob):
-            n = (first_anim - hsize - 4) // 4
-            tbase = hsize + 4
-            if 0 < n <= 1024 and tbase + n * 4 <= len(blob):
-                table = struct.unpack_from("<%dI" % n, blob, tbase)
-                for i, off in enumerate(table):
-                    if off == EMPTY or not (0 < off < len(blob)):
-                        continue
-                    try:
-                        anims.append(_parse_anim_p3rd(blob, off, i))
-                    except (struct.error, IndexError):
-                        pass
+    hdr = parse_container(blob)
+    if hdr is not None:
+        n, tbase = hdr[0][min(stream, len(hdr[0]) - 1)]
+        if 0 < n <= 4096 and tbase + n * 4 <= len(blob):
+            table = struct.unpack_from("<%dI" % n, blob, tbase)
+            for i, off in enumerate(table):
+                if off == EMPTY or not (0 < off < len(blob)):
+                    continue
+                try:
+                    anims.append(_parse_anim_p3rd(blob, off, i))
+                except (struct.error, IndexError):
+                    pass
     if not anims:
         # lobby fallback: slot table right after the 3-word header (no first_anim word)
         n = count_field
@@ -260,7 +307,8 @@ def encode(pack: AnimationPack) -> bytes:
     """
     raw = pack.raw or b""
     hsize = len(pack.header) if pack.header else 0x18
-    tbase = hsize - 4
+    hdr = parse_container(raw) if raw else None
+    tbase = hdr[0][0][1] if hdr else hsize       # = hsize; NOT hsize-4
     blocks = {a.slot: _encode_anim(a) for a in pack.animations}
     rawlen = {a.slot: len(a.raw) for a in pack.animations}
 

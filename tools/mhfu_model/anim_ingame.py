@@ -7,13 +7,29 @@ lobby / MHP3rd pack handled by ``anim.py`` — see docs/ANIMATION_FORMAT.md
 
 Container layout (decoded byte-exact on Tigrex ``file_06185`` sub[3]):
 
-    +0x00  u32 magic          0x64
-    +0x04  u32 hsize          0x38
-    +0x08  5 × (u32 0x64, u32 stream_table_offset)   # the 5 sub-stream tables
+    +0x00  6 × (u32 slot_count, u32 table_offset)   # main first, then sub0..sub4
     +0x30  u32 0
-    +0x34  u32[num_slots]     MAIN stream slot table        (stream index 0)
-    <stream_table_offset[k]>  u32[num_slots]  sub-stream k  (k = 0..4)
+    +0x34  u32 data_start     = end of the last slot table (0x998 on file_06185)
+    +0x38  u32[slot_count]    MAIN stream slot table        (stream index 0)
+    <table_offset[k]>         u32[slot_count[k]]  sub-stream k  (k = 0..4)
     <data>                    per-stream packed block regions
+
+The first pair is the MAIN stream, so what this codec used to call ``magic``
+(always 0x64 = 100) is really **main's slot count**, and ``hsize`` (0x38) is
+really **main's table offset**. The counts differ per stream on some monsters:
+``file_06111`` alternates 100/105 (0x64/0x69), so they must be read from the
+header, not derived from the first sub-table's offset.
+
+🔴 **The main table starts at ``hsize`` (0x38), not 0x34.** This codec read and
+wrote it at 0x34 until 2026-08-24, treating the ``data_start`` word as slot 0 and
+the engine's slot 99 as a "pad word" — so the MAIN stream sat **one slot off**
+from sub1/sub3. Round-tripping a native PAC hid it (parse and encode cancelled out)
+and bind-pose builds hid it (one block aliased to every slot), but every REAL-MOTION
+build had the body playing clip N-1 while the head and tail played clip N. Two
+independent checks pin the offset: at 0x38 the main table's empty-slot set is
+*identical* to sub3's (38 slots; it differs from sub1's only at 24/25), and all 62
+co-occupied slots agree on clip length — at 0x34, 40 of 44 disagree by exactly one
+slot. See docs/BRUTE_TIGREX_PORT.md.
 
 So there are up to **6 parallel slot tables** (main + 5 sub). In practice a
 monster uses a subset: Tigrex populates main + sub[1] + sub[3] (the empty ones
@@ -86,6 +102,7 @@ class Block:
 class Stream:
     """One slot table + its clips, keyed by slot index."""
     table_offset: int                       # absolute byte offset of the table
+    num_slots: Optional[int] = None         # None -> the container's num_slots
     clips: Dict[int, Block] = field(default_factory=dict)
     # original on-disk offset each slot pointed at (preserves aliasing/order)
     slot_offsets: Dict[int, int] = field(default_factory=dict)
@@ -96,9 +113,9 @@ class InGameAnim:
     magic: int = 0x64
     hsize: int = 0x38
     num_slots: int = 100
-    pair_magic: int = 0x64
+    pair_magic: int = 0x64          # = sub0's slot count (kept for compat)
     word30: int = 0
-    # stream 0 = main (@0x34); streams 1..5 = the 5 header sub-tables
+    # stream 0 = main (@hsize = 0x38); streams 1..5 = the 5 header sub-tables
     streams: List[Stream] = field(default_factory=list)
     raw: Optional[bytes] = None
 
@@ -159,21 +176,20 @@ def _s16(v: int) -> int:
 # container parse / encode
 # --------------------------------------------------------------------------- #
 def parse_ingame(blob: bytes) -> InGameAnim:
-    magic, hsize, pmagic1 = struct.unpack_from("<3I", blob, 0)
-    pairs = [struct.unpack_from("<2I", blob, 0x08 + i * 8) for i in range(5)]
+    # Six (slot_count, table_offset) pairs: main first, then sub0..sub4. The
+    # MAIN table therefore begins at `hsize` — there is no pad word. Reading it
+    # at 0x34 (the data_start word) shifts the whole stream one slot; see the
+    # module docstring.
+    pairs = [struct.unpack_from("<2I", blob, i * 8) for i in range(6)]
     word30 = struct.unpack_from("<I", blob, 0x30)[0]
-    # Layout: header(0x34) + main table(100) + one 0xFFFFFFFF pad word + the 5
-    # sub-tables(100 each). So main is [0x34, 0x34+ns*4) and sub0 begins one pad
-    # word later. num_slots derived from the first declared sub-table offset.
-    sub_offs = [off for _m, off in pairs]
-    main_off = 0x34
-    num_slots = (sub_offs[0] - main_off - 4) // 4
-    table_offs = [main_off] + sub_offs
+    magic, hsize = pairs[0]              # main's slot count / table offset
+    pmagic1 = pairs[1][0]
+    num_slots = magic
 
     streams: List[Stream] = []
-    for toff in table_offs:
-        table = struct.unpack_from("<%dI" % num_slots, blob, toff)
-        st = Stream(table_offset=toff)
+    for cnt, toff in pairs:
+        table = struct.unpack_from("<%dI" % cnt, blob, toff)
+        st = Stream(table_offset=toff, num_slots=cnt)
         cache: Dict[int, Block] = {}
         for slot, off in enumerate(table):
             if off == EMPTY or not (0 < off < len(blob)):
@@ -191,26 +207,31 @@ def parse_ingame(blob: bytes) -> InGameAnim:
 def encode_ingame(a: InGameAnim) -> bytes:
     """Serialize. Byte-exact for an unmodified parse; engine-valid for edits.
 
-    The header + all six slot tables occupy a fixed prefix
-    ``0x34 + 6*num_slots*4``; blocks are packed per-stream after it, in the order
-    main, sub0..sub4, preserving intra-stream aliasing (each unique source offset
-    emitted once, slots sharing it repointed to the same new offset).
+    The 0x38-byte header and all six slot tables occupy a fixed prefix; blocks are
+    packed per-stream after it, in the order main, sub0..sub4, preserving
+    intra-stream aliasing (each unique source offset emitted once, slots sharing it
+    repointed to the same new offset).
     """
     ns = a.num_slots
-    # Layout: header(0x34) + main(ns) + one pad word + 5 sub-tables(ns each).
-    main_off = 0x34
-    sub0 = main_off + ns * 4 + 4                    # +4 = the pad word
-    sub_offs = [sub0 + ns * 4 * i for i in range(5)]
-    prefix_end = sub_offs[-1] + ns * 4
+    # Per-stream slot counts — a stream may declare its own (file_06111 alternates
+    # 100/105). Streams a caller built without one inherit the container's.
+    counts = [(st.num_slots or ns) for st in a.streams[:6]]
+    counts += [ns] * (6 - len(counts))
+    HDR = 0x38
+    offs, run = [], HDR
+    for cnt in counts:
+        offs.append(run)
+        run += cnt * 4
+    prefix_end = run
 
-    # header: magic, hsize, 5×(pair_magic, sub_offset), word30  → exactly 0x34 B
-    head = bytearray(struct.pack("<2I", a.magic, a.hsize))
-    for off in sub_offs:
-        head += struct.pack("<2I", a.pair_magic, off)
-    head += struct.pack("<I", a.word30)
-    assert len(head) == main_off, (len(head), main_off)
+    # header: 6×(slot_count, table_offset), word30, data_start -> exactly 0x38 B
+    head = bytearray()
+    for cnt, off in zip(counts, offs):
+        head += struct.pack("<2I", cnt, off)
+    head += struct.pack("<2I", a.word30, prefix_end)
+    assert len(head) == HDR, (len(head), HDR)
 
-    tables = [[EMPTY] * ns for _ in range(6)]      # main + 5 sub
+    tables = [[EMPTY] * counts[i] for i in range(6)]   # main + 5 sub
     body = bytearray()
     pos = prefix_end
 
@@ -240,10 +261,8 @@ def encode_ingame(a: InGameAnim) -> bytes:
                 tables[si][slot] = blk_off
 
     out = bytearray(head)
-    out += struct.pack("<%dI" % ns, *tables[0])    # main table
-    out += struct.pack("<I", EMPTY)                 # pad word @ main_off+ns*4
-    for ti in range(1, 6):                          # 5 sub-tables
-        out += struct.pack("<%dI" % ns, *tables[ti])
+    for ti in range(6):                             # main @0x38, then sub0..sub4
+        out += struct.pack("<%dI" % counts[ti], *tables[ti])
     assert len(out) == prefix_end, (len(out), prefix_end)
     out += body
     return bytes(out)
@@ -484,7 +503,7 @@ def from_flat_anim(flat_pack, split: List[int], num_slots: int = 100,
 
 def swap_anim_to_realmotion(pac_bytes: bytes, flat_pack, anim_index: int = 3,
                             skel_index: int = 0, split: Optional[List[int]] = None,
-                            fill_slots: bool = True, keep_size: bool = True,
+                            fill_slots="host", keep_size: bool = True,
                             host_count: Optional[int] = None,
                             bone_map: Optional[Dict[int, Optional[int]]] = None):
     """Replace a big-monster PAC's anim sub with REAL motion from a flat anim pack.
@@ -506,8 +525,13 @@ def swap_anim_to_realmotion(pac_bytes: bytes, flat_pack, anim_index: int = 3,
     Without ``host_count`` it falls back to the skeleton's own animated count (the
     pre-v22 behaviour, kept for native/same-rig monsters).
 
+    ``fill_slots`` controls which of the 100 slots end up populated:
+    ``"host"`` (default) reproduces the host PAC's own occupancy exactly — the
+    engine can only ever dispatch the slots the host fills; ``True`` is the legacy
+    dense 0..99 fill; ``False`` leaves the source pack's slots untouched.
+
     Returns ``(pac_bytes, info)`` with info = dict(animated, skel_animated, split,
-    host_count, clips, skel_synced).
+    host_count, clips, skel_synced, slots).
     """
     import copy
     from .pac import MonsterPac, SubResource
@@ -532,12 +556,33 @@ def swap_anim_to_realmotion(pac_bytes: bytes, flat_pack, anim_index: int = 3,
     # with a bone_map the selection is by correspondence (target joint -> source
     # track), so keep all source tracks; from_flat_anim picks per the map.
     ig = from_flat_anim(fp, split=sp, bone_map=bone_map)  # map/pad to n bones
-    if fill_slots:
-        for st in ig.streams:
-            if st.clips:
-                base = st.clips[min(st.clips)]
-                for s in range(ig.num_slots):
-                    st.clips.setdefault(s, base)
+    # ---- slot occupancy ---------------------------------------------------
+    # 🔴 Mirror the HOST's occupancy, slot for slot. The engine dispatches an
+    # action to a slot INDEX, so the only slots that can ever be asked for are
+    # the ones the host monster fills — native Tigrex fills 62/64/62 of 100 and
+    # leaves 38 deliberately empty. `fill_slots="host"` (the default) therefore
+    # aliases a clip into every slot the host fills that the source lacks, and
+    # DROPS source clips that land in a slot the host leaves empty: they are
+    # unreachable, and they cost file size the relocate budget needs.
+    # `True` is the legacy dense 0..99 fill; `False` leaves the source as-is.
+    host_occ = None
+    if fill_slots == "host":
+        try:
+            host_ig = parse_ingame(pac.subs[anim_index].data)
+            host_occ = [set(st.clips) for st in host_ig.streams]
+        except Exception:
+            host_occ = None                    # not an in-game anim — fall back
+    for si, st in enumerate(ig.streams):
+        if not st.clips or not fill_slots:
+            continue
+        base = st.clips[min(st.clips)]
+        want = (host_occ[si] if host_occ and si < len(host_occ)
+                else set(range(ig.num_slots)))
+        for slot in want:
+            st.clips.setdefault(slot, base)
+        if host_occ:
+            for slot in [s for s in st.clips if s not in want]:
+                del st.clips[slot]
     blob = encode_ingame(ig)
     if keep_size:
         blob = fit_anim_sub(blob, len(pac.subs[anim_index].data))
@@ -556,7 +601,8 @@ def swap_anim_to_realmotion(pac_bytes: bytes, flat_pack, anim_index: int = 3,
     out = MonsterPac(subs=subs, tail=pac.tail).to_bytes()
     return out, {"animated": n, "skel_animated": skel_animated, "split": sp,
                  "host_count": host_count, "clips": len(fp.animations),
-                 "skel_synced": skel_synced}
+                 "skel_synced": skel_synced,
+                 "slots": [len(st.clips) for st in ig.streams]}
 
 
 def fit_anim_sub(anim_bytes: bytes, target_size: int) -> bytes:
@@ -588,12 +634,11 @@ def make_static_pose(stream_specs: List[Tuple[int, List[int]]],
     round-trip fidelity (an all-empty anim collapses the mesh — see ``empty_bone``).
     """
     streams: List[Stream] = []
-    main_off = 0x34
-    sub0 = main_off + num_slots * 4 + 4
-    table_offs = [main_off] + [sub0 + num_slots * 4 * i for i in range(5)]
+    main_off = 0x38                                 # = hsize; NOT 0x34
+    table_offs = [main_off + num_slots * 4 * i for i in range(6)]
     for si in range(6):
         toff = table_offs[si]
-        st = Stream(table_offset=toff)
+        st = Stream(table_offset=toff, num_slots=num_slots)
         if si < len(stream_specs):
             bc, slots = stream_specs[si]
             if bc > 0 and slots:
@@ -619,3 +664,44 @@ def summary(a: InGameAnim) -> str:
         lines.append(f"  {nm} @{st.table_offset:#x}: {len(st.clips)} clips, "
                      f"bones/blk={len(any_blk.bones)}")
     return "\n".join(lines)
+
+
+def to_flat_anim(ig: InGameAnim, streams: Tuple[int, ...] = (0, 2, 4)):
+    """Inverse of :func:`from_flat_anim` — recombine the per-stream bone
+    partitions back into whole-rig clips.
+
+    The engine splits one clip's bones across several streams (Tigrex: 31 + 9 + 5
+    = 45 joints in streams main/sub1/sub3) and indexes them all by the same slot,
+    so a clip is only whole once the streams are concatenated **in stream order**:
+    that concatenation is joint order. Returns a :class:`model.AnimationPack`, the
+    same type the flat/lobby parser produces, so everything downstream —
+    ``convert.animation_fcurves``, the Blender importer — works on an in-game
+    animation unchanged.
+
+    This is what makes a ported moveset checkable OFFLINE: import the built PAC,
+    play its clips, and see whether the motion survived the conversion, instead of
+    booting the emulator to find out.
+    """
+    from .model import Animation, AnimationPack, BoneTrack
+    from .model import Channel as MChannel, Keyframe as MKeyframe
+
+    live = [si for si in streams if si < len(ig.streams) and ig.streams[si].clips]
+    anims = []
+    for slot in sorted(set().union(*[set(ig.streams[si].clips) for si in live])
+                       if live else []):
+        tracks, loop, loop_start, tag = [], 0, 0.0, BLOCK_TAG
+        for si in live:
+            blk = ig.streams[si].clips.get(slot)
+            if blk is None:
+                continue
+            tag, loop, loop_start = blk.tag, blk.loop, blk.loop_start
+            for bone in blk.bones:
+                tracks.append(BoneTrack(
+                    tag=bone.mask,
+                    channels=[MChannel(type=ch.ctype, keyframes=[
+                        MKeyframe(k.value, k.frame, k.ease_in, k.ease_out)
+                        for k in ch.keyframes]) for ch in bone.channels]))
+        anims.append(Animation(slot=slot, tag=tag, bone_count=len(tracks),
+                               loop=loop, loop_start=loop_start, tracks=tracks))
+    return AnimationPack(magic=ig.magic, slot_count=ig.num_slots,
+                         animations=anims, header=b"", raw=ig.raw or b"")

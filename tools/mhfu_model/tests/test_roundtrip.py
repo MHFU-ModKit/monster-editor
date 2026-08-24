@@ -86,7 +86,12 @@ def test_decode_smoke():
     # Tigrex (single-set) is the Phase 1 reference target — must fully decode.
     tig = load_pac(os.path.join(DATA_DIR, "file_06134.bin"))
     assert tig.skeleton.bone_count == 25
-    assert len(tig.anim.animations) == 22
+    # 21 clips in slots 1..22 (slot 4 empty). It read 22 until 2026-08-24: the
+    # slot table was taken from hsize-4, which is the data_start word, so every
+    # monster gained a phantom slot 0 aliasing its first real block. Slot 0 is
+    # empty in every anim pack checked, in both games.
+    assert len(tig.anim.animations) == 21
+    assert 0 not in {a.slot for a in tig.anim.animations}
     assert tig.model.mesh_groups and tig.model.mesh_groups[0].vertex_count > 0
 
 

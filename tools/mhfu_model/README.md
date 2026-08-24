@@ -93,9 +93,14 @@ Tests: `PYTHONPATH=tools python tools/mhfu_model/tests/test_{roundtrip,convert,e
   tree links are bone indices (`-1`=none); bind scale/rot/pos floats.
 - **PMO** (sub-1): header at offset **8**; mesh-table stride **0x20 (legacy) or
   0x18 (small-mon)** — auto-detected; monsters are rigid-skinned.
-- **Animation** (sub-3, P3rd pack): header `{0x64, hsize, slot_count}`; offset
-  table at **`hsize-4`**; nested `{0x80000000|tag, count, size}` sections chain
-  exactly; keyframe = 8B `s16 value, frame, ease_in, ease_out`.
+- **Animation** (sub-3): header is `N × (u32 slot_count, u32 table_offset)` + `u32 0`
+  + `u32 data_start`, so the words that look like `{magic, hsize}` are really stream
+  0's **count and table offset** — the first slot table starts at **`hsize`**, not
+  `hsize-4` (that word is `data_start`) and not `hsize+4`. `N = hsize/8 - 1`: 2
+  streams at `0x18`, 4 at `0x28`, 6 at `0x38` (big monsters), 3 at MHP3rd's `0x20`.
+  Counts are per stream (some monsters alternate 100/105). Nested
+  `{0x80000000|tag, count, size}` sections chain exactly; keyframe = 8B
+  `s16 value, frame, ease_in, ease_out`. → `docs/ANIMATION_FORMAT.md`
 - **Quantization**: rotation `4096=90°`, location `16=1.0`, scale `256=1.0`.
 
 ## Encoders (Phase 3) + validator (Phase 2) — gotchas pinned

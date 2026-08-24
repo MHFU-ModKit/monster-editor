@@ -28,12 +28,37 @@ def test_parse_structure():
     m = ai.parse_ingame(_native_anim())
     assert m.magic == 0x64 and m.hsize == 0x38 and m.num_slots == 100
     pop = [len(s.clips) for s in m.streams]
-    assert pop == [63, 0, 64, 0, 62, 0]            # main + sub1 + sub3
+    assert pop == [62, 0, 64, 0, 62, 0]            # main + sub1 + sub3
     # stream bone counts 31/9/5
     bc = lambda st: len(next(iter(st.clips.values())).bones)
     assert bc(m.streams[0]) == 31
     assert bc(m.streams[2]) == 9
     assert bc(m.streams[4]) == 5
+
+
+@pytest.mark.skipif(not os.path.exists(DATA), reason="needs extracted game data")
+def test_main_table_is_at_hsize_not_0x34():
+    """Regression: the MAIN slot table starts at hsize (0x38), not 0x34.
+
+    Reading it at 0x34 (the data_start word) shifted the whole main stream one
+    slot against sub1/sub3, so every real-motion build had the body playing clip
+    N-1 while the head and tail played clip N. Two independent invariants catch
+    it, and both fail at 0x34:
+      * main's empty-slot set is IDENTICAL to sub3's, and
+      * every co-occupied slot agrees on clip length across the streams.
+    """
+    m = ai.parse_ingame(_native_anim())
+    main, sub3 = m.streams[0], m.streams[4]
+    empty = lambda st: {i for i in range(m.num_slots) if i not in st.clips}
+    assert empty(main) == empty(sub3)
+    assert len(empty(main)) == 38
+
+    def span(blk):
+        return max((kf.frame for bn in blk.bones for ch in bn.channels
+                    for kf in ch.keyframes), default=0)
+    shared = sorted(set(main.clips) & set(sub3.clips))
+    assert len(shared) == 62
+    assert all(span(main.clips[i]) == span(sub3.clips[i]) for i in shared)
 
 
 def test_static_pose_empty_single_stream():
