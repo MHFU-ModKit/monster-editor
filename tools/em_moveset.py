@@ -141,48 +141,65 @@ def param_regs(ov: Overlay, fn: int, limit: int = 60):
     return idr, moder
 
 
-def switch_of(ov: Overlay, fn: int, limit: int = 400):
-    """The (table, count) of the first jump-table switch in `fn`, if any."""
-    hi = tbl = n = None
+def switch_of(ov: Overlay, fn: int, limit: int = 400, want_key: int | None = None):
+    """The (table, count, bias) of a jump-table switch in `fn`, if any.
+
+    🔴 The table address is recognised by where it LANDS, not by how big the
+    `%lo` immediate is. An earlier version required `imm > 0x1000`, which happens
+    to hold for em75 (11088) and fails for em02 (1688) — so 10 of the 17 monster
+    overlays silently reported "no action tick" when they have exactly the same
+    structure. Never filter an address by the size of its low half.
+
+    `want_key`: if given, only accept a switch whose bound check reads that entity
+    offset (e.g. 0x298), so the species switch in the same function is not
+    mistaken for the action dispatch.
+    """
+    hi: dict[int, int] = {}
+    tbl = n = None
     bias = 0
+    key_off = None
     insns = []
     for i in range(limit):
         a = fn + i * 4
+        if not ov.has(a):
+            break
         ins = decode(ov.word(a), a)
         insns.append(ins)
+        rs, rt, rd = (ins.word >> 21) & 31, (ins.word >> 16) & 31, (ins.word >> 11) & 31
         if ins.op == "lui":
-            hi = ins.imm
+            hi[rt] = ins.imm
+        elif ins.op == "addiu" and rs in hi and ins.imm is not None:
+            cand = ((hi[rs] << 16) + ins.imm) & 0xFFFFFFFF
+            if ov.data_va <= cand < ov.data_end:
+                tbl = cand
         elif ins.op == "sltiu" and n is None:
             n = ins.imm
-            # ⚠️ The bias must come from the register the bound check reads, not
-            # from "the last negative addiu": every prologue starts with
-            # `addiu sp, sp, -N`, which otherwise renumbers the whole table.
-            src_reg = (ins.word >> 21) & 31
-            for p in reversed(insns[:-1]):
-                prt, prs = (p.word >> 16) & 31, (p.word >> 21) & 31
-                if p.op == "addiu" and prt == src_reg and prs == src_reg and p.imm < 0:
-                    bias = -p.imm
+            src = rs
+            # bias must come from the register the bound check reads, not from
+            # "the last negative addiu" — every prologue opens `addiu sp, sp, -N`.
+            for q in reversed(insns[:-1]):
+                qrt, qrs = (q.word >> 16) & 31, (q.word >> 21) & 31
+                if q.op == "addiu" and qrt == src and qrs == src and q.imm < 0:
+                    bias = -q.imm
                     break
-                if p.op in ("addiu", "addu", "andi", "lbu", "lhu", "lw") and prt == src_reg:
-                    if p.op == "andi":
-                        src_reg = prs
-                        continue
+                if q.op == "andi" and qrt == src:
+                    src = qrs
+                    continue
+                if q.op in ("lbu", "lb", "lhu", "lh", "lw") and qrt == src:
+                    key_off = q.imm
                     break
-        elif ins.op == "addiu" and hi is not None and ins.imm and ins.imm > 0x1000:
-            t = ((hi << 16) + ins.imm) & 0xFFFFFFFF
-            if ov.data_va <= t < ov.data_end:
-                tbl = t
+                if q.op in ("addiu", "addu", "or") and qrt == src:
+                    break
         elif ins.op == "jr" and ins.args != "ra" and tbl:
+            if want_key is not None and key_off != want_key:
+                hi, tbl, n, bias, key_off = {}, None, None, 0, None
+                continue
             return tbl, n, bias
         elif ins.op == "jr" and ins.args == "ra":
             break
     return None, None, 0
 
 
-
-# --------------------------------------------------------------------------- #
-# The behaviour side: (main_state, sub_state) -> handler -> the animations it drives
-# --------------------------------------------------------------------------- #
 def state_dispatchers(ov: Overlay):
     """Find `switch(+0x298) -> switch(+0x299)`, the per-frame action tick.
 
@@ -200,7 +217,7 @@ def state_dispatchers(ov: Overlay):
         if ins.op != "lbu" or ins.imm != 0x298:
             continue
         fn = ov.func_start(a)
-        tbl, n, _ = switch_of(ov, fn, limit=600)
+        tbl, n, _ = switch_of(ov, fn, limit=600, want_key=0x298)
         if not tbl or not n:
             continue
         # prefer the tick whose cases actually fan out into +0x299 switches
