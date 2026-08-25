@@ -242,6 +242,7 @@ def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 15
         return set()
     seen.add(fn)
     out, regs = set(), {}
+    alt = set()          # values reachable only via a branch-likely's annulled slot
     for i in range(limit):
         a = fn + i * 4
         if not ov.has(a):
@@ -250,6 +251,15 @@ def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 15
         rs, rt = (ins.word >> 21) & 31, (ins.word >> 16) & 31
         if ins.op == "addiu" and rs == 0:
             regs[rt] = ins.imm
+        # 🔴 A branch-LIKELY (`beql`/`bnel`/...) annuls its delay slot when NOT
+        # taken, so the slot is the OTHER arm, not part of the straight path.
+        # Walking through it linearly reports one arm as if it were the only one:
+        # em75's (0,5) is `a1 = 54 if species == 81 else 46`, and the linear read
+        # said just 54 — which a live run then contradicted. Keep both.
+        if ins.op in ("beql", "bnel", "blezl", "bgtzl", "bltzl", "bgezl", "bc1tl", "bc1fl"):
+            d = decode(ov.word(a + 4), a + 4)
+            if d.op == "addiu" and ((d.word >> 21) & 31) == 0 and ((d.word >> 16) & 31) == 5:
+                alt.add(d.imm)
         if ins.op == "jal":
             d = decode(ov.word(a + 4), a + 4)          # delay slot runs first
             if d.op == "addiu" and ((d.word >> 21) & 31) == 0:
@@ -257,6 +267,8 @@ def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 15
             if ins.target == EXECUTOR:
                 if 5 in regs:
                     out.add(regs[5])
+                out |= alt
+                alt = set()
             elif ov.text_va <= ins.target < ov.text_end:
                 out |= exec_consts(ov, ins.target, depth + 1, seen, limit)
         if ins.op == "jr" and ins.args == "ra":
