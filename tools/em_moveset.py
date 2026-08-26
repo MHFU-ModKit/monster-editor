@@ -32,6 +32,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ovl_explore import Overlay                                     # noqa: E402
 from mips_dis import decode                                         # noqa: E402
 
+# 🔴 NOT EXTRACTED — the per-slot applier `0x09AC5520(entity, a1 + 0x3E8 +
+# slot*0xC8, speed, mode, slot)` also writes the animation channel, one body-part
+# slot at a time, from 41 sites in em75.ovl. Un-biasing those into this table was
+# tried on 2026-08-26 and DROPPED a1 46 from (0,5) — an id the live trace shows 29
+# times — so it is left out rather than shipped with a regression on a confirmed
+# row. Live, the missing ids show up as slot disagreement: (0,8) reads `1/24/1`.
+# → docs/AI_SCRIPTING_ENGINE.md §34b
+PER_SLOT_APPLIER = 0x09AC5520
 ACT_SET = 0x09AC8690          # act_set(entity, main, sub, mode) — game_task.ovl
 ACT_SET_RAW = 0x09AC8818      # the inner one that actually writes +0x298/+0x299
 EXECUTOR = 0x09AC5228         # the animation channel
@@ -246,6 +254,29 @@ def state_dispatchers(ov: Overlay):
     return fn, out
 
 
+# Ops whose destination register is `rt` (I-type) and `rd` (R-type). Used only to
+# answer "did something just clobber a1 with a value we cannot read statically?".
+_WRITES_RT = {"addiu", "addi", "ori", "andi", "xori", "lui", "slti", "sltiu",
+              "lw", "lh", "lhu", "lb", "lbu", "lwl", "lwr", "mfc1", "lwc1"}
+_WRITES_RD = {"addu", "add", "subu", "sub", "or", "and", "xor", "nor", "sll",
+              "srl", "sra", "sllv", "srlv", "srav", "slt", "sltu", "movn",
+              "movz", "mfhi", "mflo"}
+
+
+def _clobbers(ins, reg: int) -> bool:
+    """True if `ins` writes `reg` with something that is not a literal.
+
+    🔴 Without this the tracker never forgets. em75's (1,3) sets `a1 = 2` for one
+    branch and then reaches two more executor calls whose `a1` came from a table
+    (`lw a1, 0x18(s2)`); the stale 2 was credited to all three, so the row read
+    `anim a1 -> 2` as if fully resolved. Live it plays 2, 7 and 8.
+    """
+    rt, rd = (ins.word >> 16) & 31, (ins.word >> 11) & 31
+    if ins.op == "addiu" and ((ins.word >> 21) & 31) == 0:
+        return False                                   # that IS the literal form
+    return (ins.op in _WRITES_RT and rt == reg) or (ins.op in _WRITES_RD and rd == reg)
+
+
 def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 1500):
     """Constant `a1` values a handler hands to the animation executor.
 
@@ -256,9 +287,10 @@ def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 15
     """
     seen = seen if seen is not None else set()
     if fn in seen or depth > 1 or not ov.has(fn):
-        return set()
+        return set(), False
     seen.add(fn)
     out, regs = set(), {}
+    computed = False     # an executor call was reached with a1 holding a non-literal
     alt = set()          # values reachable only via a branch-likely's annulled slot
     for i in range(limit):
         a = fn + i * 4
@@ -268,6 +300,10 @@ def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 15
         rs, rt = (ins.word >> 21) & 31, (ins.word >> 16) & 31
         if ins.op == "addiu" and rs == 0:
             regs[rt] = ins.imm
+        else:
+            for r in (5, 8):                # a1 (the id) and t0 (the slot index)
+                if _clobbers(ins, r):
+                    regs.pop(r, None)
         # 🔴 A branch-LIKELY (`beql`/`bnel`/...) annuls its delay slot when NOT
         # taken, so the slot is the OTHER arm, not part of the straight path.
         # Walking through it linearly reports one arm as if it were the only one:
@@ -284,13 +320,18 @@ def exec_consts(ov: Overlay, fn: int, depth: int = 0, seen=None, limit: int = 15
             if ins.target == EXECUTOR:
                 if 5 in regs:
                     out.add(regs[5])
+                else:
+                    computed = True
                 out |= alt
                 alt = set()
             elif ov.text_va <= ins.target < ov.text_end:
-                out |= exec_consts(ov, ins.target, depth + 1, seen, limit)
+                sub_out, sub_computed = exec_consts(ov, ins.target, depth + 1,
+                                                    seen, limit)
+                out |= sub_out
+                computed = computed or sub_computed
         if ins.op == "jr" and ins.args == "ra":
             break
-    return out
+    return out, computed
 
 
 def print_states(ov: Overlay):
@@ -328,8 +369,13 @@ def print_states(ov: Overlay):
             if tgt is None:
                 print(f"    ({m},{sub + bias:3d})  0x{ce:08X}  (inline / no handler call)")
                 continue
-            a1s = sorted(exec_consts(ov, tgt))
+            a1s, computed = exec_consts(ov, tgt)
+            a1s = sorted(a1s)
             shown = ",".join(str(x) for x in a1s) if a1s else "(computed)"
+            # A handler can have BOTH literal and table-driven executor calls;
+            # reporting only the literals reads as "fully resolved" when it isn't.
+            if a1s and computed:
+                shown += ",+computed"
             print(f"    ({m},{sub + bias:3d})  handler 0x{tgt:08X}  anim a1 -> {shown}")
         print()
 
