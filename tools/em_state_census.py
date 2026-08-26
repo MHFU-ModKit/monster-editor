@@ -112,15 +112,29 @@ def main() -> int:
         sp = moved.get(k)
         mv = sum(sp) / len(sp) if sp else None
         dw = sum(v) / len(v)
-        verdict = ("HOLDS + STATIONARY" if mv is not None and mv < 60 and dw >= 8
-                   else "HOLDS + MOVES" if dw >= 8
-                   else "short — will bounce out")
+        # ⚠️ "unmeasured" is its own verdict and must not be folded into
+        # "MOVES". `mv` is None when the state never occurred on two consecutive
+        # ticks with the monster co-located, which is a gap in the sample, not a
+        # finding — and reporting it as MOVES made (0,7), the longest-dwelling
+        # state in the whole table, look like a poor candidate for a struggle
+        # loop on no evidence at all.
+        # 🔴 THE UNITS ARE PER TICK AND THE TICK IS 2 Hz — double them before
+        # calling anything stationary. (2,1) at "45" was reported STATIONARY
+        # under a threshold of 60, and it is 90 units a SECOND in whatever
+        # direction the monster faces: a probe that held it walked the Brute
+        # 10 952 -> 31 164 units off the map in 450 s. 25/tick (50/s) is about
+        # the most a monster can drift and still read as standing still.
+        verdict = ("short — will bounce out" if dw < 8
+                   else "HOLDS + unmeasured" if mv is None
+                   else "HOLDS + STILL" if mv < 25
+                   else "HOLDS + DRIFTS" if mv < 60
+                   else "HOLDS + MOVES")
         return (f"{str(k):8s} {dw:6.1f} {len(v):4d} "
                 f"{(f'{mv:10.0f}' if mv is not None else '         ?')} "
                 f"{str(sorted(anims[k])):>12s}   {verdict}")
 
     print(f"{'state':8s} {'dwell':>6} {'n':>4} {'move/tick':>10} {'a1':>12}   "
-          f"verdict     (dwell in 2 Hz ticks)")
+          f"verdict     (2 Hz: dwell in ticks, move/tick x2 = units/second)")
     rows = sorted(((sum(v) / len(v), k) for k, v in dwell.items()
                    if len(v) >= args.min_samples), reverse=True)
     for _, k in rows[:args.top]:
