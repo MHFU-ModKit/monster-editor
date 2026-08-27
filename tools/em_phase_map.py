@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """em_phase_map.py — what actually decides how long a big-monster action runs.
 
-`entity+0x414` is a red herring: em75 has 81 literal stores to it, but live it
-reads 0 through most actions and overriding it changes nothing. The real timing
-lives in the per-`(main,sub)` handler, which is a small phase machine on
-`entity+0x1D5`, and its transitions are gated on the **clip's own cursor**:
+`entity+0x414` is real but a MINORITY gate — 27 of em75's 231 actions, not the
+universal action clock an earlier note here claimed. Most actions read 0 from it
+throughout. The dominant timing lives in the per-`(main,sub)` handler, which is a
+small phase machine on `entity+0x1D5` whose transitions are gated on the **clip's
+own cursor**:
 
   `0x08864408(block, slot, frame)` -> 1 when the clip cursor has reached `frame`
       lb   v0, 0x3E(a0)          ; disabled? -> 0
