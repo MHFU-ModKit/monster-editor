@@ -3,7 +3,10 @@
 
 `entity+0x414` is real but a MINORITY gate — 27 of em75's 231 actions, not the
 universal action clock an earlier note here claimed. Most actions read 0 from it
-throughout. The dominant timing lives in the per-`(main,sub)` handler, which is a
+throughout. It is a per-action frame BUDGET (seeded from {30,60,150,300,600,900}),
+counted down and tested by the handler — and since 2026-08-28 it is known to be
+SETTABLE from a mod: a post-hook on abi slot 32 cut `(2,9)` from 3.30 s to 0.55 s.
+So "fixed length" below describes the native game, not a porting ceiling. The dominant timing lives in the per-`(main,sub)` handler, which is a
 small phase machine on `entity+0x1D5` whose transitions are gated on the **clip's
 own cursor**:
 
@@ -47,7 +50,7 @@ CURSOR_REACHED = 0x08864408       # (block, slot, frame) -> cursor >= frame
 CURSOR_WINDOW = 0x08864348        # (block, slot, frame) -> windowed form
 PHASE = 0x1D5                     # entity+0x1D5, the handler's phase byte
 CLIP_FLAGS = 0xBC                 # bit 0 = clip still playing
-TIMER = 0x414                     # the countdown that is NOT the duration gate
+TIMER = 0x414                     # the per-action frame budget (a minority gate)
 ANIM_BLOCK = 0x80                 # entity+0x80; per-slot stride 0x40, cursor +0x10
 
 
@@ -169,7 +172,7 @@ def main() -> int:
             else:
                 clip_only += 1
         elif g["timer"]:
-            frame_only += 1                    # +0x414 countdown: FIXED length
+            frame_only += 1                    # +0x414 budget: fixed, but writable
         elif g["frames"] or g["windows"]:
             neither += 1                       # cursor-gated but never waits for the end
         else:
@@ -179,14 +182,15 @@ def main() -> int:
     print(f"\n  of {tot} actions, by what ENDS them:")
     print(f"    {clip_only:3d} clip-done only        -> any clip length, no event frames")
     print(f"    {both:3d} clip-done + cursor tests -> any clip length, but FIXED event frames")
-    print(f"    {frame_only:3d} +0x414 countdown      -> FIXED length, clip is ignored")
+    print(f"    {frame_only:3d} +0x414 countdown      -> fixed budget; settable (EM_OVERLAY_ABI §13)")
     print(f"    {neither:3d} cursor tests only")
     print(f"    {unknown_n[0]:3d} no gate found         (instant / driven from elsewhere)")
     ends_on_clip = both + clip_only
     print(f"\n  {ends_on_clip}/{tot} ({ends_on_clip/tot:.0%}) END WHEN THE CLIP ENDS"
           f" -> their length is the ported clip's to choose.")
-    print(f"  {frame_only}/{tot} ({frame_only/tot:.0%}) run a fixed frame count regardless"
-          f" -> a longer ported clip IS truncated here.")
+    print(f"  {frame_only}/{tot} ({frame_only/tot:.0%}) run on a fixed frame BUDGET instead"
+          f" -> a longer ported clip is truncated only if")
+    print(f"      nobody raises the budget, which is one word per enter-action.")
     if unresolved:
         print(f"\n  \u26a0 {unresolved} cursor thresholds are loaded from data, not literals,"
               f" and show as '?'.")
