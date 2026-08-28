@@ -102,6 +102,56 @@ def analyse(ov: Overlay, fn: int, cap: int = 600):
     return gates
 
 
+PHASE_STORE = 0x1D5               # sb <reg>, 469(entity) — the phase increment
+
+
+def budget_owner(ov: Overlay, fn: int, cap: int = 400):
+    """Can a slot-32 POST-hook own this action's `+0x414` budget?
+
+    It can iff the handler does NOT re-seed the budget in its **phase-0 block** —
+    the block that runs on the first slot-29 tick *after* enter-action, i.e.
+    after our store. Handlers that do (e.g. `(2,16)`: `addiu v1,zero,150; sw
+    v1,1044(s1)`) overwrite us one frame later; handlers that only consume it
+    (e.g. `(2,24)`) keep our value. Both confirmed live in the same run:
+    `(2,24)` held 1231 of our 1234, `(2,16)` counted down from the handler's 150.
+
+    Seeds elsewhere in the handler do NOT count and an earlier version of this
+    that flagged any literal seed got `(2,9)` wrong: `(2,9)` seeds 600 on its way
+    OUT, for the action it chains into, and a post-hook does own it (measured —
+    forcing 30 cut it from 3.30 s to 0.55 s).
+
+    The phase-0 block runs from the first `sb <reg>, 0x1D5(entity)` to the first
+    unconditional `b`, whose DELAY SLOT still belongs to the block — which is
+    exactly where `(2,16)` hides its re-seed.
+    """
+    a, in_block, seeds = fn, False, []
+    hist, tail = [], -1
+    for _ in range(cap):
+        i = decode(ov.word(a), a)
+        if not in_block and i.op == "sb" and getattr(i, "imm", None) == PHASE_STORE:
+            in_block = True
+        elif in_block:
+            if i.op == "sw" and getattr(i, "imm", None) == TIMER:
+                src = i.args.split(",")[0].strip()
+                if src == "zero":
+                    seeds.append(0)
+                for prev in reversed(hist[-8:]):
+                    if prev.op == "addiu" and prev.args.startswith(src + ","):
+                        p = [x.strip() for x in prev.args.split(",")]
+                        if p[1] == "zero":
+                            seeds.append(int(p[2], 0))
+                        break
+            if tail < 0 and i.op == "b":
+                tail = 1                      # one more insn: the delay slot
+            elif tail == 1:
+                break
+        hist.append(i)
+        if i.op == "jr" and "ra" in i.args:
+            break
+        a += 4
+    return sorted(set(seeds))
+
+
 def handlers(ov: Overlay):
     """(main, sub) -> handler address, reusing em_moveset's dispatcher walk."""
     _entry, disp = state_dispatchers(ov)
@@ -127,6 +177,9 @@ def main() -> int:
     ap.add_argument("overlay")
     ap.add_argument("--main", type=int)
     ap.add_argument("--pair")
+    ap.add_argument("--budget-owner", action="store_true",
+                    help="for the timer-gated actions, can a slot-32 post-hook "
+                         "own the +0x414 budget, or does phase 0 re-seed it?")
     args = ap.parse_args()
     ov = Overlay.load_file(args.overlay)
     hs = handlers(ov)
@@ -144,6 +197,22 @@ def main() -> int:
         print(f"  clip-done (+0xBC)   : {g['clip_done']}")
         print(f"  timer  (+0x414)     : {g['timer']}")
         print(f"  phase writes        : {len(g['phases'])}")
+        return 0
+
+    if args.budget_owner:
+        cache, own, lose = {}, [], []
+        print(f"{'pair':>9s} {'handler':>11s}  phase-0 re-seed  verdict")
+        for (m, sub), fn in sorted(hs.items()):
+            g = cache.get(fn) or cache.setdefault(fn, analyse(ov, fn))
+            if g["clip_done"] or not g["timer"]:
+                continue                       # not one of the timer-gated 27
+            seeds = budget_owner(ov, fn)
+            (lose if seeds else own).append((m, sub))
+            print(f"  ({m},{sub:2d}) 0x{fn:08X}  {str(seeds) if seeds else '-':>15s}  "
+                  f"{'phase 0 re-seeds -> post-hook LOSES' if seeds else 'consumes only    -> post-hook OWNS it'}")
+        print(f"\n  a slot-32 POST-hook owns {len(own)} of {len(own)+len(lose)}: {own}")
+        print(f"  phase 0 re-seeds in {len(lose)}, which need the slot-29 seam: {lose}")
+        print("\n  Confirmed live: (2,24) and (2,9) owned, (2,16) not. EM_OVERLAY_ABI §13.")
         return 0
 
     print(f"{ov.name}: {len(hs)} (main,sub) handlers\n")
