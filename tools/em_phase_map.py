@@ -3,7 +3,10 @@
 
 `entity+0x414` is real but a MINORITY gate — 27 of em75's 231 actions, not the
 universal action clock an earlier note here claimed. Most actions read 0 from it
-throughout. The dominant timing lives in the per-`(main,sub)` handler, which is a
+throughout. It is a per-action frame BUDGET (seeded from {30,60,150,300,600,900}),
+counted down and tested by the handler — and since 2026-08-28 it is known to be
+SETTABLE from a mod: a post-hook on abi slot 32 cut `(2,9)` from 3.30 s to 0.55 s.
+So "fixed length" below describes the native game, not a porting ceiling. The dominant timing lives in the per-`(main,sub)` handler, which is a
 small phase machine on `entity+0x1D5` whose transitions are gated on the **clip's
 own cursor**:
 
@@ -47,7 +50,7 @@ CURSOR_REACHED = 0x08864408       # (block, slot, frame) -> cursor >= frame
 CURSOR_WINDOW = 0x08864348        # (block, slot, frame) -> windowed form
 PHASE = 0x1D5                     # entity+0x1D5, the handler's phase byte
 CLIP_FLAGS = 0xBC                 # bit 0 = clip still playing
-TIMER = 0x414                     # the countdown that is NOT the duration gate
+TIMER = 0x414                     # the per-action frame budget (a minority gate)
 ANIM_BLOCK = 0x80                 # entity+0x80; per-slot stride 0x40, cursor +0x10
 
 
@@ -99,6 +102,56 @@ def analyse(ov: Overlay, fn: int, cap: int = 600):
     return gates
 
 
+PHASE_STORE = 0x1D5               # sb <reg>, 469(entity) — the phase increment
+
+
+def budget_owner(ov: Overlay, fn: int, cap: int = 400):
+    """Can a slot-32 POST-hook own this action's `+0x414` budget?
+
+    It can iff the handler does NOT re-seed the budget in its **phase-0 block** —
+    the block that runs on the first slot-29 tick *after* enter-action, i.e.
+    after our store. Handlers that do (e.g. `(2,16)`: `addiu v1,zero,150; sw
+    v1,1044(s1)`) overwrite us one frame later; handlers that only consume it
+    (e.g. `(2,24)`) keep our value. Both confirmed live in the same run:
+    `(2,24)` held 1231 of our 1234, `(2,16)` counted down from the handler's 150.
+
+    Seeds elsewhere in the handler do NOT count and an earlier version of this
+    that flagged any literal seed got `(2,9)` wrong: `(2,9)` seeds 600 on its way
+    OUT, for the action it chains into, and a post-hook does own it (measured —
+    forcing 30 cut it from 3.30 s to 0.55 s).
+
+    The phase-0 block runs from the first `sb <reg>, 0x1D5(entity)` to the first
+    unconditional `b`, whose DELAY SLOT still belongs to the block — which is
+    exactly where `(2,16)` hides its re-seed.
+    """
+    a, in_block, seeds = fn, False, []
+    hist, tail = [], -1
+    for _ in range(cap):
+        i = decode(ov.word(a), a)
+        if not in_block and i.op == "sb" and getattr(i, "imm", None) == PHASE_STORE:
+            in_block = True
+        elif in_block:
+            if i.op == "sw" and getattr(i, "imm", None) == TIMER:
+                src = i.args.split(",")[0].strip()
+                if src == "zero":
+                    seeds.append(0)
+                for prev in reversed(hist[-8:]):
+                    if prev.op == "addiu" and prev.args.startswith(src + ","):
+                        p = [x.strip() for x in prev.args.split(",")]
+                        if p[1] == "zero":
+                            seeds.append(int(p[2], 0))
+                        break
+            if tail < 0 and i.op == "b":
+                tail = 1                      # one more insn: the delay slot
+            elif tail == 1:
+                break
+        hist.append(i)
+        if i.op == "jr" and "ra" in i.args:
+            break
+        a += 4
+    return sorted(set(seeds))
+
+
 def handlers(ov: Overlay):
     """(main, sub) -> handler address, reusing em_moveset's dispatcher walk."""
     _entry, disp = state_dispatchers(ov)
@@ -124,6 +177,9 @@ def main() -> int:
     ap.add_argument("overlay")
     ap.add_argument("--main", type=int)
     ap.add_argument("--pair")
+    ap.add_argument("--budget-owner", action="store_true",
+                    help="for the timer-gated actions, can a slot-32 post-hook "
+                         "own the +0x414 budget, or does phase 0 re-seed it?")
     args = ap.parse_args()
     ov = Overlay.load_file(args.overlay)
     hs = handlers(ov)
@@ -141,6 +197,22 @@ def main() -> int:
         print(f"  clip-done (+0xBC)   : {g['clip_done']}")
         print(f"  timer  (+0x414)     : {g['timer']}")
         print(f"  phase writes        : {len(g['phases'])}")
+        return 0
+
+    if args.budget_owner:
+        cache, own, lose = {}, [], []
+        print(f"{'pair':>9s} {'handler':>11s}  phase-0 re-seed  verdict")
+        for (m, sub), fn in sorted(hs.items()):
+            g = cache.get(fn) or cache.setdefault(fn, analyse(ov, fn))
+            if g["clip_done"] or not g["timer"]:
+                continue                       # not one of the timer-gated 27
+            seeds = budget_owner(ov, fn)
+            (lose if seeds else own).append((m, sub))
+            print(f"  ({m},{sub:2d}) 0x{fn:08X}  {str(seeds) if seeds else '-':>15s}  "
+                  f"{'phase 0 re-seeds -> post-hook LOSES' if seeds else 'consumes only    -> post-hook OWNS it'}")
+        print(f"\n  a slot-32 POST-hook owns {len(own)} of {len(own)+len(lose)}: {own}")
+        print(f"  phase 0 re-seeds in {len(lose)}, which need the slot-29 seam: {lose}")
+        print("\n  Confirmed live: (2,24) and (2,9) owned, (2,16) not. EM_OVERLAY_ABI §13.")
         return 0
 
     print(f"{ov.name}: {len(hs)} (main,sub) handlers\n")
@@ -169,7 +241,7 @@ def main() -> int:
             else:
                 clip_only += 1
         elif g["timer"]:
-            frame_only += 1                    # +0x414 countdown: FIXED length
+            frame_only += 1                    # +0x414 budget: fixed, but writable
         elif g["frames"] or g["windows"]:
             neither += 1                       # cursor-gated but never waits for the end
         else:
@@ -179,14 +251,15 @@ def main() -> int:
     print(f"\n  of {tot} actions, by what ENDS them:")
     print(f"    {clip_only:3d} clip-done only        -> any clip length, no event frames")
     print(f"    {both:3d} clip-done + cursor tests -> any clip length, but FIXED event frames")
-    print(f"    {frame_only:3d} +0x414 countdown      -> FIXED length, clip is ignored")
+    print(f"    {frame_only:3d} +0x414 countdown      -> fixed budget; settable (EM_OVERLAY_ABI §13)")
     print(f"    {neither:3d} cursor tests only")
     print(f"    {unknown_n[0]:3d} no gate found         (instant / driven from elsewhere)")
     ends_on_clip = both + clip_only
     print(f"\n  {ends_on_clip}/{tot} ({ends_on_clip/tot:.0%}) END WHEN THE CLIP ENDS"
           f" -> their length is the ported clip's to choose.")
-    print(f"  {frame_only}/{tot} ({frame_only/tot:.0%}) run a fixed frame count regardless"
-          f" -> a longer ported clip IS truncated here.")
+    print(f"  {frame_only}/{tot} ({frame_only/tot:.0%}) run on a fixed frame BUDGET instead"
+          f" -> a longer ported clip is truncated only if")
+    print(f"      nobody raises the budget, which is one word per enter-action.")
     if unresolved:
         print(f"\n  \u26a0 {unresolved} cursor thresholds are loaded from data, not literals,"
               f" and show as '?'.")
