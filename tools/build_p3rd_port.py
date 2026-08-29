@@ -28,7 +28,10 @@ def main():
     ap.add_argument("--nb", type=int, default=3)
     ap.add_argument("--hops", type=int, default=1)
     ap.add_argument("--ground-lift", type=float, default=0.0,
-                    help="raise the body N world-units (swap-spawn isn't terrain-placed)")
+                    help="raise the rest pose N units so the feet land on the "
+                         "skeleton origin, MHFU's datum. Get the number from "
+                         "tools/port_rest_floor.py (native reads +2.7). NOT the "
+                         "retracted terrain-placement theory — see port_p3rd.py.")
     ap.add_argument("--skin", choices=("auto", "transfer", "source"), default="auto",
                     help="auto = nearest-bone blend + seam weld (no native ref needed); "
                          "transfer = copy the host frame's own native skinning onto the "
