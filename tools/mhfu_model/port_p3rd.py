@@ -61,7 +61,8 @@ def _p3rd_main_pmo(blob):
 
 
 # --------------------------------------------------------------------------- #
-def _source_bone_remap(source_skeleton: bool, lead_pad: int, bone_map):
+def _source_bone_remap(source_skeleton: bool, lead_pad: int, bone_map,
+                       newpos=None):
     """Return callable(src_bone) -> out_bone mapping the SOURCE skeleton's bone
     indices onto the OUTPUT rig's joint indices, for the authentic-skin path.
 
@@ -71,6 +72,8 @@ def _source_bone_remap(source_skeleton: bool, lead_pad: int, bone_map):
     (host_joint -> source_track) to source -> host_joint. A source bone with no host
     correspondence returns -1 (dropped; its weight redistributes over the rest)."""
     if source_skeleton:
+        if newpos is not None:
+            return lambda b: newpos.get(b, -1)
         pad = lead_pad or 0
         return (lambda b: b + pad) if pad else (lambda b: b)
     if bone_map:
@@ -146,6 +149,8 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                      if src_skel_sub else None)
 
     lead_pad = 0
+    newpos = None
+    bone_order = None
     if source_skeleton:
         # --- SOURCE-SKELETON path: rig = the monster's OWN skeleton (no down-rig). ---
         if src_skel_blob is None:
@@ -172,15 +177,34 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         hp, hl, hbw = _skin.frame_skeleton(frame_pac)
         lead_pad = max(0, _lead_origin(hbw) - _lead_origin(bw))
         info["lead_pad"] = lead_pad
+
+        # --- stream partition, READ OFF THE BONE TREE (not the Tigrex formula) ---
+        # MHFU's FK walks the rig in 3 streams and each must be a contiguous run of
+        # bone indices. Native rigs are authored body/head/tail so the trailing
+        # slice happens to be right; an MHP3rd rig is not (the Zinogre's head sits
+        # at bones 18..23, mid-order). Derive the real subtrees and REORDER the rig
+        # so the partition is contiguous; the same permutation then drives the skin
+        # and the anim, so nothing else has to know.
+        src_animated = struct.unpack_from("<I", src_skel_blob, 0x1C)[0]
+        if not (0 < src_animated <= len(ssk.bones)):
+            src_animated = len(ssk.bones)     # 0x1C-header skeleton: no count word
+        split, order = _sk.derive_stream_partition(parents, bw, src_animated)
+        split = [split[0] + lead_pad] + list(split[1:])
+        bone_order = order
+        info["stream_split"] = split
+        info["bone_reorder"] = (order != list(range(len(ssk.bones))))
+
+        # source bone i -> output joint index (permutation + leading-origin pad)
+        newpos = {old_i: new_i + lead_pad for new_i, old_i in enumerate(order)}
+        parents = _sk.reorder_bones(parents, order)
+        bw = [bw[old_i] for old_i in order]
         if lead_pad:
-            # prepend lead_pad origin bones to the rig used for skinning
             parents = [(-1 if j == 0 else j - 1) for j in range(lead_pad)] + \
                       [(p + lead_pad if p >= 0 else lead_pad - 1) for p in parents]
             bw = [(0.0, 0.0, 0.0)] * lead_pad + list(bw)
-            # anim: source track i drives joint i+lead_pad; placeholders stay at rest
-            bone_map = {i + lead_pad: i for i in range(len(ssk.bones))}
-        else:
-            bone_map = None
+        # anim: source track i drives joint newpos[i]; placeholders stay at rest
+        bone_map = ({newpos[i]: i for i in range(len(ssk.bones))}
+                    if (lead_pad or info["bone_reorder"]) else None)
         dead = set()
         info["mode"] = "source_skeleton"
         info["src_bones"] = len(ssk.bones)
@@ -224,7 +248,8 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         # SHIP THE MONSTER'S OWN SKIN: pair each vertex's source-palette (bone, weight)
         # influences with the output rig (source-skeleton: src bone i -> i + lead_pad;
         # retarget: invert the host<-source bone map). No nearest-bone guess, no oracle.
-        remap = _source_bone_remap(source_skeleton, lead_pad, bone_map)
+        remap = _source_bone_remap(source_skeleton, lead_pad, bone_map,
+                                   newpos=newpos)
         vgs = _skin.from_source_influences(
             model.mesh_groups, bone_remap=remap,
             materials_of=lambda g: g.material, max_pal=8)
@@ -274,7 +299,8 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         new = bytearray(_replace_sub(bytes(new), 2, tmh_bytes))  # his own TMH
         info["tmh_bytes"] = len(tmh_bytes)
     if source_skeleton:
-        conv = _sk.p3rd_to_mhfu(src_skel_blob, lead_pad=lead_pad)  # own skeleton (+origin pad)
+        conv = _sk.p3rd_to_mhfu(src_skel_blob, lead_pad=lead_pad,
+                                split=split, order=bone_order)   # own rig, stream-ordered
         new = bytearray(_replace_sub(bytes(new), 0, conv))
         info["skeleton_bytes"] = len(conv)
 
@@ -293,7 +319,7 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         out, ainfo = _ig.swap_anim_to_realmotion(
             bytes(new), flat, anim_index=3, skel_index=0,
             host_count=(None if source_skeleton else host_count),
-            split=(None if source_skeleton else split),
+            split=split,
             keep_size=keep_anim_size, bone_map=bone_map)
         new = bytearray(out)
         info["anim"] = ainfo

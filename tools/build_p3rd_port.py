@@ -50,7 +50,8 @@ def main():
                                   skin=a.skin, source_skeleton=a.source_skeleton)
     open(a.out, "wb").write(pac)
     print("wrote %s" % a.out)
-    for k in ("mode", "src_bones", "skeleton_bytes", "src_groups", "src_verts",
+    for k in ("mode", "src_bones", "lead_pad", "stream_split", "bone_reorder",
+              "skeleton_bytes", "src_groups", "src_verts",
               "skin_mode", "welded_seams", "pmo_bytes",
               "tmh_bytes", "materials", "anim_clips", "bone_map_matched", "anim",
               "total", "native_total", "needs_relocate"):
