@@ -133,13 +133,21 @@ def check(pac, model_pac=None, geo=None):
                 anim = cand
                 break
     if anim is not None:
-        counts = []
-        for st in anim.streams:
-            bc = max((len(bl.bones) for cl in st.clips for bl in [cl]), default=0) \
-                if False else 0
-            counts.append(bc)
+        occupied = [(i, st) for i, st in enumerate(anim.streams) if st.clips]
         ck(True, "anim sub parses", "streams=%d slots=%s"
            % (len(anim.streams), [len(st.clips) for st in anim.streams]))
+        # Each populated stream's blocks must carry exactly the bones the
+        # skeleton assigns to that stream. A mismatch walks the FK joint array off
+        # the end of a section — the v20/v21 crash class.
+        want = [c for _sid, c in runs]
+        detail, agree = [], True
+        for k, (_i, st) in enumerate(occupied):
+            got = sorted({len(bl.bones) for bl in st.clips.values()})
+            if k < len(want) and got and got != [want[k]]:
+                agree = False
+                detail.append("stream %d carries %s bones, partition says %d"
+                              % (k, got, want[k]))
+        ck(agree, "anim bone counts match the skeleton partition", "; ".join(detail))
     else:
         ck(False, "anim sub parses", "no parsable in-game anim sub")
 

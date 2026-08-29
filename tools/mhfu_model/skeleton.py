@@ -276,6 +276,11 @@ def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0,
     src_animated = struct.unpack_from("<I", p3rd_blob, 0x1C)[0]
     animated = (src_animated if 0 < src_animated <= nsrc else nsrc) + lead_pad
     sp = split or _default_split(animated)
+    if sum(sp) != animated:
+        # The FK walks `animated` joints across the stream sections; a partition
+        # that does not cover exactly that many runs off the end of one.
+        raise ValueError("split %r sums to %d, skeleton declares %d animated bones"
+                         % (sp, sum(sp), animated))
 
     runs = []
     for sid, c in enumerate(sp):
