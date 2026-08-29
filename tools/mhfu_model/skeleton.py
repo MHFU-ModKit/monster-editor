@@ -105,13 +105,146 @@ def assign_stream_ids(skel: Skeleton, split) -> Skeleton:
 
 
 def _default_split(n: int):
-    """3-stream split mirroring native Tigrex's tail-stream sizes (…/9/5)."""
+    """3-stream split mirroring native Tigrex's tail-stream sizes (…/9/5).
+
+    A LAST RESORT. Prefer :func:`derive_stream_partition`, which reads the real
+    partition off the bone tree instead of assuming the Tigrex's bone ordering.
+    """
     if n >= 9 + 5 + 1:
         return [n - 14, 9, 5]
     return [n]
 
 
-def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0) -> bytes:
+# --------------------------------------------------------------------------- #
+# stream partition — derived from the bone tree, not assumed
+# --------------------------------------------------------------------------- #
+def _child_map(parents):
+    kids = {}
+    for i, p in enumerate(parents):
+        kids.setdefault(p, []).append(i)
+    return kids
+
+
+def _subtree(kids, root):
+    out, stack = {root}, [root]
+    while stack:
+        for c in kids.get(stack.pop(), ()):
+            out.add(c)
+            stack.append(c)
+    return out
+
+
+def _appendage(parents, kids, leaf, limit, taken, ceiling):
+    """The subtree an extremity belongs to: climb from ``leaf`` to the highest
+    ancestor whose subtree still fits in ``limit`` bones, stays inside ``ceiling``
+    and does not touch an already-claimed stream.
+
+    Always returns a COMPLETE subtree — starting from ``{leaf}`` would strand the
+    leaf's own children in the body stream while the leaf moved to the end, putting
+    a child ahead of its parent (13 of MHP3rd's 212 in-quest rigs hit exactly that).
+    """
+    best = _subtree(kids, leaf)
+    if len(best) > limit or max(best) >= ceiling:
+        return set()
+    a = leaf
+    while True:
+        p = parents[a]
+        if p is None or p <= 0:
+            break
+        st = _subtree(kids, p)
+        if len(st) > limit or (st & taken) or max(st) >= ceiling:
+            break
+        a, best = p, st
+    return best
+
+
+def _appendages(parents, kids, limit, ceiling):
+    """Every maximal subtree that could serve as a stream, by root bone."""
+    out = {}
+    for a in range(1, ceiling):
+        if parents[a] is None or parents[a] < 0:
+            continue
+        st = _subtree(kids, a)
+        if len(st) <= limit and max(st) < ceiling:
+            out[a] = st
+    return out
+
+
+def _pick_appendage(parents, kids, bind_world, limit, taken, ceiling, want_max_z):
+    """The stream at one end of the body: the subtree holding the most extreme
+    bone along Z, falling back to the most extreme MULTI-bone subtree when that
+    lands on a bare leaf (a one-bone stream is a legal but useless partition)."""
+    live = [i for i in range(ceiling) if i not in taken]
+    if not live:
+        return set()
+    tip = (max if want_max_z else min)(live, key=lambda i: bind_world[i][2])
+    best = _appendage(parents, kids, tip, limit, taken, ceiling)
+    if len(best) >= 2:
+        return best
+    cands = [st for st in _appendages(parents, kids, limit, ceiling).values()
+             if len(st) >= 2 and not (st & taken)]
+    if not cands:
+        return best
+    return (max if want_max_z else min)(
+        cands, key=lambda st: (max if want_max_z else min)(
+            bind_world[i][2] for i in st))
+
+
+def derive_stream_partition(parents, bind_world, animated, streams=3,
+                            max_frac=0.4):
+    """Read MHFU's 3-stream bone partition off the SOURCE bone tree.
+
+    MHFU's animation FK walks a rig in independent streams (native Tigrex =
+    31 body / 9 head+neck / 5 tail), and each stream must be a **contiguous run of
+    bone indices** (`bone+0x50`). Native monster rigs satisfy that because they are
+    authored body-first with the head and tail as the two trailing subtrees — which
+    is exactly what makes the old ``[n-14, 9, 5]`` formula appear to work.
+
+    An MHP3rd rig is under no such obligation. The Zinogre's head sits at bones
+    18..23, in the MIDDLE of its index order, so slicing off the last 14 bones puts a
+    hind leg in the head stream. This finds the real subtrees geometrically — the
+    stream holding the most **-Z** bone is the tail, the most **+Z** the head — and
+    returns the permutation that moves them to the end.
+
+    Returns ``(split, order)``: ``split`` = the per-stream bone counts, ``order`` =
+    the new->old index permutation (identity when the rig is already native-shaped).
+    Verified to reproduce the native Tigrex's [31, 9, 5] with an identity order.
+    """
+    n = len(parents)
+    animated = max(0, min(animated, n))
+    if animated < 3 or streams < 2:
+        return [animated] if animated else [n], list(range(n))
+    kids = _child_map(parents)
+    limit = max(1, int(animated * max_frac))
+    tail = _pick_appendage(parents, kids, bind_world, limit, set(), animated, False)
+    head = _pick_appendage(parents, kids, bind_world, limit, tail, animated, True)
+    if head & tail or len(head) + len(tail) >= animated:
+        head = set()
+    body = [i for i in range(animated) if i not in head and i not in tail]
+    if not body:
+        return [animated], list(range(n))
+    split = [len(body)] + [len(x) for x in (head, tail) if x]
+    order = body + sorted(head) + sorted(tail) + list(range(animated, n))
+    return split, order
+
+
+def reorder_bones(parents, order):
+    """Apply a new->old permutation, returning the reindexed parent array.
+
+    The engine builds its joint tree by index, so a parent must keep a LOWER index
+    than its children; :func:`derive_stream_partition` only ever moves whole
+    subtrees behind their parent, which preserves that.
+    """
+    pos = {old: new for new, old in enumerate(order)}
+    out = []
+    for old in order:
+        p = parents[old]
+        out.append(pos[p] if p is not None and p >= 0 and p in pos else -1)
+    return out
+
+
+def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0,
+                 order=None) -> bytes:
     """Convert a MHP3rd (0x80000000) skeleton to a native MHFU 0xC0000000 skeleton.
 
     The MHP3rd skeleton uses **0x5C** bone sections; the MHFU engine's joint builder
@@ -150,17 +283,47 @@ def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0) -> bytes:
     while len(runs) < n:
         runs.append(len(sp))                       # non-animated tail -> own stream id
 
-    # unified bone list: lead_pad placeholders (origin chain) then the shifted source.
-    def sh(v):                                      # shift a bone link by lead_pad (-1 stays)
-        return v + lead_pad if v is not None and v >= 0 else -1
+    # unified bone list: lead_pad placeholders (origin chain) then the source bones,
+    # optionally REORDERED so each anim stream is a contiguous run of bone indices
+    # (see derive_stream_partition — MHP3rd rigs are not authored native-shaped).
+    perm = list(order) if order else list(range(nsrc))
+    if sorted(perm) != list(range(nsrc)):
+        raise ValueError("order must be a permutation of the %d source bones" % nsrc)
+    pos = {old_i: new_i + lead_pad for new_i, old_i in enumerate(perm)}
+
+    def sh(v):                     # source bone index -> output joint index
+        return pos.get(v, -1) if v is not None and v >= 0 else -1
+
+    parents = [(j - 1 if j > 0 else -1) for j in range(lead_pad)]
+    for old_i in perm:
+        p = src[old_i].parent
+        parents.append(sh(p) if p is not None and p >= 0
+                       else (lead_pad - 1 if lead_pad else -1))
+    # child/sibling are fully derivable from the parent array and MUST be rebuilt
+    # after a permutation (verified byte-identical to the shipped links on the native
+    # Tigrex, the Brute, the Zinogre and file_05354 — the only difference is that two
+    # ROOTS are not each other's sibling, which is preserved here).
+    kids = {}
+    for i, p in enumerate(parents):
+        if p >= 0:
+            kids.setdefault(p, []).append(i)
+    child = [-1] * n
+    sibling = [-1] * n
+    for p, cs in kids.items():
+        cs = sorted(cs)
+        child[p] = cs[0]
+        for a, b in zip(cs, cs[1:]):
+            sibling[a] = b
+
     bl = []   # (flag, idx, parent, child, sibling, scale, rot, pos)
     for j in range(lead_pad):
-        bl.append((1, j, j - 1 if j > 0 else -1, j + 1, -1,
+        bl.append((1, j, parents[j], child[j], sibling[j],
                    (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
-    for b in src:
-        parent = sh(b.parent) if b.parent >= 0 else (lead_pad - 1 if lead_pad else -1)
+    for new_i, old_i in enumerate(perm):
+        b = src[old_i]
+        j = new_i + lead_pad
         bl.append((b.flag if getattr(b, "flag", 0) else 1,
-                   b.index + lead_pad, parent, sh(b.child), sh(b.sibling),
+                   j, parents[j], child[j], sibling[j],
                    tuple(b.bind_scale), tuple(b.bind_rot), tuple(b.bind_pos)))
 
     secs = bytearray()
