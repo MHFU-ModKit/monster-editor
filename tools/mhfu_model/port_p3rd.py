@@ -308,11 +308,20 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     if anim_blob is not None:
         flat = _flatanim.parse_p3rd(anim_blob)
         info["anim_clips"] = len(flat.animations)
-        # GROUND LIFT: a swap-spawned monster is NOT terrain-placed — the engine pins
-        # its world Y at 0 (verified live), so the body (root + pelvis-lift ~300) sits
-        # mostly below the snow floor (~270). Baking +ground_lift units into the pelvis
-        # locY channel raises the whole body+feet onto the ground (the relocate inject
-        # can't rely on a per-frame Y write — the engine resets it every frame).
+        # GROUND LIFT: the port inherits the SOURCE GAME'S vertical datum.
+        # ⛔ The rationale that used to sit here — "a swap-spawned monster is NOT
+        # terrain-placed, the engine pins its world Y at 0" — is RETRACTED with the
+        # rest of the terrain-registration theory (memory `brute-terrain-sink-re`);
+        # the engine grounds the entity correctly. The real reason a cross-game port
+        # needs this is a DATUM mismatch: MHFU's convention is "the rest pose puts
+        # the feet at the skeleton origin", and a source rig authored against another
+        # game's convention does not. Measured with `tools/port_rest_floor.py`:
+        #   native Tigrex   lowest bone -297.9 + pelvis lift 300.6 = +2.7  (on the floor)
+        #   Zinogre port    lowest bone -389.0 + pelvis lift 226.4 = -162.6 (sunk)
+        # so `--ground-lift 165.3` and the port lands at +2.7 too. The native reading
+        # +2.7 is what makes the method trustworthy — it is the control.
+        # Baking it into the PELVIS locY channel (not a per-frame write) is what makes
+        # it hold in every pose and while moving.
         if ground_lift:
             _apply_ground_lift(flat, ground_lift)
             info["ground_lift"] = ground_lift
