@@ -17,9 +17,12 @@ The three traps, and what each one looks like when it is not caught
 2. **A move bound to a `(main,sub)` pair the engine never enters.** Its handler checks
    for a condition nobody created and returns immediately: **411 of 411 forced moves
    survived exactly one tick**, the clip restarted from frame 0 twice a second and no
-   animation ever finished. `tools/em_state_census.py` measures it; issue #4 turns that
-   into machine-readable `species/emNN.json`. Until then this check WARNS — see
-   :class:`ActionIntel`.
+   animation ever finished. `species/emNN.json` (`tools/em_intel.py`) carries it, and
+   the file separates three states that look alike and are not: no census at all, a
+   census that says nothing about this pair, and a census that measured ZERO entries.
+   Only the last is an error. A port that means it may say `allow_unentered = true`.
+   The same file also carries STATIC intel, so even with no census this checks that
+   the host overlay dispatches the pair at all.
 3. **A hurtbox bone out of range for the shipped skeleton.** The volume table is
    bone-indexed and a ported monster ships its own rig, so a host-derived index is not
    just wrong, it reads off the end of the joint array.
@@ -32,22 +35,24 @@ Exit status is 1 if anything came back at level ``error``.
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, runtime_checkable
+from typing import Dict, List, Optional
 
 from .manifest import PortManifest, load as load_manifest
+from .intel import (ActionIntel, MIN_DWELL_TICKS, PairIntel,  # noqa: F401
+                    SpeciesIntel, find_intel)
 
 ERROR = "error"
 WARNING = "warning"
 
-#: how long, in ticks, a pair must hold before it is worth scripting. The census
-#: prints dwell in ticks at 2 Hz; anything that bounces out in one or two is the
-#: never-entered failure wearing a different hat.
-MIN_DWELL_TICKS = 3.0
+#: the reader of `species/emNN.json`. Issue #2 shipped a provisional one under this
+#: name and called it "the single class #4 replaces"; #4 replaced it with
+#: :class:`mhfu_monster_editor.intel.SpeciesIntel`, which still accepts the flat
+#: shape the provisional reader documented. The alias keeps callers working.
+JsonActionIntel = SpeciesIntel
 
 
 @dataclass
@@ -60,89 +65,6 @@ class Issue:
     def __str__(self) -> str:
         return "%-7s %-24s %-18s %s" % (self.level.upper(), self.code, self.where,
                                         self.message)
-
-
-# --------------------------------------------------------------------------- #
-# the seam for issue #4 — action intel
-# --------------------------------------------------------------------------- #
-@dataclass
-class PairIntel:
-    """What the census knows about one `(main, sub)` behaviour pair."""
-    main: int
-    sub: int
-    #: how many times the ENGINE entered the pair on its own. 0 = NEVER ENTERED.
-    entered: int = 0
-    #: mean dwell in 2 Hz ticks while the engine held it
-    dwell_ticks: float = 0.0
-    #: executor a1 values observed under it
-    a1: List[int] = field(default_factory=list)
-    note: str = ""
-
-
-@runtime_checkable
-class ActionIntel(Protocol):
-    """The whole interface issue #4 has to satisfy. Deliberately two members.
-
-    ``host_species`` is the MHFU species whose overlay the census was taken from — the
-    intel is a property of the HOST, not of the port, because `(main,sub)` is dispatched
-    by the host's own AI overlay. Two different ports riding the same host share it.
-
-    ``pair(main, sub)`` returns :class:`PairIntel`, or ``None`` when the census has
-    nothing to say about that pair (which is NOT the same as "never entered" — an
-    absent pair means an unobserved one).
-    """
-    host_species: int
-
-    def pair(self, main: int, sub: int) -> Optional[PairIntel]: ...
-
-
-class JsonActionIntel:
-    """Provisional reader for `species/emNN.json`, the file issue #4 will produce.
-
-    ⚠️ The on-disk shape is #4's to define; this accepts the obvious one and is the
-    single class to replace when it lands::
-
-        {"host_species": 75,
-         "pairs": [{"main": 2, "sub": 8, "entered": 46, "dwell_ticks": 23.7,
-                    "a1": [15]}, ...]}
-
-    A pair absent from ``pairs`` is unobserved. A pair present with ``entered`` 0 is the
-    census saying it looked and the engine never went there — the rejectable case.
-    """
-
-    def __init__(self, host_species: int, pairs: Iterable[PairIntel],
-                 source: str = "") -> None:
-        self.host_species = int(host_species)
-        self._by_pair = {(p.main, p.sub): p for p in pairs}
-        self.source = source
-
-    def pair(self, main: int, sub: int) -> Optional[PairIntel]:
-        return self._by_pair.get((int(main), int(sub)))
-
-    def __len__(self) -> int:
-        return len(self._by_pair)
-
-    @classmethod
-    def from_dict(cls, d: dict, source: str = "") -> "JsonActionIntel":
-        pairs = [PairIntel(main=int(p["main"]), sub=int(p["sub"]),
-                           entered=int(p.get("entered", 0)),
-                           dwell_ticks=float(p.get("dwell_ticks", 0.0)),
-                           a1=[int(x) for x in p.get("a1", [])],
-                           note=str(p.get("note", "")))
-                 for p in d.get("pairs", [])]
-        return cls(int(d.get("host_species", -1)), pairs, source)
-
-    @classmethod
-    def from_path(cls, path: os.PathLike | str) -> "JsonActionIntel":
-        p = Path(path)
-        return cls.from_dict(json.loads(p.read_text(encoding="utf-8")), str(p))
-
-
-def find_intel(host_species: int,
-               root: os.PathLike | str = "species") -> Optional[JsonActionIntel]:
-    """`species/emNN.json` for a host species, or ``None`` when #4 has not run yet."""
-    p = Path(root) / ("em%02d.json" % int(host_species))
-    return JsonActionIntel.from_path(p) if p.exists() else None
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +254,18 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
 
 
 def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
+    """The `(main,sub)` checks — static ones always, measured ones when a census exists.
+
+    🔴 Three states that read alike and must never be collapsed:
+
+    ``INTEL_ABSENT``            no measurements were supplied at all. Since #4 the
+                                file usually EXISTS and is full of static intel while
+                                still carrying no census, so this fires on the census,
+                                not on the file.
+    ``MOVE_PAIR_UNOBSERVED``    a census exists and has nothing on this pair.
+    ``MOVE_PAIR_NEVER_ENTERED`` a census exists, looked, and measured zero entries.
+                                The only one that is an ERROR.
+    """
     out: List[Issue] = []
     if not m.moves:
         return out
@@ -339,8 +273,8 @@ def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
         out.append(Issue(WARNING, "INTEL_ABSENT", "moves",
                          "no action intel for host species %d, so %d (main,sub) pair(s)"
                          " went unchecked. A pair the engine never enters bounces out "
-                         "in ONE tick — 411 of 411 forced moves did. Measure with "
-                         "tools/em_state_census.py; issue #4 makes it a file."
+                         "in ONE tick — 411 of 411 forced moves did. Build it with "
+                         "tools/em_intel.py; measure with tools/em_state_census.py."
                          % (m.host_species, len(m.moves))))
         return out
 
@@ -352,28 +286,89 @@ def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
                          "from another species says nothing." % (got, m.host_species)))
         return out
 
+    # A file with static intel but no census is the NORMAL case: collecting a census
+    # needs a cold boot with the observe-only probe deployed. Say so once, loudly,
+    # rather than once per move.
+    has_census = bool(getattr(intel, "has_census", True))
+    has_static = bool(getattr(intel, "has_static", False))
+    if not has_census:
+        why = getattr(intel, "census_reason", "") or "no census was attached"
+        out.append(Issue(WARNING, "INTEL_ABSENT", "moves",
+                         "the intel for host species %d carries NO measurements (%s), "
+                         "so whether the engine ever enters %d (main,sub) pair(s) is "
+                         "UNKNOWN — not zero. Deploy the observe-only probe and re-run "
+                         "tools/em_state_census.py / tools/em_intel.py --log."
+                         % (m.host_species, why, len(m.moves))))
+
     for name in sorted(m.moves):
         mv = m.moves[name]
         w = "moves.%s" % name
         p = intel.pair(mv.main, mv.sub)
         if p is None:
-            out.append(Issue(WARNING, "MOVE_PAIR_UNOBSERVED", w,
-                             "(%d,%d) is not in the census. Absent is not the same as "
-                             "never entered — the sample may simply not cover it."
+            mains = getattr(intel, "enumerated_mains", set())
+            if has_static and mv.main in mains:
+                n = next((s.get("sub_states")
+                          for s in getattr(intel, "main_states", [])
+                          if s.get("main") == mv.main), None)
+                out.append(Issue(ERROR, "MOVE_PAIR_NO_HANDLER", w,
+                                 "the host overlay's action tick dispatches %s "
+                                 "sub_state(s) under main %d and %d is not one of "
+                                 "them, so act_set would land on nothing."
+                                 % (n, mv.main, mv.sub)))
+            else:
+                out.append(Issue(WARNING, "MOVE_PAIR_UNOBSERVED", w,
+                                 "nothing is known about (%d,%d): it is in neither "
+                                 "the overlay's jump tables nor the census. Absent is "
+                                 "not the same as never entered."
+                                 % (mv.main, mv.sub)))
+            continue
+
+        if has_static and p.handler is None:
+            out.append(Issue(WARNING, "MOVE_PAIR_NO_HANDLER", w,
+                             "the dispatcher's case for (%d,%d) runs inline and calls "
+                             "no handler, so nothing offline can say what it does."
                              % (mv.main, mv.sub)))
+
+        if p.entered is None:
+            if has_census:
+                out.append(Issue(WARNING, "MOVE_PAIR_UNOBSERVED", w,
+                                 "the census covers this species but says nothing "
+                                 "about (%d,%d). Absent is not the same as never "
+                                 "entered — the sample may simply not cover it."
+                                 % (mv.main, mv.sub)))
+            # with no census at all the file-level INTEL_ABSENT already said it
         elif p.entered <= 0:
-            out.append(Issue(ERROR, "MOVE_PAIR_NEVER_ENTERED", w,
+            note = (" " + p.note) if getattr(p, "note", "") else ""
+            lvl = WARNING if getattr(mv, "allow_unentered", False) else ERROR
+            out.append(Issue(lvl, "MOVE_PAIR_NEVER_ENTERED", w,
                              "the census says the engine enters (%d,%d) ZERO times. "
                              "Its handler asks for a condition nothing has created and "
                              "returns at once: forced, it survives exactly one tick and "
-                             "the clip restarts from frame 0 forever."
-                             % (mv.main, mv.sub)))
+                             "the clip restarts from frame 0 forever.%s%s"
+                             % (mv.main, mv.sub, note,
+                                " Allowed by allow_unentered."
+                                if lvl == WARNING else "")))
         elif p.dwell_ticks and p.dwell_ticks < MIN_DWELL_TICKS:
             out.append(Issue(WARNING, "MOVE_PAIR_SHORT_DWELL", w,
                              "(%d,%d) holds for only %.1f ticks (%.1f s at 2 Hz) even "
                              "when the ENGINE picks it. Forced from the wrong range it "
                              "will bounce out." % (mv.main, mv.sub, p.dwell_ticks,
                                                    p.dwell_ticks / 2.0)))
+
+        # static findings that are worth saying whatever the census knows
+        if has_static and p.handler is not None:
+            if mv.clip is not None and p.ends_on == "budget" and p.budget.gated:
+                seeds = p.budget.phase0_seeds
+                out.append(Issue(WARNING, "MOVE_PAIR_BUDGET_GATED", w,
+                                 "(%d,%d) does not end when the clip ends — it runs on "
+                                 "the +0x414 frame budget, so a longer ported clip is "
+                                 "TRUNCATED. %s"
+                                 % (mv.main, mv.sub,
+                                    "Phase 0 re-seeds it with %s, so a slot-32 "
+                                    "post-hook cannot raise it; use the slot-29 seam."
+                                    % seeds if seeds else
+                                    "A slot-32 post-hook owns the budget, so it can "
+                                    "be raised (EM_OVERLAY_ABI §13).")))
     return out
 
 

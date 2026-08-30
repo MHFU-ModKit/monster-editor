@@ -2,7 +2,10 @@
 
   * :mod:`.manifest` — `port.toml`: schema, loader, canonical writer. The single source
     of truth for a ported monster, and pure data: stdlib only.
-  * :mod:`.validate` — the checks that need evidence (the built PAC, the action census).
+  * :mod:`.intel` — `species/emNN.json`: what the HOST action expects per `(main,sub)`,
+    joined from the offline analysers by `tools/em_intel.py`, with the provenance of
+    every field. Stdlib only, like the manifest.
+  * :mod:`.validate` — the checks that need evidence (the built PAC, the action intel).
   * :mod:`.core` — a monster PAC as a render-agnostic :class:`~.core.scene.Scene`:
     skeleton, skinned geometry, textures, clips, ``pose(clip, frame)``. No GL, no UI.
 

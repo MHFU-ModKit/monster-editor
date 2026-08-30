@@ -41,10 +41,16 @@ Where this differs from the issue's sketch, and why
   em id is what selects it. Naming the em id and leaving the offset unset is the correct
   authoring, and it is what both shipped ports do — pinning the number in the manifest
   forks it away from the map that the renderer and the porter both read.
-* **`[moves]` has `latch` / `min_gap`, not `budget`.** There is no "budget" anywhere in
-  the runtime. ``latch`` (how many executor dispatches the clip covers, default 1) and
-  ``min_gap`` (ticks before the same move may be re-issued, default 2) are the two knobs
-  `mhfu_port.lua` actually reads.
+* **`[moves]` has `latch` / `min_gap`, not `budget`.** ``latch`` (how many executor
+  dispatches the clip covers, default 1) and ``min_gap`` (ticks before the same move may
+  be re-issued, default 2) are the two knobs `mhfu_port.lua` actually reads; there is no
+  authorable budget beside them. (The engine's own `entity+0x414` frame budget is a
+  different thing entirely — a per-action countdown that gates 27 of the Tigrex's 231
+  actions, reported by `species/emNN.json` and *not* settable from a manifest.)
+* **`[moves]` also has `allow_unentered`.** ``validate`` refuses a move bound to a
+  `(main,sub)` the census MEASURED as never entered; this is the explicit override that
+  downgrades it to a warning, so the decision is in the file rather than in a flag on
+  someone's command line.
 * **`[[hurtbox]]` does not carry `part` as a first-class field.** The sketch conflated
   two *different* tables in the host overlay: VOLUMES (`0x28` records: bone + radius, no
   part field at all) and WEAKNESS (`0x18` records, keyed by `part_id`). See
@@ -120,6 +126,11 @@ class Move:
     latch: int = 1
     min_gap: int = 2
     label: str = ""
+    #: bind this pair even though the census measured ZERO entries into it. An
+    #: explicit, auditable override for the one thing `validate` refuses outright —
+    #: 411 of 411 forced moves into such a pair survived exactly one tick, so the
+    #: default is to refuse and the flag exists to be argued for in a comment.
+    allow_unentered: bool = False
 
 
 @dataclass
@@ -331,7 +342,8 @@ _SOURCE_KEYS = ("game", "em_id", "model", "geo", "anim")
 _BUILD_KEYS = ("source_skeleton", "skin", "ground_lift", "animated", "bone_offset",
                "skip_bones", "drop_joints", "nb", "hops", "reweight_undriven")
 _CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame")
-_MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label")
+_MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label",
+              "allow_unentered")
 _HURTBOX_KEYS = ("bone", "radius", "part", "label")
 _EFFECT_KEYS = ("move", "frame", "id", "bone", "label")
 _TOP_KEYS = ("schema", "port", "source", "build", "clips", "moves", "hurtbox", "effect")
@@ -413,7 +425,8 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
             name=mname, main=_need(m, "main", int, w), sub=_need(m, "sub", int, w),
             clip=_opt(m, "clip", str, w), anim=_opt(m, "anim", int, w),
             latch=_opt(m, "latch", int, w, 1), min_gap=_opt(m, "min_gap", int, w, 2),
-            label=_opt(m, "label", str, w, ""))
+            label=_opt(m, "label", str, w, ""),
+            allow_unentered=_opt(m, "allow_unentered", bool, w, False))
 
     hurtboxes = []
     for i, h in enumerate(_typed(raw.get("hurtbox", []), list, where + ".hurtbox")):
@@ -569,6 +582,8 @@ def dumps(m: PortManifest) -> str:
         _kv(out, "anim", mv.anim)
         _kv(out, "latch", mv.latch)
         _kv(out, "min_gap", mv.min_gap)
+        if mv.allow_unentered:
+            _kv(out, "allow_unentered", mv.allow_unentered)
         _kv(out, "label", mv.label)
 
     for h in m.hurtboxes:
