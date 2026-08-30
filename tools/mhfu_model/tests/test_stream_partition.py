@@ -115,7 +115,10 @@ def test_converted_skeleton_carries_the_reordered_partition():
     blob = _skel(ZINOGRE, b"\x00\x00\x00\x80")
     _sk, par, bw = _rig(blob)
     split, order = SK.derive_stream_partition(par, bw, 46)
-    out = SK.p3rd_to_mhfu(blob, split=split, order=order)
+    # ⚠️ src_animated is EXPLICIT now. `p3rd_to_mhfu` used to read it from +0x1C,
+    # which is not an animated-bone count (0x40000001 on most rigs, a
+    # plausible-but-wrong 46 here); it defaults to every bone instead.
+    out = SK.p3rd_to_mhfu(blob, split=split, order=order, src_animated=46)
     sids = _stream_ids(out)
     assert sids[:33] == [0] * 33
     assert sids[33:39] == [1] * 6
@@ -133,7 +136,10 @@ def test_child_and_sibling_links_are_rebuilt_correctly():
     blob = _skel(ZINOGRE, b"\x00\x00\x00\x80")
     _sk, par, bw = _rig(blob)
     split, order = SK.derive_stream_partition(par, bw, 46)
-    out = SK.p3rd_to_mhfu(blob, split=split, order=order)
+    # ⚠️ src_animated is EXPLICIT now. `p3rd_to_mhfu` used to read it from +0x1C,
+    # which is not an animated-bone count (0x40000001 on most rigs, a
+    # plausible-but-wrong 46 here); it defaults to every bone instead.
+    out = SK.p3rd_to_mhfu(blob, split=split, order=order, src_animated=46)
     sk2 = SKP.parse(out)
     npar = [b.parent for b in sk2.bones]
     kids = {}
@@ -152,7 +158,8 @@ def test_the_formula_split_fragments_the_zinogre_head():
     """The check has teeth: with the old formula, stream 1 is THREE fragments."""
     blob = _skel(ZINOGRE, b"\x00\x00\x00\x80")
     _sk, par, _bw = _rig(blob)
-    out = SK.p3rd_to_mhfu(blob, split=SK._default_split(46))     # [32, 9, 5]
+    out = SK.p3rd_to_mhfu(blob, split=SK._default_split(46),
+                          src_animated=46)                       # [32, 9, 5]
     npar = [b.parent for b in SKP.parse(out).bones]
     rng = set(range(32, 41))
     roots = [i for i in rng if npar[i] >= 0 and npar[i] not in rng]

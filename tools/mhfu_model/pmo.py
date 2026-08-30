@@ -283,12 +283,66 @@ def _append_unreferenced_vgroups(blob, header, scale, groups, seen_vg):
     return groups
 
 
+def _attach_influences(blob: bytes, header, groups) -> int:
+    """Give every vertex its AUTHENTIC ``(bone, weight)`` list from the PMO's own
+    bone palette. Returns the number of groups resolved (0 = nothing to attach).
+
+    🔴 Draw order is NOT the bind index for a native MHFU monster. Each vgroup
+    record carries ``(bone_count, cumulative_bone_count)`` into the skeleton's
+    ``Weight[]`` patch list at header[10]; replaying that list in vgroup-table
+    order yields a per-vgroup palette, and a vertex's VTYPE weights index INTO
+    that palette. `pmo_p3rd` has always done this for MHP3rd; the MHFU walk never
+    did, so every consumer fell back to "group N is welded to bone N" — which for
+    file_06185 welds 166 of 214 groups onto one bone. That is the single reason
+    the offline Blender render could never be trusted against the game.
+
+    Best-effort: a PMO without a palette (small monsters, no weight bits) is left
+    alone and the caller keeps its rigid-by-draw-order fallback.
+    """
+    from .pmo_skin import _resolve_running_palette
+    vg_tab, t9, skel_off = header[8], header[9], header[10]
+    if not (0 < vg_tab < t9 <= len(blob)) or not skel_off:
+        return 0
+    nvg = (t9 - vg_tab) // 0x10
+    try:
+        recs = [struct.unpack_from("<2BH3I", blob, vg_tab + i * 0x10)
+                for i in range(nvg)]
+        pal_len = (recs[-1][2] + recs[-1][1]) if recs else 0
+        if not pal_len or skel_off + pal_len * 2 > len(blob):
+            return 0
+        patches = [struct.unpack_from("<2B", blob, skel_off + i * 2)
+                   for i in range(pal_len)]
+        palettes = _resolve_running_palette(patches, recs)
+    except (struct.error, IndexError):
+        return 0
+    done = 0
+    for g in groups:
+        if not (0 <= g.vg_rec < len(palettes)):
+            continue
+        pal = palettes[g.vg_rec]
+        if not pal:
+            continue
+        g.boneref = pal[0]
+        for v in g.vertices:
+            w = v.get("weights")
+            if w:
+                v["influences"] = [(pal[k] if k < len(pal) else -1, w[k])
+                                   for k in range(len(w))]
+            else:
+                v["influences"] = [(pal[0], 1.0)]
+        done += 1
+    return done
+
+
 def parse(blob: bytes) -> Model:
     """Decode a big-monster PMO into MeshGroups (best-effort geometry).
 
     Header struct at offset 8 (`I4f2H8I`). Mesh-table stride varies (0x20/0x18) —
     both walks are tried and the valid one with the most decoded geometry wins; the
     winning stride is recorded on the model for the encoder.
+
+    Vertices additionally carry ``influences`` — the REAL skin — whenever the file
+    has a bone palette (`_attach_influences`).
     """
     type_, version = struct.unpack_from("4s4s", blob, 0)
     if type_ != b"pmo\x00":
@@ -307,6 +361,7 @@ def parse(blob: bytes) -> Model:
         # recover any 2nd-set vgroups the mesh table didn't reference (split-mesh
         # monsters like file_06185 — see _append_unreferenced_vgroups).
         best = _append_unreferenced_vgroups(blob, header, model.scale, best, best_seen)
+        _attach_influences(blob, header, best)
         model.mesh_groups = best
         model.stride = best_stride
     return model

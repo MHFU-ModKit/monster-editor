@@ -206,6 +206,18 @@ def parse_pac_p3rd(data: bytes, geo_blob: "Optional[bytes]" = None,
     return _parse_pac_p3rd_from_pac(pac, geo_blob=geo_blob, anim_blob=anim_blob)
 
 
+def load_pac_bytes(data: bytes, geo_blob: bytes = None) -> MonsterModel:
+    """`load_pac` for a PAC already in memory — no MHP3rd companion auto-probe.
+
+    For callers (verify_port, the injector) that hold the bytes and have no path to
+    probe a sibling file from; pass `geo_blob` explicitly if the geometry is external.
+    """
+    pac = MonsterPac.from_bytes(data)
+    if _detect_game(pac) != "p3rd":
+        return _parse_pac_mhfu_from_pac(pac)
+    return _parse_pac_p3rd_from_pac(pac, geo_blob=geo_blob)
+
+
 def load_pac(path: str) -> MonsterModel:
     """Load a monster PAC from `path` (MHFU or MHP3rd auto-detected).
 

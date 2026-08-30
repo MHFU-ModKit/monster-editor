@@ -148,6 +148,67 @@ def check(pac, model_pac=None, geo=None):
                 detail.append("stream %d carries %s bones, partition says %d"
                               % (k, got, want[k]))
         ck(agree, "anim bone counts match the skeleton partition", "; ".join(detail))
+
+        # 🔴 THE FK INVARIANT (docs/agent_memory_map.md "Bone-count rule"):
+        #     skeleton bone_count - 1  ==  anim partition total  ==  entity+0x1A4
+        # Every check above is INTERNAL consistency — the partition against itself,
+        # the skin against the source — so a build whose partition simply does not
+        # SPAN the rig passes all of them. The shipped Zinogre did: it walked 51
+        # joints with a 46-bone partition, leaving joints 46-50 (4% of the mesh,
+        # the neck/jaw chain) with no bone section at all. Nothing here noticed.
+        # ⚠️ The native Tigrex "violates" this by 3 and renders fine, so a shortfall
+        # is a WARNING about unmanaged joints, not a proven crash — but it should
+        # never be silent, and a shortfall that carries real geometry is a defect.
+        part_total = sum(max(len(bl.bones) for bl in st.clips.values())
+                         for _i, st in occupied)
+        fk_walk = bone_count - 1
+        # ⛔ RETRACTED 2026-08-29 AS A REQUIREMENT — it is a REPORT, never a gate.
+        # This was added believing the bone-count rule demanded partition == walk.
+        # It does not: the NATIVE Tigrex runs partition 45 against a walk of 48 and
+        # is perfectly fine, so trailing joints WITHOUT a bone section are the normal
+        # authored shape, not a defect. Worse, a Zinogre rebuilt to satisfy it
+        # (partition 51 == walk 51) HUNG the game on the quest-load screen, while the
+        # 46 build spawns and fights. Equality appears to be the one value the joint
+        # builder cannot take. Report the shortfall and how much mesh rides it; do
+        # NOT fail on it, and do not "fix" a build by growing the partition.
+        ck(True, "anim partition vs FK walk (report only)",
+           "partition %d vs FK walk %d (skeleton bone_count %d - 1)%s"
+           % (part_total, fk_walk, bone_count,
+              "" if part_total == fk_walk
+              else " -> joints %d..%d get NO bone section"
+                   % (part_total, fk_walk - 1)))
+
+        # --- THE FORK RULE, measured ------------------------------------------
+        # 🔴 A LOCATION channel translates its joint's whole SUBTREE, so every joint
+        # carrying one must sit at or ABOVE the body fork (the first joint with more
+        # than one child, where the rig splits front from rear). Land one below it and
+        # it lifts half the animal; the waist geometry is left to span the gap.
+        # ⚠️ Do NOT gate on the structure — the NATIVE Tigrex puts a loc channel on a
+        # TAIL joint (43, displacing it up to 1873 u) and is fine, so "loc below the
+        # fork" alone false-fails the control. Gate on the CONSEQUENCE instead: how
+        # far geometry is actually stretched ACROSS the fork. Swept over every clip:
+        #     native Tigrex        0 u
+        #     Zinogre offset 1   208 u   <- the visible "L-shaped back"
+        #     Zinogre offset 0    52 u
+        # Raw magnitude will not do it either: native peaks at 239 u overall, HIGHER
+        # than the broken Zinogre's 208 — but native's is an elbow and the Zinogre's
+        # was the waist, every single clip.
+        from mhfu_model import convert as _C
+        from mhfu_model import stretch as _ST
+        from mhfu_model.p3rd_anim_map import body_fork, loc_below_fork
+        loc_joints = set()
+        flat = IG.to_flat_anim(anim)
+        for _a in flat.animations:
+            for _j, _tr in enumerate(_a.tracks):
+                for _ch in _tr.channels:
+                    if _C.channel_kind(_ch.type)[0] == "loc" and _ch.keyframes:
+                        loc_joints.add(_j)
+        below = loc_below_fork(par, loc_joints) if loc_joints else []
+        ck(True, "location channels vs the body fork (report only)",
+           "fork = joint %d; loc on %s%s"
+           % (body_fork(par), sorted(loc_joints),
+              "" if not below else "; %s are BELOW it -> see the tear check" % below))
+
     else:
         ck(False, "anim sub parses", "no parsable in-game anim sub")
 
@@ -171,6 +232,18 @@ def check(pac, model_pac=None, geo=None):
     else:
         ck(True, "little geometry on a NON-ANIMATED joint")
 
+    # --- does the clip TEAR the mesh across the body fork? ----------------------
+    # The one check here that measures the shipped animation against the shipped
+    # geometry instead of checking a table against a table. See the fork note above.
+    if anim is not None:
+        import mhfu_model as _MM
+        _mm = _MM.load_pac_bytes(pac)
+        tear, where = _ST.cross_fork_tear(_mm.model, _mm.skeleton,
+                                          _MM.anim_ingame.to_flat_anim(anim).animations)
+        ck(tear < 120.0, "clips do not tear the mesh across the body fork",
+           "worst %.0fu%s" % (tear, "" if where is None else
+                              " (slot %d frame %d, joints %d<->%d)" % where))
+
     # --- against the source ------------------------------------------------------
     if model_pac is not None:
         ssk_blob = _sub(model_pac, b"\x00\x00\x00\x80")
@@ -193,19 +266,30 @@ def check(pac, model_pac=None, geo=None):
             return out
         sdesc, odesc = _desc(spar), _desc(par)
 
-        def key(p, d):
-            return (round(p[0], 2), round(p[1], 2), round(p[2], 2), d)
+        # ⚠️ Keyed on BIND POSITION ONLY. It used to include the descendant count,
+        # which made it fire on any deliberate topology change: adopting the
+        # Zinogre's orphan root chain (bones 46-50) under bone 1 adds 5 descendants
+        # to bones 0 and 1, and the check then reported bones 0/1 "missing" while
+        # all 51 were present and every bind position was unchanged. A survival
+        # check must test SURVIVAL, or the next session "fixes" the port to satisfy
+        # it. Descendant drift is reported below instead of failing.
+        def key(p):
+            return (round(p[0], 2), round(p[1], 2), round(p[2], 2))
         out_pos = {}
         for i, p in enumerate(bw):
-            out_pos.setdefault(key(p, odesc[i]), []).append(i)
-        missing = [i for i, p in enumerate(sbw) if key(p, sdesc[i]) not in out_pos]
-        ck(not missing, "every SOURCE bone survives in the output rig",
+            out_pos.setdefault(key(p), []).append(i)
+        missing = [i for i, p in enumerate(sbw) if key(p) not in out_pos]
+        _reparented = sum(1 for i, p in enumerate(sbw)
+                          if key(p) in out_pos and i < len(sdesc)
+                          and sdesc[i] not in [odesc[j] for j in out_pos[key(p)]])
+        ck(not missing, "every SOURCE bone survives in the output rig"
+           + (" (%d re-parented)" % _reparented if _reparented else ""),
            "%d missing, e.g. %s" % (len(missing), missing[:8]))
 
         perm = {}
         used = set()
         for i, p in enumerate(sbw):
-            for c in out_pos.get(key(p, sdesc[i]), ()):
+            for c in out_pos.get(key(p), ()):
                 if c not in used:
                     perm[i] = c
                     used.add(c)

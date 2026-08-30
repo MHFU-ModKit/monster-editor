@@ -244,7 +244,7 @@ def reorder_bones(parents, order):
 
 
 def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0,
-                 order=None) -> bytes:
+                 order=None, src_animated: int = None, reparent=None) -> bytes:
     """Convert a MHP3rd (0x80000000) skeleton to a native MHFU 0xC0000000 skeleton.
 
     The MHP3rd skeleton uses **0x5C** bone sections; the MHFU engine's joint builder
@@ -273,7 +273,11 @@ def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0,
     nsrc = len(src)
     n = nsrc + lead_pad
     src_bone_count = struct.unpack_from("<I", p3rd_blob, 4)[0]
-    src_animated = struct.unpack_from("<I", p3rd_blob, 0x1C)[0]
+    # ⚠️ +0x1C is NOT an animated-bone count (it reads 0x40000001 on most MHP3rd
+    # rigs, and a plausible-but-wrong 46 on the Zinogre). Default to EVERY bone so
+    # the partition spans the whole FK walk; the caller overrides via src_animated.
+    if src_animated is None:
+        src_animated = nsrc
     animated = (src_animated if 0 < src_animated <= nsrc else nsrc) + lead_pad
     sp = split or _default_split(animated)
     if sum(sp) != animated:
@@ -302,6 +306,8 @@ def p3rd_to_mhfu(p3rd_blob: bytes, split=None, lead_pad: int = 0,
     parents = [(j - 1 if j > 0 else -1) for j in range(lead_pad)]
     for old_i in perm:
         p = src[old_i].parent
+        if reparent and old_i in reparent:
+            p = reparent[old_i]           # orphan root adopted; see port_p3rd
         parents.append(sh(p) if p is not None and p >= 0
                        else (lead_pad - 1 if lead_pad else -1))
     # child/sibling are fully derivable from the parent array and MUST be rebuilt

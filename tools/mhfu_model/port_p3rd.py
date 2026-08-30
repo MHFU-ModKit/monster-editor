@@ -29,6 +29,7 @@ from . import anim as _flatanim
 from . import anim_ingame as _ig
 from . import bone_match as _bm
 from . import skeleton_p3rd as _skp
+from . import p3rd_anim_map as _p3am
 from . import skeleton as _sk
 
 
@@ -86,6 +87,19 @@ def _source_bone_remap(source_skeleton: bool, lead_pad: int, bone_map,
 
 
 # --------------------------------------------------------------------------- #
+
+def _p3am_records(anim_blob):
+    """Bone records per clip in an MHP3rd moveset (0 if unknown). All streams agree."""
+    if not anim_blob:
+        return 0
+    try:
+        pk = _flatanim.parse_p3rd(anim_blob, stream=0)
+        counts = {len(a.tracks) for a in pk.animations}
+        return counts.pop() if len(counts) == 1 else 0
+    except Exception:
+        return 0
+
+
 def port_monster(model_pac: bytes, frame_pac: bytes,
                  geo_companion: Optional[bytes] = None,
                  anim_blob: Optional[bytes] = None,
@@ -93,7 +107,14 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
                  host_count: int = 45, split=None,
                  keep_anim_size: bool = False, ground_lift: float = 0.0,
                  weld: bool = True, weld_min_bonedist: float = 150.0,
-                 skin: str = "auto", source_skeleton: bool = False):
+                 skin: str = "auto", source_skeleton: bool = False,
+                 src_animated: Optional[int] = None,
+                 em_id: Optional[int] = None,
+                 anim_bone_offset: Optional[int] = None,
+                 anim_skip: Optional[list] = None,
+                 reparent_orphans: bool = True,
+                 reweight_undriven: bool = False,
+                 drop_joints=None):
     """Port an MHP3rd big monster onto an MHFU host frame. Returns (pac_bytes, info).
 
     Parameters
@@ -161,6 +182,27 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         _local = [tuple(b.bind_pos) for b in ssk.bones]
         bw = bind_world_positions(parents, _local)
 
+        # ADOPT ORPHAN ROOT CHAINS. An MHP3rd rig can carry a SECOND root chain
+        # (bone with parent == -1 that is not bone 0). The Zinogre's is bones 46-50:
+        # the **severed tail**, the carvable object dropped when the tail is cut. It is
+        # authored on its own root because once severed it lies in world space.
+        # ⚠️ The native MHFU Tigrex has the same thing (bones 45-47) and leaves it
+        # UNPARENTED, so adoption is a deviation from native, not a fix. It exists only
+        # because an MHP3rd rig's origin is at the hip (~435 units up) rather than the
+        # ground, so an unadopted chain floats at flank height instead of lying under
+        # the monster. Neither placement is right until the severed-tail datum is
+        # worked out; adoption at least keeps it moving with the body.
+        reparent = {}
+        if reparent_orphans:
+            host = 1 if len(parents) > 1 else 0
+            for i, pp in enumerate(parents):
+                if i != 0 and (pp is None or pp < 0):
+                    reparent[i] = host
+            if reparent:
+                parents = [host if (i != 0 and (pp is None or pp < 0)) else pp
+                           for i, pp in enumerate(parents)]
+                info["adopted_orphan_roots"] = sorted(reparent)
+
         # The native big-mon OVERLAY hardcodes the hip/ground joint index (Tigrex = the
         # tail of a 3-bone leading-origin chain = joint 2). A source skeleton with a
         # SHORTER leading-origin chain lands its hip at a lower joint -> the overlay's
@@ -185,9 +227,40 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         # at bones 18..23, mid-order). Derive the real subtrees and REORDER the rig
         # so the partition is contiguous; the same permutation then drives the skin
         # and the anim, so nothing else has to know.
-        src_animated = struct.unpack_from("<I", src_skel_blob, 0x1C)[0]
+        # 🔴 +0x1C IS NOT AN ANIMATED-BONE COUNT. On most MHP3rd rigs it reads
+        # 0x40000001 (a section magic) and the range test below rejects it; on the
+        # Zinogre it happens to read 46, which IS in range, so it was trusted — and
+        # 46 is wrong. The moveset drives 37 bones, and the rig has 51.
+        #
+        # The constraint that actually matters is the FK invariant (agent_memory_map
+        # "Bone-count rule"):
+        #
+        #     skeleton bone_count - 1 == anim 3-stream partition total == entity+0x1A4
+        #
+        # A partition SHORTER than the walk leaves the trailing joints with no bone
+        # section, and a joint with no section keeps a ZEROED matrix — every vertex
+        # riding it collapses to the origin and the mesh stretches to meet it. The
+        # Zinogre shipped with partition 46 against a walk of 51 and 4% of his mesh
+        # (the neck/jaw chain, bones 47-50) smeared to the world origin.
+        #
+        # So the partition must span EVERY bone. Bones the moveset does not drive are
+        # not a problem in themselves: from_flat_anim gives them rest_bone(), which
+        # poses them at bind RELATIVE TO THEIR PARENT, so they are carried along by
+        # the body instead of collapsing. Pass ``src_animated`` only to override.
+        if src_animated is None:
+            # Span exactly the DRIVEN range. Not every bone: partition == FK walk
+            # hangs the joint builder (agent_memory_map "Bone-count rule"). Not the
+            # +0x1C word either: it is not an animated count.
+            _n = _p3am_records(anim_blob)
+            if _n:
+                _b2r = _p3am.for_monster(em_id if em_id is not None else -1, _n,
+                                         len(ssk.bones), offset=anim_bone_offset,
+                                         skip=anim_skip)
+                src_animated = (max(_b2r) + 1) if _b2r else len(ssk.bones)
+            else:
+                src_animated = len(ssk.bones)
         if not (0 < src_animated <= len(ssk.bones)):
-            src_animated = len(ssk.bones)     # 0x1C-header skeleton: no count word
+            src_animated = len(ssk.bones)
         split, order = _sk.derive_stream_partition(parents, bw, src_animated)
         split = [split[0] + lead_pad] + list(split[1:])
         bone_order = order
@@ -202,9 +275,35 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
             parents = [(-1 if j == 0 else j - 1) for j in range(lead_pad)] + \
                       [(p + lead_pad if p >= 0 else lead_pad - 1) for p in parents]
             bw = [(0.0, 0.0, 0.0)] * lead_pad + list(bw)
-        # anim: source track i drives joint newpos[i]; placeholders stay at rest
-        bone_map = ({newpos[i]: i for i in range(len(ssk.bones))}
-                    if (lead_pad or info["bone_reorder"]) else None)
+        # 🔴 MHP3rd ANIM RECORDS ARE NOT POSITIONAL. This used to be
+        #     bone_map = {newpos[i]: i}
+        # i.e. "source bone i is driven by track i", which is what the Blender
+        # importer for these files explicitly is NOT: it walks the skeleton from a
+        # per-monster `bone_offset`, stepping over a per-monster skip list
+        # (`p3rd_anim_map`). On the Zinogre the positional read put 37 records on
+        # bones 0..36, leaving the TAIL and part of the jaw with no data at all —
+        # they froze at bind while the body moved, and the skin between them
+        # stretched. The same 37 records, mapped correctly, cover bones 1..46
+        # INCLUDING the tail. → docs/ANIMATION_FORMAT.md, p3rd_anim_map.
+        n_rec = _p3am_records(anim_blob)
+        b2r = None
+        if n_rec:
+            b2r = _p3am.for_monster(em_id if em_id is not None else -1, n_rec,
+                                    len(ssk.bones), offset=anim_bone_offset,
+                                    skip=anim_skip)
+            info["anim_bone_offset"] = (anim_bone_offset
+                                        if anim_bone_offset is not None
+                                        else _p3am.BONE_OFFSET.get(em_id,
+                                                                   _p3am.DEFAULT_BONE_OFFSET))
+            info["anim_driven_bones"] = len(b2r)
+            info["anim_max_driven_bone"] = max(b2r) if b2r else None
+        _src_bw_for_reweight = list(bw)          # SOURCE indices; bw is permuted below
+        _r2b_for_lift = ({r: b for b, r in b2r.items()} if b2r else None)
+        _src_parents_for_lift = [x.parent for x in ssk.bones]
+        # source bone -> RECORD (not track index); unmapped bones stay at rest.
+        bone_map = ({newpos[i]: (b2r.get(i) if b2r is not None else i)
+                     for i in range(len(ssk.bones))}
+                    if (b2r is not None or lead_pad or info["bone_reorder"]) else None)
         dead = set()
         info["mode"] = "source_skeleton"
         info["src_bones"] = len(ssk.bones)
@@ -234,11 +333,101 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
             dead = {d for d in range(host_count) if bone_map.get(d) is None}
         info["dead_joints"] = sorted(dead)
 
+    # --- drop auxiliary geometry (opt-in, and usually WRONG) ---
+    # ⚠️ The orphan-root chain on an MHP3rd rig — the Zinogre's bones 46-50, 165 verts —
+    # is the **SEVERED TAIL**: the carvable object the game drops when the tail is cut.
+    # Both the Zinogre and the native MHFU Tigrex (its own is bones 45-47, 150 verts)
+    # have a cuttable tail and both carry one. It is authored on its own root because
+    # once severed it lies in world space, not on the animal. That is why it is not
+    # animated, why nothing else is parented to it, and why hiding it leaves no hole.
+    # 🔴 So do NOT drop it by default — dropping it removes a real gameplay object.
+    # This flag stays for the case where a port genuinely carries geometry the target
+    # engine cannot place. Check first with blender_mhfu/render_port_views.py
+    # (MHFU_VIEW_ONLY=1 to see it, =2 to see the model without it).
+    if drop_joints:
+        _drop = set(drop_joints)
+        _kept, _lost = [], 0
+        for g in model.mesh_groups:
+            _tot = {}
+            for v in g.vertices:
+                for bb, w in (v.get("influences") or ()):
+                    if w > 1e-4 and bb >= 0:
+                        _tot[bb] = _tot.get(bb, 0.0) + w
+            _dom = max(_tot, key=_tot.get) if _tot else -1
+            if _dom in _drop:
+                _lost += len(g.vertices)
+            else:
+                _kept.append(g)
+        info["dropped_joints"] = sorted(_drop)
+        info["dropped_groups"] = len(model.mesh_groups) - len(_kept)
+        info["dropped_verts"] = _lost
+        model.mesh_groups = _kept
+
     # --- skin geometry onto the output skeleton ---
     # AUTHENTIC-SKIN path: when the source carries its OWN per-vertex blend weights
     # (v102 bone palette, parsed by pmo_p3rd) and we ship the source rig, prefer them
     # over any guess/transfer. Auto-upgrade the default in source-skeleton mode so a
     # plain `--source-skeleton` build ships the real skin.
+    # 🔴 SUPERSEDED — DO NOT ENABLE. Kept only so the experiment is reproducible.
+    # The premise was that the undriven geometry past the last record is BODY
+    # geometry ("bones 48/49/50 = the middle of his back") and needs folding onto a
+    # driven neighbour. That premise is false. Rendered in isolation those joints are
+    # a flat auxiliary PLATE on the rig's second root chain, and hiding them leaves
+    # no hole anywhere on the monster (blender_mhfu/render_port_views.py,
+    # MHFU_VIEW_ONLY). Re-weighting therefore tears one contiguous decoration across
+    # the head, spine, hip, tail and legs — in game, a large moving spike over a
+    # slab that does not move. Use `drop_joints` instead.
+    # ⚠️ It also silently mangles a REAL undriven body part if one ever exists, for
+    # the same reason: nearest-driven-bone is per vertex, so a patch does not stay
+    # together. Any future version must choose ONE target per source bone.
+    if reweight_undriven and source_skeleton and b2r:
+        import math as _m
+        _bw = locals().get("_src_bw_for_reweight") or []
+        _skipset = set(anim_skip if anim_skip is not None
+                       else _p3am.SKIPPED_BONES.get(em_id, []))
+        # Candidates are driven bones that actually OWN geometry. Structural bones
+        # (the origin chain) are nearest to any torso vertex by Euclidean distance
+        # while deforming nothing, so including them just re-creates the rigid patch
+        # one bone over — 58 of the Zinogre's 165 vertices went to the rig root
+        # before this filter.
+        _owns = {}
+        for g in model.mesh_groups:
+            for v in g.vertices:
+                for bb, w in (v.get("influences") or []):
+                    if w:
+                        _owns[bb] = _owns.get(bb, 0) + 1
+        undriven = {b for b in range(len(_bw)) if b not in b2r and b not in _skipset}
+        driven = [b for b in b2r
+                  if b < len(_bw) and _owns.get(b, 0) >= 8 and b not in undriven]
+        moved = 0
+        chose = {}
+        if driven and undriven:
+            # 🔴 PER VERTEX, not per bone. Picking the driven bone nearest the BONE
+            # sends the whole patch to whatever is closest to that bone's ORIGIN,
+            # which for a chain rooted at (0,0,0) is the rig root — so the lower-back
+            # geometry (centroid z -78) was being folded onto bone 1 and would have
+            # stayed just as rigid. Each vertex goes to the driven bone nearest to
+            # ITSELF, so the patch deforms with whatever is actually next to it.
+            for g in model.mesh_groups:
+                for v in g.vertices:
+                    infl = v.get("influences")
+                    if not infl or not any(bb in undriven for bb, _w in infl):
+                        continue
+                    vp = (v["x"], v["y"], v["z"])
+                    acc = {}
+                    for bb, w in infl:
+                        tb = bb
+                        if bb in undriven:
+                            tb = min(driven, key=lambda d: _m.dist(_bw[d], vp))
+                            chose[bb] = chose.get(bb, {})
+                            chose[bb][tb] = chose[bb].get(tb, 0) + 1
+                        acc[tb] = acc.get(tb, 0.0) + w
+                    v["influences"] = sorted(acc.items())
+                    moved += 1
+            info["reweighted_verts"] = moved
+            info["reweight_map"] = {b: sorted(c.items(), key=lambda t: -t[1])
+                                    for b, c in sorted(chose.items())}
+
     has_src_infl = any(v.get("influences") for g in model.mesh_groups for v in g.vertices)
     if source_skeleton and skin == "auto" and has_src_infl:
         skin = "source"
@@ -300,7 +489,9 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         info["tmh_bytes"] = len(tmh_bytes)
     if source_skeleton:
         conv = _sk.p3rd_to_mhfu(src_skel_blob, lead_pad=lead_pad,
-                                split=split, order=bone_order)   # own rig, stream-ordered
+                                split=split, order=bone_order,
+                                src_animated=src_animated,
+                                reparent=reparent)               # own rig, stream-ordered
         new = bytearray(_replace_sub(bytes(new), 0, conv))
         info["skeleton_bytes"] = len(conv)
 
@@ -323,7 +514,9 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
         # Baking it into the PELVIS locY channel (not a per-frame write) is what makes
         # it hold in every pose and while moving.
         if ground_lift:
-            _apply_ground_lift(flat, ground_lift)
+            _apply_ground_lift(flat, ground_lift,
+                               bone_of_record=locals().get("_r2b_for_lift"),
+                               parents=locals().get("_src_parents_for_lift"))
             info["ground_lift"] = ground_lift
         out, ainfo = _ig.swap_anim_to_realmotion(
             bytes(new), flat, anim_index=3, skel_index=0,
@@ -341,7 +534,7 @@ def port_monster(model_pac: bytes, frame_pac: bytes,
     return bytes(new), info
 
 
-def _apply_ground_lift(flat, lift_units):
+def _apply_ground_lift(flat, lift_units, bone_of_record=None, parents=None):
     """Add ``lift_units`` (world units) to the pelvis bone's locY across every clip.
 
     The pelvis = the bone whose locY channel carries the body height (the big ~300-unit
@@ -359,7 +552,24 @@ def _apply_ground_lift(flat, lift_units):
                     score[bi] += sum(abs(k.value) for k in c.keyframes) / len(c.keyframes)
     if not score:
         return
+    # 🔴 PICK BY TOPOLOGY, NOT BY MAGNITUDE. "Biggest locY" finds the bone that
+    # carries the body height — which is only the right lever if it is also an
+    # ANCESTOR OF THE WHOLE MONSTER. The Zinogre's rig branches at bone 1 into a
+    # front half (bone 2: spine/head/forelimbs) and a rear half (bone 25: hips/
+    # hind legs/tail). Its biggest-locY record maps to bone 2, so lifting it
+    # raised the front of the body and left the tail and hind legs on the floor —
+    # a monster doing a permanent handstand. Lift the ROOT-MOST bone that has a
+    # locY channel instead: its subtree is everything.
     pelvis = score.most_common(1)[0][0]
+    if bone_of_record and parents:
+        def depth(b):
+            d = 0
+            while 0 <= b < len(parents) and parents[b] >= 0 and d < 64:
+                b = parents[b]; d += 1
+            return d
+        cands = [r for r in score if r in bone_of_record]
+        if cands:
+            pelvis = min(cands, key=lambda r: (depth(bone_of_record[r]), r))
     for a in flat.animations:
         if pelvis < len(a.tracks):
             for c in a.tracks[pelvis].channels:

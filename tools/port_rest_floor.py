@@ -6,8 +6,9 @@ and draws the rig from there, so a build whose rest pose puts its lowest bone at
 Y != 0 is drawn that far off the floor. A cross-game port inherits the SOURCE
 game's datum instead, and nothing in the structural checks notices.
 
-The estimate is deliberately crude — lowest bone in bind pose, plus the pelvis
-locY at frame 0 of the idle clip — and it is trustworthy for exactly one reason:
+The estimate is deliberately crude — lowest bone in bind pose, plus every locY
+along its ancestor chain at frame 0 of the idle clip — and it is trustworthy for
+exactly one reason:
 run on the NATIVE it answers +2.6, i.e. on the floor. A method that lands the
 control within 3 units of zero is measuring the right thing.
 
@@ -28,22 +29,44 @@ LOCY = 0x080
 
 
 def rest_floor(path, idle_slot=1):
+    """Bind-pose floor of the LOWEST bone, with the idle clip's root motion applied.
+
+    🔴 SUM THE WHOLE ANCESTOR CHAIN. This used to take the single largest-magnitude
+    locY anywhere in the clip and call it "the pelvis lift". That is right only while
+    exactly one joint carries the lift. The moment `--ground-lift` lands on a
+    DIFFERENT joint from the source's own root motion — which is what happens once
+    the anim record->bone map is correct, because records 0 and 1 are two separate
+    location nodes — the two split (165.3 on joint 1 + 226.4 on joint 2) and reading
+    only the larger under-reports the lift by the whole of the other one. It reported
+    the Zinogre 162 units SUNK when the chain total was byte-identical to the build
+    that measured correct.
+    """
     mm = mhfu_model.load_pac(str(path))
     w = convert.bone_world_positions(mm.skeleton)
     low_bone = min(w.items(), key=lambda kv: kv[1][1])
-    a = ig.parse_ingame(MonsterPac.from_bytes(Path(path).read_bytes()).find("anim").data)
-    blk = next((st.clips[idle_slot] for st in a.streams if idle_slot in st.clips), None)
-    # the pelvis = the bone carrying the big locY; the root above it stays ~0
-    best = 0.0
-    for bn in (blk.bones if blk else []):
-        for ch in bn.channels:
-            if (ch.ctype & 0xFFF) == LOCY and ch.keyframes:
-                v = ch.keyframes[0].value / 16.0
-                if abs(v) > abs(best):
-                    best = v
+    parents = {b.index: b.parent for b in mm.skeleton.bones}
+    bind_y = {b.index: b.bind_pos[1] for b in mm.skeleton.bones}
+
+    flat = ig.to_flat_anim(ig.parse_ingame(
+        MonsterPac.from_bytes(Path(path).read_bytes()).find("anim").data))
+    clip = next((a for a in flat.animations if a.slot == idle_slot), None)
+    locy = {}
+    for j, tr in enumerate(clip.tracks if clip else []):
+        for ch in tr.channels:
+            if (ch.type & 0xFFF) == LOCY and ch.keyframes:
+                locy[j] = ch.keyframes[0].value / 16.0
+
+    # walk low bone -> root, replacing each joint's bind Y with its channel Y
+    lift, j, seen = 0.0, low_bone[0], set()
+    while j is not None and j >= 0 and j not in seen:
+        seen.add(j)
+        if j in locy:
+            lift += locy[j] - bind_y.get(j, 0.0)
+        j = parents.get(j, -1)
+
     return {"path": Path(path).name, "low_bone": low_bone[0],
-            "low_y": low_bone[1][1], "pelvis_lift": best,
-            "rest_floor": low_bone[1][1] + best}
+            "low_y": low_bone[1][1], "pelvis_lift": lift,
+            "rest_floor": low_bone[1][1] + lift}
 
 
 if __name__ == "__main__":
