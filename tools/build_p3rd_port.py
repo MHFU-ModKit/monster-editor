@@ -8,25 +8,42 @@ Example (Brute Tigrex -> Tigrex host):
         --anim  workspace/extracted_mhp3/data_files/file_05250.bin \
         --frame workspace/extracted/data_files/file_06185.bin \
         --out   tmp/brute_tigrex_v47_authentic.bin
+
+Or, with the flag soup in a manifest (`ports/*.toml`, mhfu_monster_editor.manifest) —
+the same build, byte for byte, and a file the app and the runtime read too:
+
+    python tools/build_p3rd_port.py --manifest ports/brute_tigrex.toml \\
+        --out tmp/brute_tigrex_em058.bin
+
+The manifest supplies a DEFAULT for every flag it knows; anything you also type on the
+command line still wins, so `--manifest ports/zinogre.toml --skin auto` is a one-off
+variant of a recorded build rather than a new flag soup.
 """
 import argparse
 import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _TOOLS)
+sys.path.insert(0, os.path.dirname(_TOOLS))          # repo root: mhfu_monster_editor
 from mhfu_model import p3rd_anim_map as _p3am
 from mhfu_model import port_p3rd as PORT
 
 
-def main():
+def _parser():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="MHP3rd model+skel+TMH PAC")
+    ap.add_argument("--manifest", help="ports/<name>.toml — supplies a default for "
+                                       "every flag below (mhfu_monster_editor)")
+    ap.add_argument("--data-root", default="workspace",
+                    help="extract root the manifest's file ids resolve against "
+                         "(<root>/extracted, <root>/extracted_mhp3)")
+    ap.add_argument("--model", help="MHP3rd model+skel+TMH PAC")
     ap.add_argument("--geo", help="MHP3rd GE-list companion (model+1)")
     ap.add_argument("--anim", help="MHP3rd raw moveset (model+2)")
     ap.add_argument("--frame", default="workspace/extracted/data_files/file_06185.bin",
                     help="MHFU host PAC (Tigrex)")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", help="output PAC. Falls back to tmp/<manifest port.pac>")
     ap.add_argument("--nb", type=int, default=3)
     ap.add_argument("--hops", type=int, default=1)
     ap.add_argument("--ground-lift", type=float, default=0.0,
@@ -71,7 +88,61 @@ def main():
     ap.add_argument("--source-skeleton", action="store_true",
                     help="ship the monster's OWN skeleton (no lossy down-rig to the host "
                          "rig) — for shapes that differ from the host; anim plays 1:1")
-    a = ap.parse_args()
+    return ap
+
+
+def _explicit_dests(argv):
+    """Which options the caller actually TYPED, as argparse dests.
+
+    A manifest may only fill in what was left out, and "left out" cannot be inferred
+    from the parsed value — `--ground-lift 0.0` and no flag at all both come back 0.0.
+    So parse a second time against a copy of the same parser whose every default is
+    None: anything not None was typed. This keeps one parser definition and does not
+    care about `--flag=value`, abbreviations or ordering.
+    """
+    probe = _parser()
+    for act in probe._actions:
+        act.default = None
+        act.required = False
+    ns, _ = probe.parse_known_args(argv)
+    return {k for k, v in vars(ns).items() if v is not None}
+
+
+def _apply_manifest(ap, a, argv):
+    """Fill every flag the caller did NOT type from the manifest. Explicit flags win."""
+    from mhfu_monster_editor import manifest as MF
+
+    man = MF.load(a.manifest)
+    typed = _explicit_dests(argv)
+    filled = []
+    for dest, value in man.build_args(a.data_root).items():
+        if dest in typed:
+            continue
+        setattr(a, dest, value)
+        filled.append(dest)
+    if a.out is None:
+        # `port.pac` is a BARE FILENAME, and a built port is Capcom data spliced from
+        # two games (docs/ASSETS.md category D). Dropping it in the CWD puts an
+        # unignored 750 KB PAC at the repo root, one `git add -A` from being committed.
+        # `tmp/` is the gitignored home ASSETS.md registers for it.
+        a.out = os.path.join("tmp", man.pac)
+        os.makedirs("tmp", exist_ok=True)
+    print("[port] manifest %s -> %s (host species %d, %s em%03d); manifest set %s"
+          % (a.manifest, man.name, man.host_species, man.source.game,
+             man.source.em_id if man.source.em_id is not None else -1,
+             ", ".join(sorted(filled)) or "nothing"))
+    return man
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = _parser()
+    a = ap.parse_args(argv)
+    if a.manifest:
+        _apply_manifest(ap, a, argv)
+    for req in ("model", "out"):
+        if getattr(a, req) is None:
+            ap.error("--%s is required (or give a --manifest that supplies it)" % req)
 
     model = open(a.model, "rb").read()
     frame = open(a.frame, "rb").read()

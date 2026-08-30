@@ -1,0 +1,102 @@
+# MHP3rd Brute Tigrex (em058) -> MHFU, riding the Tigrex host.
+#
+#   python tools/build_p3rd_port.py --manifest ports/brute_tigrex.toml \
+#       --out tmp/brute_tigrex_em058.bin
+#
+# ⚠️ This is the POST-2026-08-30 build, and it supersedes both shipped Brutes.
+# `brute_tigrex_v67_hostslots.bin` was built before `p3rd_anim_map` had a row for him,
+# so it took DEFAULT_BONE_OFFSET (2) — which puts both of his location records on the
+# FRONT branch of a rig that forks at bone 1, and tears his middle. `v63_clipfix` is
+# the same era. The em id now resolves from the model file number and the fork rule
+# pins the offset at 0. The Lua scripts under framework/prx/mods/lua_host/scripts/
+# still name the old files; retargeting them is a separate job.
+#
+# ⚠️ Comments here are NOT preserved if the editor writes this file back.
+
+schema = 1
+
+[port]
+name = "brute_tigrex"
+host_species = 75            # MON_TIGREX (0x4B)
+host_frame = 6185
+pac = "brute_tigrex_em058.bin"
+fid = 6186
+orig = "file_06185.bin.orig"
+replace = [77]               # MON_GIADROME (0x4D)
+
+[source]
+game = "mhp3rd"
+em_id = 58                   # resolved from file_05248 by p3rd_anim_map; bone offset 0
+model = 5248
+geo = 5249
+anim = 5250
+
+[build]
+# 🟢 DECISION 2026-08-30: a P3rd monster loads as a NEW monster, not a native one
+# re-skinned, so the Brute goes down the source-skeleton route like the Zinogre. The
+# hitbox desync that argued for retargeting is not retracted — it is the known open
+# cost, and an AI/timing job.
+source_skeleton = true
+skin = "source"
+# No ground lift: unlike the Zinogre nobody has run tools/port_rest_floor.py against
+# this build. Measure before setting it — a guessed datum is the whole sink bug.
+ground_lift = 0.0
+nb = 3
+hops = 1
+reweight_undriven = false
+
+# CLIPS — executor a1 == the packed slot index.
+#
+# 🔴 CLIP IDS ARE PER BUILD. docs/brute_tigrex_anim_ids.txt was labelled by filming an
+# EARLIER Brute, and on `v67_hostslots` a1 = label - 1 — confirmed for a1 = 51 and
+# nothing else. So `frames`/`loop` below are measured against THIS build and are
+# trustworthy; the `label` is inherited and is not.
+#
+# ⚠️ Two of brute_showcase.lua's three clip ids do not survive on this build, and the
+# validator is what says so:
+#     trapped    = 82  -> slot 82 is not populated at all (CLIP_SLOT_MISSING)
+#     break_free = 69  -> slot 69 holds a copy of the idle clip (CLIP_IS_FILLER):
+#                         forcing it plays IDLE, which on screen looks identical to
+#                         the override failing.
+# They are left out rather than carried forward. Re-derive them with
+# tools/anim_capture.sh <pac> <a1> and add them back.
+
+[clips.charge]
+slot = 61
+frames = 382
+loop = false
+label = "'crazy forward charge' per docs/brute_tigrex_anim_ids.txt (label 62 = a1 61 on v67_hostslots) — NOT re-derived on this build"
+
+# MOVES — the alignment. main/sub go to act_set (entity+0x298/+0x299) and own the
+# hitbox, the damage and the effects; `clip` only paints the animation channel.
+#
+# 🔴 THE PAIR COMES OUT OF tools/em_state_census.py, NOT out of the dispatcher table.
+# em_moveset.py --states lists 231 reachable pairs for the Tigrex and says nothing
+# about whether the engine ever GOES there. brute_showcase.lua's first loop ran on
+# (4,15) and (4,8) — main 4 is the damage-reaction bank — and 411 of 411 forced moves
+# survived exactly one tick. (2,8) is the longest-dwelling mover in ~1600 observed
+# transitions: dwell 23.7 ticks over n=46, 1127 units/tick. It is the charge.
+
+[moves.charge]
+main = 2
+sub = 8
+clip = "charge"
+latch = 1                    # executor dispatches the clip covers; one forced pair
+                             # runs a SEQUENCE of sub-actions and overriding all of
+                             # them restarts the clip from frame 0 each time
+min_gap = 2                  # ticks before the same move may be re-issued
+
+# HURTBOXES — none yet, deliberately.
+#
+# The volume table (bone + radius, 0x28 records) lives in the HOST overlay file_06108,
+# not in the model PAC, and it is BONE-INDEXED. The native Tigrex's four volumes
+# (bone 10 r150, 18 r150, 41 r170, 42 r170) are indices into the Tigrex rig; this port
+# ships its own 47-joint rig, so copying them across would attach the head sphere to
+# whatever joint happens to sit at index 10. Deriving the port's own volumes is open
+# work. Until then he inherits the host's, which is the current hitbox desync.
+
+# EFFECTS — none yet. There is no effect DATA to port: MHFU's overlays call
+# spawn_effect(entity, id, bone) with the id, the bone and the frame as literal
+# immediates, so a port fires MHFU's OWN library. The recipe shape is
+# `[[effect]] move = "charge", frame = 4, id = 42, bone = 33` — which ids look like
+# what is a live sweep nobody has run. See docs/EFFECTS_AND_VFX.md.

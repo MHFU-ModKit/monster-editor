@@ -1,0 +1,99 @@
+# MHP3rd Zinogre (em040) -> MHFU, riding the Tigrex host.
+#
+# The build this describes is `zinogre_v10.bin`, cold-boot-validated 2026-08-30 and
+# byte-identical to the command recorded in docs/agent_session_log.md. Rebuild with:
+#
+#   python tools/build_p3rd_port.py --manifest ports/zinogre.toml --out tmp/zinogre_v10.bin
+#
+# ⚠️ Comments here are NOT preserved if the editor writes this file back — tomllib
+# drops them on read. Anything that must survive belongs in a doc.
+
+schema = 1
+
+[port]
+name = "zinogre"
+host_species = 75            # MON_TIGREX (0x4B)
+host_frame = 6185            # extracted file_06185 == host_species + 6110
+pac = "zinogre_v10.bin"
+fid = 6186                   # the engine asks for species + 6111
+orig = "file_06185.bin.orig"
+replace = [77]               # MON_GIADROME (0x4D) — swapped at QUEST_TARGETS_BUILDING
+
+[source]
+game = "mhp3rd"
+em_id = 40                   # picks bone_offset 0 + the 10-bone skip list (p3rd_anim_map)
+model = 5339
+geo = 5340
+anim = 5341
+
+[build]
+# Ship his OWN rig: he has no host analogue, so a down-rig onto the Tigrex would lose
+# the shape. skin = "source" then pairs the v102 bone palette with that same rig 1:1.
+source_skeleton = true
+skin = "source"
+# A cross-game port inherits the SOURCE game's vertical datum. Measured with
+# tools/port_rest_floor.py: unlifted he reads -162.6 against MHFU's "feet at the
+# skeleton origin"; +165.3 puts him at +2.7, which is what the native control reads.
+ground_lift = 165.3
+# = the anim 3-stream partition total. His rig is 51 bones; 46 are body, and bones
+# 46-50 are the severed-tail carve object the moveset never drives.
+animated = 46
+nb = 3
+hops = 1
+reweight_undriven = false
+
+# CLIPS — his animation vocabulary, addressed by executor a1 == the packed slot index
+# (verified live, 34/34 clip runs over three cold boots; there is no offset on this port).
+#
+# ⚠️ NOBODY HAS LABELLED THIS MOVESET YET, so the names below are slot numbers and the
+# labels carry only what is measured. There is no way to read a clip's MEANING out of
+# the file — render the contact sheet (blender_mhfu/render_anim_clips.py +
+# tools/moveset_sheet.py) or film it (tools/anim_capture.sh <pac> <a1>), then rename
+# these and the moves that reference them.
+#
+# These six are the ones zinogre_clips.lua probes, chosen because each carries an
+# authored length no other slot in either pack shares — so a single `end` read at
+# ent+0x80+0x1C names the clip with no ambiguity. `frames`/`loop` are checked against
+# the built PAC by mhfu_monster_editor.validate.
+
+[clips.clip_02]
+slot = 2
+frames = 252
+loop = false
+label = "unlabelled; 253f, travels 0 units"
+
+[clips.clip_04]
+slot = 4
+frames = 264
+loop = true
+label = "unlabelled; 265f, travels 1202 units — a locomotion loop"
+
+[clips.clip_10]
+slot = 10
+frames = 408
+loop = true
+label = "unlabelled; 409f, travels 0 units. The longest clip in either pack, so `end = 408` is his fingerprint"
+
+[clips.clip_12]
+slot = 12
+frames = 380
+loop = true
+label = "unlabelled; 381f, travels 77 units"
+
+[clips.clip_18]
+slot = 18
+frames = 242
+loop = false
+label = "unlabelled; 243f, travels 0 units"
+
+[clips.clip_19]
+slot = 19
+frames = 344
+loop = false
+label = "unlabelled; 345f, travels 221 units net / 336 peak"
+
+# MOVES — deliberately empty. A move is an ALIGNMENT between a host behaviour pair and
+# one of the clips above, and aligning an unlabelled vocabulary is guessing. The pairs
+# themselves come from the HOST species' census (tools/em_state_census.py), so the
+# Brute's shortlist in ports/brute_tigrex.toml applies here unchanged once the clips
+# have names.
