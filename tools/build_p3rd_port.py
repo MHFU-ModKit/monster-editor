@@ -11,9 +11,11 @@ Example (Brute Tigrex -> Tigrex host):
 """
 import argparse
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mhfu_model import p3rd_anim_map as _p3am
 from mhfu_model import port_p3rd as PORT
 
 
@@ -46,10 +48,12 @@ def main():
                          "leaves the trailing joints with a zeroed matrix and their "
                          "mesh collapses to the origin.")
     ap.add_argument("--em-id", type=int, default=None,
-                    help="MHP3rd monster id (Zinogre = 40). Selects the animation "
-                         "bone-offset + skipped-bone list from p3rd_anim_map, which "
-                         "is REQUIRED for correct motion: P3rd anim records are not "
-                         "positional.")
+                    help="MHP3rd monster id (Zinogre = 40, Brute Tigrex = 58). Selects "
+                         "the animation bone-offset + skipped-bone list from "
+                         "p3rd_anim_map, which is REQUIRED for correct motion: P3rd "
+                         "anim records are not positional. DEFAULT: resolved from the "
+                         "--model file number. Pass a NEGATIVE value to opt out and "
+                         "build unmapped (reproduces pre-2026-08-30 output).")
     ap.add_argument("--anim-bone-offset", type=int, default=None,
                     help="override the anim bone offset (measure it with "
                          "p3rd_anim_map.score_offsets, do not guess)")
@@ -73,6 +77,37 @@ def main():
     frame = open(a.frame, "rb").read()
     geo = open(a.geo, "rb").read() if a.geo else None
     anim = open(a.anim, "rb").read() if a.anim else None
+
+    # 🔴 RESOLVE THE em ID FROM THE MODEL PAC BY DEFAULT. Without this the builder
+    # took DEFAULT_BONE_OFFSET (2) for any monster the caller did not name, while
+    # `render_anim_clips` looked the same monster up and used its MEASURED offset —
+    # so a port could BUILD at one bone map and RENDER at another with nothing said.
+    # That is how the Brute shipped at offset 2 (his fork is bone 1, so both his
+    # location records landed on the front branch and tore his middle) while looking
+    # acceptable, because `auto_skin` was smearing the bad map into something
+    # plausible. The measured map is the correct default; guessing is the exception.
+    # Escape hatch: pass a NEGATIVE --em-id to force the old unmapped behaviour, or
+    # --anim-bone-offset to set the number outright.
+    if a.em_id is None and a.model:
+        m = re.search(r"file_(\d+)", os.path.basename(a.model))
+        found = _p3am.em_for_model_pac(int(m.group(1))) if m else -1
+        if found >= 0:
+            a.em_id = found
+            print("[port] %s -> em%03d: bone offset %d, %d skipped bone(s) "
+                  "(p3rd_anim_map)"
+                  % (os.path.basename(a.model), found,
+                     _p3am.BONE_OFFSET.get(found, _p3am.DEFAULT_BONE_OFFSET),
+                     len(_p3am.SKIPPED_BONES.get(found, []))))
+        else:
+            print("⚠️  %s is not in p3rd_anim_map.EM_BY_MODEL_PAC — building at the "
+                  "DEFAULT bone offset %d, which is very probably WRONG. Read the "
+                  "species name from the `MWo3` header at offset 32 of the overlay "
+                  "two files below the model pac, pin the offset with the FORK RULE, "
+                  "and add a row. -> docs/ANIMATION_FORMAT.md"
+                  % (os.path.basename(a.model), _p3am.DEFAULT_BONE_OFFSET),
+                  file=sys.stderr)
+    if a.em_id is not None and a.em_id < 0:
+        a.em_id = None                      # explicit opt-out of the lookup
 
     pac, info = PORT.port_monster(model, frame, geo_companion=geo, anim_blob=anim,
                                   nb=a.nb, hops=a.hops, ground_lift=a.ground_lift,

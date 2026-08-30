@@ -35,6 +35,14 @@ sheet. It looks exactly like a rigging fault, and it is a mapping fault.
       offset 1 -> loc on bones 1, 2   ❌ bone 2 is the FRONT branch only
       offset 2 -> loc on bones 2, 3   ❌ worse
 
+    em058 (Brute Tigrex): fork = bone 1 (children 2, 29, 34, 39) — SAME answer, offset 0.
+      He is not in ``skipped_bones.md`` at all, so he took DEFAULT_BONE_OFFSET (2) for
+      months: two loc records on bones 2 and 3, his middle stretched and a wing swept
+      away. ⚠️ It was INVISIBLE while `render_anim_clips` re-skinned with `auto_skin` —
+      a blended guess smears a wrong bone map into something plausible. Switching to the
+      PMO's authentic palette is what made it show. A skinning guess does not just lose
+      fidelity; it HIDES mapping bugs.
+
 The native MHFU Tigrex obeys the same rule — its fork is bone 2 (children 3, 21, 26, 40)
 and its loc channels sit on bones 1 and 2. ⚠️ Comparing INDEX positions instead of TREE
 positions is what got this wrong for a day: "native carries loc on 1 and 2, so the port
@@ -79,10 +87,16 @@ SKIPPED_BONES: Dict[int, List[int]] = {
 # NOT constant — monsters occupy different numbers of files — so this is a lookup,
 # not a formula. Add a row when you port a new monster; an unknown id falls back to
 # DEFAULT_BONE_OFFSET with no skips, which is the addon's own default and is very
-# probably WRONG. Measure with score_offsets() before you trust it.
+# probably WRONG — pin it with the FORK RULE (module docstring). ⚠️ NOT with
+# score_offsets(): that cannot pick an offset at all, it only validates a skip list.
 EM_BY_MODEL_PAC: Dict[int, int] = {
-    5339: 40,      # Zinogre
+    5248: 58,      # Brute Tigrex — file_05246/47 are `em058m0.ovl`/`em058m1.ovl`
+    5339: 40,      # Zinogre      — file_05337/38 are `em040m0.ovl`/`em040m1.ovl`
 }
+# 🔴 READ THE ID OUT OF THE DATA, don't guess it. The two files immediately BEFORE a
+# monster's model pac are its AI overlays, and an `MWo3` header carries the name at
+# offset 32 — `em058m0.ovl` names the species outright. The Brute went unmapped for
+# months and silently took DEFAULT_BONE_OFFSET, which is wrong for him.
 
 
 def em_for_model_pac(pac_id: int) -> int:
@@ -95,6 +109,13 @@ BONE_OFFSET: Dict[int, int] = {
     40: 0,      # Zinogre — the FORK RULE (see module docstring). NOT 1: that lands a
     #             location record on bone 2, the front branch, and hoists the front half
     #             of the animal ~230 units above the rear.
+    58: 0,      # Brute Tigrex — the SAME rule, and it was reached the same way. His fork
+    #             is bone 1 (children 2, 29, 34, 39), so the addon's default of 2 put his
+    #             two location records on bones 2 and 3 — the FRONT branch — and tore his
+    #             middle. Corroborated twice, exactly as em040 was: 43 records over
+    #             offset 0 consume bones 0..42, i.e. every real body bone EXACTLY, and
+    #             what is left undriven is 43/44/45 — a second orphan ROOT chain that is
+    #             the severed-tail carve object, the same thing em040 leaves at 46..50.
 }
 DEFAULT_BONE_OFFSET = 2
 

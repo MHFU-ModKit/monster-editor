@@ -162,23 +162,38 @@ ALIGN = 4   # anim block offsets are 4-byte aligned (verified across all 49 PACs
 
 
 def _parse_anim_p3rd(blob: bytes, ao: int, slot: int) -> Animation:
-    """Parse one MHP3rd anim block (bones -> channels -> keyframes)."""
+    """Parse one MHP3rd anim block (bones -> channels -> keyframes).
+
+    🔴 EVERY COUNT HERE COMES OFF THE BLOB, so this must survive being pointed at
+    a file that is not an anim pack. `bone_count` is a u32 (up to 4e9) and a
+    `rec_size`/`csz` of 0 never advances the cursor — so garbage input span the
+    loop appending tracks until the KERNEL killed the process. That is not a
+    catchable exception: callers wrapping this in `except Exception` see no error,
+    they see their whole tool die with exit 137, which reads as a machine problem.
+    (Real case: `slot_catalog.py --source` handed a monster's MODEL pac instead of
+    its anim pac — `file_05339` instead of `file_05341`.) A record is at least its
+    own 4-byte header, so the blob's length bounds every count.
+    """
     bone_count, block_size, loop_flag = struct.unpack_from("<3I", blob, ao)
     o = ao + 0x10                            # past {bone_count,block_size,loop,pad}
     tracks: list[BoneTrack] = []
-    for _b in range(bone_count):
+    for _b in range(min(bone_count, max(0, len(blob) - o) // 4)):
         nch, rec_size = struct.unpack_from("<2H", blob, o)
         co = o + 4
         channels = []
         mask = 0
-        for _c in range(nch):
+        for _c in range(min(nch, max(0, len(blob) - co) // 8)):
             bit, nkf, csz = struct.unpack_from("<HHI", blob, co)
             kfs = [Keyframe(*struct.unpack_from("<4h", blob, co + 8 + k * 8))
                    for k in range(nkf)]
             channels.append(Channel(type=bit, keyframes=kfs))   # low bits = transform bit
             mask |= bit
+            if csz <= 0:
+                break                        # would not advance — garbage, not a clip
             co += csz
         tracks.append(BoneTrack(tag=mask, channels=channels))   # tag low bits = mask
+        if rec_size <= 0:
+            break
         o += rec_size
     end = ao + min(block_size, len(blob) - ao)
     return Animation(
