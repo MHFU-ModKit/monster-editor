@@ -347,6 +347,35 @@ class SkinBinding:
         out += self.positions * self.rest[:, None]
         return out
 
+    def apply_directions(self, deform: np.ndarray, dirs: np.ndarray) -> np.ndarray:
+        """``(v,3)`` NORMALS carried through the same blend, re-normalised.
+
+        The 3x3 part only: a direction has no origin, so the translation column must
+        not touch it — blending the full matrix and then transforming a point at the
+        normal's coordinates would drag every normal to wherever the joint moved.
+
+        Strictly this is the inverse-transpose that a non-uniform scale would need, and
+        the engine's own FK has **no scale channels at all** (a scale in a converted
+        clip is one of the two things that crash MHFU outright — `monster-porting`), so
+        every deform here is a rotation and a translation and the 3x3 IS its own
+        inverse-transpose. Should that ever stop being true, this is the line to fix.
+
+        Unskinned vertices keep their bind normal, exactly as :meth:`apply` keeps their
+        bind position.
+        """
+        d = np.ascontiguousarray(dirs, dtype=np.float64).reshape(-1, 3)
+        if len(d) != len(self.positions):
+            raise ValueError("%d vertices but %d directions"
+                             % (len(self.positions), len(d)))
+        if not len(d):
+            return d.copy()
+        blended = np.einsum("vk,vkij->vij", self.weights,
+                            deform[self.bones][:, :, :3, :3])
+        out = np.einsum("vij,vj->vi", blended, d)
+        out += d * self.rest[:, None]
+        n = np.linalg.norm(out, axis=1, keepdims=True)
+        return np.divide(out, n, out=np.zeros_like(out), where=n > 1e-12)
+
 
 # --------------------------------------------------------------------------- #
 # a posed instant

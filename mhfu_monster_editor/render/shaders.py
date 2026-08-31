@@ -101,6 +101,91 @@ void main() {
 """
 
 
+#: the skinned monster. Positions and normals arrive ALREADY DEFORMED — the skinning is
+#: `core.pose`'s, on the CPU, so the picture and a headless assertion come out of the
+#: same maths that `stretch.py` is the oracle for. Doing it again in GLSL would make a
+#: second oracle, which is the one thing this package must not grow.
+MESH_VS = """
+#version 330 core
+uniform mat4 u_mvp;
+in vec3 in_pos;
+in vec3 in_normal;
+in vec2 in_uv;
+in float in_group;      // vertex group index, for per-group colouring
+in float in_bone;       // dominant joint, for highlight / isolate
+out vec3 v_normal;
+out vec2 v_uv;
+out float v_group;
+out float v_bone;
+void main() {
+    gl_Position = u_mvp * vec4(in_pos, 1.0);
+    v_normal = in_normal;
+    v_uv = in_uv;
+    v_group = in_group;
+    v_bone = in_bone;
+}
+"""
+
+#: `u_mode`: 0 textured, 1 flat grey, 2 per-vertex-group colour.
+#: `u_isolate`: 0 draw everything, 1 only the tagged joints, 2 everything BUT them —
+#: `MHFU_VIEW_ONLY`'s two meanings, which answer "what IS that patch of geometry" and
+#: "what is left without it".
+MESH_FS = """
+#version 330 core
+uniform sampler2D u_tex;
+uniform sampler2D u_bone_tag;   // (n_bones x 1) R8: 1 = tagged
+uniform int   u_mode;
+uniform int   u_isolate;
+uniform int   u_n_bones;
+uniform int   u_has_tex;
+uniform vec3  u_light;
+uniform vec3  u_tint;
+uniform float u_alpha;
+in vec3 v_normal;
+in vec2 v_uv;
+in float v_group;
+in float v_bone;
+out vec4 f_color;
+
+// a stable, well-spread colour per integer — enough to tell 214 groups apart.
+vec3 hue(float i) {
+    float h = fract(i * 0.6180339887);
+    vec3 k = fract(vec3(h) + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0));
+    return 0.35 + 0.55 * abs(fract(k * 3.0) * 2.0 - 1.0);
+}
+
+float bone_tag(float bone) {
+    if (bone < 0.0 || u_n_bones <= 0) return 0.0;
+    // sample the texel CENTRE; (bone / n) lands on the boundary and can pick the
+    // neighbour under any filtering that is not exactly nearest.
+    return texture(u_bone_tag, vec2((bone + 0.5) / float(u_n_bones), 0.5)).r;
+}
+
+void main() {
+    float tag = bone_tag(v_bone);
+    if (u_isolate == 1 && tag < 0.5) discard;
+    if (u_isolate == 2 && tag >= 0.5) discard;
+
+    vec3 base;
+    if (u_mode == 2)            base = hue(v_group);
+    else if (u_mode == 1 || u_has_tex == 0) base = vec3(0.72, 0.72, 0.74);
+    else {
+        vec4 t = texture(u_tex, v_uv);
+        if (t.a < 0.35) discard;          // TMH alpha punches out fins and membranes
+        base = t.rgb;
+    }
+    base *= u_tint;
+    if (tag >= 0.5 && u_isolate == 0) base = mix(base, vec3(0.90, 0.13, 0.13), 0.65);
+
+    // two-sided lambert with a fill: a monster PAC's winding is not reliable, so a
+    // one-sided term leaves whole plates black.
+    vec3 n = normalize(v_normal);
+    float d = abs(dot(n, normalize(u_light)));
+    f_color = vec4(base * (0.35 + 0.65 * d), u_alpha);
+}
+"""
+
+
 def _cache(ctx) -> Dict[Tuple[str, ...], object]:
     store = getattr(ctx, "_mhfu_programs", None)
     if store is None:
@@ -133,3 +218,7 @@ def line_program(ctx):
 
 def ground_program(ctx):
     return program(ctx, GROUND_VS, GROUND_FS)
+
+
+def mesh_program(ctx):
+    return program(ctx, MESH_VS, MESH_FS)

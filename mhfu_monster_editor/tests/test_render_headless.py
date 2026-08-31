@@ -121,21 +121,29 @@ def test_viewport_draws_the_scene(ctx):
     from mhfu_monster_editor.render.viewport import Viewport, scene_bounds
 
     scene = open_scene(TIGREX)
-    b = scene_bounds(scene)
-    assert b.radius > 0, b
+    bind = scene_bounds(scene)
+    assert bind.radius > 0, bind
     with Viewport(ctx, (320, 240)) as vp:
         vp.set_scene(scene)
-        assert np.allclose(vp.camera.target, b.center), "the camera must frame the subject"
+        # 🔴 framed on the POSED extent, not the bind one. A bind pose is a splayed T
+        # whose centre is nowhere near the standing animal; framing on it puts the
+        # subject in a corner. `Viewport.bounds` reports the pose.
+        assert np.allclose(vp.camera.target, vp.bounds.center), \
+            "the camera must frame what is on screen"
+        assert not np.allclose(vp.bounds.center, bind.center), \
+            "this PAC's posed and bind centres coincide — the test proves nothing"
         vp.draw()
-        img = vp.read = vp.target.read()
+        img = vp.target.read()
 
         # the background is uniform; anything else on screen is the subject or the grid.
         bg = np.array([int(round(c * 255)) for c in vp.background[:3]])
         lit = int((np.abs(img[..., :3].astype(int) - bg).max(axis=2) > 12).sum())
         assert lit > 500, "only %d pixels differ from the background — nothing drew" % lit
 
-        # and with every layer off, nothing does. Proves the count above is OUR pixels.
+        # and with every layer off, nothing does. Proves the count above is OUR pixels
+        # and not, say, a mis-cleared background.
         vp.show_ground = vp.show_axes = vp.show_points = vp.show_bounds = False
+        vp.show_mesh = vp.show_skeleton = False
         vp.draw()
         empty = vp.target.read()
         blank = int((np.abs(empty[..., :3].astype(int) - bg).max(axis=2) > 12).sum())

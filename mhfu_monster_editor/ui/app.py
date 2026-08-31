@@ -26,6 +26,8 @@ from typing import Optional, Tuple
 
 from ..render.camera import VIEWS
 from ..render.context import ContextError, attached, describe
+from ..render.mesh import MODES
+from ..render.skeleton import undriven_geometry
 from ..render.viewport import Viewport
 
 #: where hello_imgui remembers window size, position and the docking layout.
@@ -53,8 +55,12 @@ class EditorApp:
     """
 
     def __init__(self, scene, *, size: Tuple[int, int] = (1440, 900),
-                 title: Optional[str] = None, view: str = "three") -> None:
+                 title: Optional[str] = None, view: str = "three",
+                 startup=None) -> None:
         self.scene = scene
+        #: the parsed CLI namespace, applied to the viewport on the first frame so the
+        #: window opens showing what the same flags would have rendered headless.
+        self.startup = startup
         self.size = size
         self.title = title or "mhfu_monster_editor — %s" % scene.name
         self.initial_view = view
@@ -63,6 +69,12 @@ class EditorApp:
         self.status = ""
         self._error: Optional[str] = None
         self._hovered = False
+        #: draw each joint's index over the viewport. Off by default — 48 numbers on
+        #: top of the animal is a lot, and it is the bone WORK that wants them.
+        self.show_joint_ids = False
+        #: joints that carry geometry no clip drives. → `render.skeleton`
+        self.orphans = {}
+        self._counts = None
 
     # ---- lifecycle ---------------------------------------------------- #
     def _ensure_gl(self) -> bool:
@@ -81,6 +93,10 @@ class EditorApp:
             self.viewport.set_scene(self.scene)
             self.viewport.camera.look(self.initial_view)
             self.status = describe(self.ctx)
+            self.orphans = undriven_geometry(self.scene)
+            if self.startup is not None:
+                from ..__main__ import apply_startup
+                apply_startup(self.viewport, self.startup)
         except ContextError as e:
             self._error = str(e)
             return False
@@ -128,6 +144,7 @@ class EditorApp:
         imgui.invisible_button("##viewport", size, _viewport_button_flags())
         self._hovered = imgui.is_item_hovered()
         self._camera_input(h, active=imgui.is_item_active())
+        self._joint_labels(imgui, pos, (w, h))
         _overlay_text(imgui, pos, self._hud())
 
     def _camera_input(self, view_h: int, *, active: bool) -> None:
@@ -192,13 +209,125 @@ class EditorApp:
                 cam.look(name)
         if imgui.button("frame", imgui.ImVec2(72, 0)):
             cam.frame(vp.bounds)
+
         imgui.separator()
+        imgui.text_disabled("shading")
+        changed, mode = imgui.combo("##mode", vp.mesh.mode, list(MODES))
+        if changed:
+            vp.mesh.mode = mode
+        _, vp.show_mesh = imgui.checkbox("mesh", vp.show_mesh)
+        imgui.same_line()
+        _, vp.wireframe = imgui.checkbox("wire", vp.wireframe)
+
+        imgui.separator()
+        imgui.text_disabled("skeleton")
+        _, vp.show_skeleton = imgui.checkbox("bones", vp.show_skeleton)
+        imgui.same_line()
+        _, vp.skeleton_xray = imgui.checkbox("x-ray", vp.skeleton_xray)
+        _, self.show_joint_ids = imgui.checkbox("indices", self.show_joint_ids)
+
+        imgui.separator()
+        imgui.text_disabled("reference")
         _, vp.show_ground = imgui.checkbox("ground", vp.show_ground)
+        imgui.same_line()
         _, vp.show_axes = imgui.checkbox("axes", vp.show_axes)
         _, vp.show_bounds = imgui.checkbox("bounds", vp.show_bounds)
-        _, vp.show_points = imgui.checkbox("points", vp.show_points)
-        _, vp.point_size = imgui.slider_float("size", vp.point_size, 1.0, 8.0)
+        imgui.same_line()
+        _, vp.show_points = imgui.checkbox("bind pts", vp.show_points)
         _, cam.fov = imgui.slider_float("fov", cam.fov, 15.0, 90.0)
+
+    def _joints_panel(self) -> None:
+        """The joint list: select, highlight, isolate. `MHFU_VIEW_HILITE`/`ONLY`."""
+        from imgui_bundle import imgui
+
+        vp = self.viewport
+        if vp is None or vp.skeleton is None:
+            imgui.text_disabled("no scene yet")
+            return
+        sk = vp.skeleton
+
+        imgui.text("fork %d" % sk.fork)
+        imgui.same_line()
+        imgui.text_disabled("lead %s" % (list(sk.lead) or "-"))
+        if self.orphans:
+            imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
+            imgui.text_wrapped(
+                "⚠ %d vertices hang on joints no clip drives (%s) — they stay at bind, "
+                "which is why they sit apart from the animal."
+                % (sum(self.orphans.values()),
+                   ", ".join(str(j) for j in sorted(self.orphans))))
+            imgui.pop_style_color()
+
+        changed, iso = imgui.combo("isolate", vp.mesh.isolate,
+                                   ["off", "only tagged", "hide tagged"])
+        if changed:
+            vp.mesh.isolate = iso
+        if imgui.button("clear tags"):
+            vp.tag_joints(())
+        imgui.same_line()
+        if imgui.button("tag lead+fork"):
+            vp.tag_joints(list(sk.lead))
+        imgui.separator()
+
+        tagged = set(vp.mesh.tagged)
+        counts = self._joint_vertex_counts()
+        if imgui.begin_child("##joints"):
+            for j in range(len(sk.positions)):
+                on = j in tagged
+                hit, on = imgui.checkbox("##t%d" % j, on)
+                if hit:
+                    vp.tag_joints((tagged | {j}) if on else (tagged - {j}))
+                imgui.same_line()
+                label = "%2d  %s%s" % (j, "· " * 0, _joint_note(sk, j, counts.get(j, 0)))
+                if imgui.selectable(label, sk.selected == j)[0]:
+                    vp.select_joint(None if sk.selected == j else j)
+            imgui.end_child()
+
+    def _joint_labels(self, imgui, pos, size) -> None:
+        """Joint indices drawn over the picture, and click-to-select on the joint.
+
+        The numbers are 2D text on imgui's draw list rather than 3D geometry: they
+        stay the same size at every zoom, they never need a font atlas in GL, and the
+        projection they use is the very matrix the frame was drawn with — so a label
+        cannot drift from its joint.
+        """
+        vp = self.viewport
+        sk = vp.skeleton
+        if sk is None:
+            return
+        mvp = vp.camera.mvp(vp.target.aspect)
+
+        if self._hovered and imgui.is_mouse_clicked(_DRAG_ORBIT) \
+                and not imgui.is_mouse_dragging(_DRAG_ORBIT):
+            m = imgui.get_io().mouse_pos
+            hit = sk.pick(mvp, size, m.x - pos.x, m.y - pos.y)
+            if hit is not None:
+                vp.select_joint(None if sk.selected == hit else hit)
+
+        if not self.show_joint_ids and sk.selected is None:
+            return
+        got = sk.project(mvp, size)
+        if got is None:
+            return
+        xy, ok = got
+        draw = imgui.get_window_draw_list()
+        plain = imgui.get_color_u32(imgui.ImVec4(0.80, 0.84, 0.92, 0.90))
+        hot = imgui.get_color_u32(imgui.ImVec4(0.98, 0.30, 0.32, 1.0))
+        for j in range(len(xy)):
+            if not ok[j]:
+                continue
+            if not self.show_joint_ids and j != sk.selected:
+                continue
+            draw.add_text(imgui.ImVec2(pos.x + xy[j][0] + 6, pos.y + xy[j][1] - 7),
+                          hot if j == sk.selected else plain, str(j))
+
+    def _joint_vertex_counts(self):
+        if self._counts is None:
+            import numpy as np
+            dom = self.scene.merged.dominant()
+            self._counts = {int(j): int(n) for j, n in
+                            zip(*np.unique(dom, return_counts=True)) if j >= 0}
+        return self._counts
 
     # ---- run ---------------------------------------------------------- #
     def runner_params(self):
@@ -272,7 +401,8 @@ def _docking(app: EditorApp):
     d.docking_splits = [split]
     d.dockable_windows = [viewport,
                           win("Scene", "Left", app._scene_panel),
-                          win("View", "Left", app._view_panel)]
+                          win("View", "Left", app._view_panel),
+                          win("Joints", "Left", app._joints_panel)]
     return d
 
 
@@ -292,6 +422,20 @@ def _framebuffer_scale() -> float:
     from imgui_bundle import imgui
     fb = imgui.get_io().display_framebuffer_scale
     return float(max(fb.x, 1.0))
+
+
+def _joint_note(sk, j: int, verts: int) -> str:
+    """The one-line role of a joint in the list: fork, lead chain, and its geometry."""
+    bits = []
+    if j == sk.fork:
+        bits.append("FORK")
+    elif j in sk.lead:
+        bits.append("lead")
+    if sk.driven is not None and j not in sk.driven:
+        bits.append("undriven")
+    if verts:
+        bits.append("%dv" % verts)
+    return " ".join(bits)
 
 
 def _overlay_text(imgui, pos, text: str) -> None:
