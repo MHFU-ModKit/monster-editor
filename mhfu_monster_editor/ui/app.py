@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 from ..render.camera import VIEWS
 from ..render.context import ContextError, attached, describe
 from ..render.mesh import MODES
+from ..render.playback import GAME_HZ, OBSERVED_SPEEDS, root_travel, wall_clock
 from ..render.skeleton import undriven_geometry
 from ..render.viewport import Viewport
 
@@ -75,6 +76,14 @@ class EditorApp:
         #: joints that carry geometry no clip drives. → `render.skeleton`
         self.orphans = {}
         self._counts = None
+        #: ``{frame: label}`` drawn on the timeline's marker strip. Issue #9 fills it
+        #: from the HOST action's expectations; empty until then, and the strip is
+        #: drawn either way so that is a data change, not a UI change.
+        self.markers = {}
+        self._clip_filter = ""
+        self._travel_cache = {}
+        #: the user's "Enable idling" setting, borrowed while a clip plays.
+        self._idle_pref = None
 
     # ---- lifecycle ---------------------------------------------------- #
     def _ensure_gl(self) -> bool:
@@ -102,6 +111,37 @@ class EditorApp:
             return False
         return True
 
+    # ---- power saving ------------------------------------------------- #
+    def _sync_idling(self) -> None:
+        """Hold hello_imgui's idle off while a clip is playing, and hand it back after.
+
+        🔴 hello_imgui idles the app to save power: `fps_idling.fps_idle` is **9**, and
+        it engages `time_active_after_last_event` = **3 seconds** after the last input
+        event. That is right for a static pose — a viewport nobody is touching should
+        not burn a core — and wrong for playback, which is animating precisely when
+        nobody is touching anything. The symptom is the frame rate collapsing a few
+        seconds into a loop and recovering the instant the mouse moves.
+
+        The clip still advances at the correct RATE while idling, because
+        :meth:`Playback.advance` works in real seconds — 9 fps just means ~3.3 game
+        frames are stepped per rendered frame, so the animation is *choppy*, not slow.
+
+        Idling is BORROWED, not overridden: the setting the user had (there is a
+        checkbox for it in the status bar) is captured on the first playing frame and
+        restored when playback stops, so toggling it while paused still sticks.
+        """
+        from imgui_bundle import hello_imgui
+
+        playing = self.viewport is not None and self.viewport.playback.playing
+        idling = hello_imgui.get_runner_params().fps_idling
+        if playing:
+            if self._idle_pref is None:
+                self._idle_pref = bool(idling.enable_idling)
+            idling.enable_idling = False
+        elif self._idle_pref is not None:
+            idling.enable_idling = self._idle_pref
+            self._idle_pref = None
+
     # ---- panels ------------------------------------------------------- #
     def _viewport_panel(self) -> None:
         from imgui_bundle import imgui
@@ -111,6 +151,11 @@ class EditorApp:
             return
         if not self._ensure_gl():
             return
+
+        # the transport is advanced HERE, once per frame, from imgui's own delta —
+        # not in the timeline panel, which is dockable and may be closed.
+        self._sync_idling()
+        self.viewport.tick(imgui.get_io().delta_time)
 
         avail = imgui.get_content_region_avail()
         w, h = int(max(avail.x, 1)), int(max(avail.y, 1))
@@ -283,6 +328,154 @@ class EditorApp:
                     vp.select_joint(None if sk.selected == j else j)
             imgui.end_child()
 
+    # ---- clips (issue #7) --------------------------------------------- #
+    def _clips_panel(self) -> None:
+        """Every clip in the PAC: slot, frames, loop, driven joints, root travel."""
+        from imgui_bundle import imgui
+
+        vp = self.viewport
+        if vp is None:
+            imgui.text_disabled("no GL context yet")
+            return
+        clips = self.scene.clips
+        if not clips:
+            imgui.text_disabled("this PAC has no animation sub-resource")
+            return
+
+        imgui.text("%d clips" % len(clips))
+        imgui.same_line()
+        imgui.text_disabled("%d looping" % sum(1 for c in clips if c.loop))
+        _, self._clip_filter = imgui.input_text("##filter", self._clip_filter)
+        imgui.same_line()
+        imgui.text_disabled("filter")
+
+        flags = (imgui.TableFlags_.borders_inner_h.value
+                 | imgui.TableFlags_.row_bg.value
+                 | imgui.TableFlags_.scroll_y.value
+                 | imgui.TableFlags_.sizing_stretch_prop.value)
+        if not imgui.begin_table("##clips", 5, flags):
+            return
+        for name, w in (("slot", 0.6), ("frames", 0.8), ("s", 0.6), ("loop", 0.5),
+                        ("travel", 0.9)):
+            imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
+        imgui.table_setup_scroll_freeze(0, 1)
+        imgui.table_headers_row()
+
+        needle = self._clip_filter.strip().lower()
+        current = vp.clip.slot if vp.clip is not None else None
+        for c in clips:
+            label = "%d %s" % (c.slot, " ".join(c.names))
+            if needle and needle not in label.lower():
+                continue
+            imgui.table_next_row()
+            imgui.table_next_column()
+            name = c.name if c.names else str(c.slot)
+            if imgui.selectable(
+                    "%s##c%d" % (name, c.slot), current == c.slot,
+                    imgui.SelectableFlags_.span_all_columns.value)[0]:
+                vp.play_clip(c)
+            imgui.table_next_column()
+            imgui.text(str(c.frames))
+            imgui.table_next_column()
+            imgui.text("%.1f" % wall_clock(c.frames, vp.playback.speed))
+            imgui.table_next_column()
+            imgui.text("loop" if c.loop else "")
+            imgui.table_next_column()
+            net, peak = self._travel(c)
+            imgui.text("%.0f" % net if net >= 1.0 else "·")
+            if not c.whole_rig and imgui.is_item_hovered():
+                imgui.set_tooltip("partial: present in only some joint-partition streams")
+        imgui.end_table()
+
+    def _travel(self, clip):
+        """`root_travel`, cached — it evaluates the clip, so not once per frame."""
+        got = self._travel_cache.get(clip.slot)
+        if got is None:
+            got = root_travel(self.scene, clip)
+            self._travel_cache[clip.slot] = got
+        return got
+
+    def _timeline_panel(self) -> None:
+        """Transport, scrubber and the rate — the engine's model, not a media player."""
+        from imgui_bundle import imgui
+
+        vp = self.viewport
+        if vp is None or vp.clip is None:
+            imgui.text_disabled("no clip — pick one in Clips")
+            return
+        pb = vp.playback
+
+        if imgui.button("|<"):
+            pb.rewind()
+            vp.set_pose(vp.clip, pb.phase)
+        imgui.same_line()
+        if imgui.button("<|"):
+            pb.step(-1)
+            vp.set_pose(vp.clip, pb.phase)
+        imgui.same_line()
+        if imgui.button("pause" if pb.playing else "play "):
+            pb.toggle()
+        imgui.same_line()
+        if imgui.button("|>"):
+            pb.step(1)
+            vp.set_pose(vp.clip, pb.phase)
+        imgui.same_line()
+        _, pb.loop = imgui.checkbox("loop", pb.loop)
+        imgui.same_line()
+        _, strip = imgui.checkbox("in place", vp.strip_root)
+        if strip != vp.strip_root:
+            vp.strip_root = strip
+            vp.set_pose(vp.clip, pb.phase)
+
+        moved, frame = imgui.slider_float("##scrub", pb.phase, 0.0, max(pb.end, 1.0),
+                                          "frame %.1f / " + str(int(pb.end)))
+        if moved:
+            pb.seek(frame)
+            vp.set_pose(vp.clip, pb.phase)
+
+        # 🔴 the rate is the ACTION's, not the clip's: 2.0 and 2.4 were both measured
+        # on one monster. The clip owns only the frame SPAN.
+        changed, speed = imgui.slider_float("speed", pb.speed, 0.25, 4.0, "%.2f f/frame")
+        if changed:
+            pb.speed = max(0.05, speed)
+        for s in OBSERVED_SPEEDS:
+            imgui.same_line()
+            if imgui.small_button("%.1f" % s):
+                pb.speed = s
+        imgui.text_disabled(
+            "%.2f s at %.2f  (end %d / speed / %g Hz) — the SPAN is the clip's, the "
+            "RATE comes from the action dispatch" % (pb.duration, pb.speed, pb.end,
+                                                     GAME_HZ))
+        net, peak = self._travel(self.scene.clip(vp.clip))
+        imgui.text_disabled("root travel  net %.0f  peak %.0f%s"
+                            % (net, peak, "" if net >= 1.0 else "   (in place)"))
+        self._marker_strip(imgui, pb)
+
+    def _marker_strip(self, imgui, pb) -> None:
+        """The frame-markers layer. Empty until issue #9 supplies the action's frames.
+
+        Drawn even when there is nothing to draw, so #9 is a data change rather than a
+        UI change: give :attr:`markers` a ``{frame: label}`` and they appear.
+        """
+        h = 18.0
+        w = max(imgui.get_content_region_avail().x, 1.0)
+        pos = imgui.get_cursor_screen_pos()
+        draw = imgui.get_window_draw_list()
+        bg = imgui.get_color_u32(imgui.ImVec4(0.18, 0.19, 0.22, 1.0))
+        draw.add_rect_filled(pos, imgui.ImVec2(pos.x + w, pos.y + h), bg, 3.0)
+        if pb.end > 0:
+            for frame, label in sorted(self.markers.items()):
+                x = pos.x + w * max(0.0, min(frame / pb.end, 1.0))
+                col = imgui.get_color_u32(imgui.ImVec4(0.98, 0.70, 0.20, 0.95))
+                draw.add_line(imgui.ImVec2(x, pos.y), imgui.ImVec2(x, pos.y + h), col, 2.0)
+            x = pos.x + w * pb.progress
+            head = imgui.get_color_u32(imgui.ImVec4(0.95, 0.25, 0.28, 1.0))
+            draw.add_line(imgui.ImVec2(x, pos.y), imgui.ImVec2(x, pos.y + h), head, 2.0)
+        imgui.dummy(imgui.ImVec2(w, h))
+        if not self.markers:
+            imgui.text_disabled("no frame markers — issue #9 fills these from the "
+                                "host action's expectations")
+
     def _joint_labels(self, imgui, pos, size) -> None:
         """Joint indices drawn over the picture, and click-to-select on the joint.
 
@@ -377,11 +570,18 @@ def _docking(app: EditorApp):
     """
     from imgui_bundle import hello_imgui, imgui
 
-    split = hello_imgui.DockingSplit()
-    split.initial_dock = "MainDockSpace"
-    split.new_dock = "Left"
-    split.direction = imgui.Dir.left
-    split.ratio = 0.22
+    def split(initial, new, direction, ratio):
+        sp = hello_imgui.DockingSplit()
+        sp.initial_dock = initial
+        sp.new_dock = new
+        sp.direction = direction
+        sp.ratio = ratio
+        return sp
+
+    # the viewport keeps the middle; inspectors left, clips right, timeline under.
+    splits = [split("MainDockSpace", "Left", imgui.Dir.left, 0.18),
+              split("MainDockSpace", "Right", imgui.Dir.right, 0.20),
+              split("MainDockSpace", "Bottom", imgui.Dir.down, 0.22)]
 
     def win(label, dock, fn, focus=False):
         w = hello_imgui.DockableWindow()
@@ -398,11 +598,13 @@ def _docking(app: EditorApp):
     viewport.imgui_window_flags = _no_scroll_flags()
 
     d = hello_imgui.DockingParams()
-    d.docking_splits = [split]
+    d.docking_splits = splits
     d.dockable_windows = [viewport,
+                          win("Timeline", "Bottom", app._timeline_panel, focus=True),
                           win("Scene", "Left", app._scene_panel),
                           win("View", "Left", app._view_panel),
-                          win("Joints", "Left", app._joints_panel)]
+                          win("Joints", "Left", app._joints_panel),
+                          win("Clips", "Right", app._clips_panel)]
     return d
 
 

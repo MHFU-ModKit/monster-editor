@@ -32,6 +32,7 @@ from .mesh import (ISOLATE_HIDE, ISOLATE_OFF, ISOLATE_ONLY, MODE_FLAT, MODE_TEXT
                    MODE_VGROUP, MODES, SkinnedMesh, default_pose)
 from .overlay import (Ground, Lines, axes_geometry, bounds_geometry,
                       point_cloud_geometry)
+from .playback import Playback, pose_at
 from .skeleton import SkeletonOverlay
 from .target import SAMPLES, Target
 
@@ -112,6 +113,12 @@ class Viewport:
         #: the clip and frame the mesh is currently deformed to. ``clip is None`` = bind.
         self.clip = None
         self.frame = 0.0
+        #: the engine's clip cursor — phase, speed, and the `phase + speed <= end`
+        #: gate. → :mod:`.playback`
+        self.playback = Playback()
+        #: replace the root joints' location with their bind translation, so a
+        #: locomotion clip plays IN PLACE instead of walking out of frame.
+        self.strip_root = False
 
         self._ground = Ground(ctx)
         self._axes = Lines(ctx)
@@ -143,7 +150,7 @@ class Viewport:
         self.skeleton.joint_size = max(4.0, min(9.0, self.bind_bounds.radius / 160.0))
         if posed:
             clip, frame = default_pose(scene)
-            self.set_pose(clip, frame)
+            self.play_clip(clip, frame)
         else:
             self.set_pose(None)
         if frame_camera:
@@ -163,13 +170,41 @@ class Viewport:
             pose = self.scene.bind_pose()
             driven = None
         else:
-            pose = self.scene.pose(clip, frame)
+            pose = pose_at(self.scene, clip, frame, strip_root=self.strip_root)
             driven = self.scene.clip(clip).driven
         if self.mesh is not None:
             self.mesh.set_pose(None if clip is None else pose)
         if self.skeleton is not None:
             self.skeleton.set_positions(pose.joints)
             self.skeleton.set_driven(driven)
+
+    def play_clip(self, clip, frame: Optional[float] = None) -> None:
+        """Bind a clip to the transport and pose to it. ``frame=None`` keeps the cursor."""
+        if self.scene is None:
+            return
+        if clip is None:
+            self.playback.set_clip(_NO_CLIP)
+            self.set_pose(None)
+            return
+        c = self.scene.clip(clip)
+        self.playback.set_clip(c)
+        self.playback.seek(c.frames * 0.5 if frame is None else frame)
+        self.set_pose(c, self.playback.phase)
+
+    def tick(self, dt: float) -> bool:
+        """Advance the transport by ``dt`` real seconds; re-pose if it moved.
+
+        Returns whether anything changed, so a caller can skip the CPU skinning on a
+        frame where the clip is paused — which is most of them while you read a pose.
+        """
+        if self.clip is None:
+            return False
+        before = self.playback.phase
+        self.playback.advance(dt)
+        if self.playback.phase == before:
+            return False
+        self.set_pose(self.clip, self.playback.phase)
+        return True
 
     # ---- highlighting ------------------------------------------------- #
     def tag_joints(self, joints) -> None:
@@ -304,3 +339,13 @@ def render_to_file(scene, path, *, size: Tuple[int, int] = (1280, 800),
             return vp.target.save(path)
     finally:
         ctx.release()
+
+
+class _NoClip:
+    """A null clip for `play_clip(None)` — span 0, so the transport parks at bind."""
+    frames = 0
+    loop = False
+    slot = -1
+
+
+_NO_CLIP = _NoClip()

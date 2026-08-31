@@ -170,8 +170,85 @@ def test_app_opens_and_draws():
                  100.0 * got["lit"] / (w * h), got["status"]))
 
 
+def test_playback_suppresses_the_idle_throttle():
+    """🔴 hello_imgui idles to 9 fps three seconds after the last input event.
+
+    Right for a static pose, wrong for playback — which animates precisely when
+    nobody is touching anything. The symptom is the frame rate collapsing a few
+    seconds into a loop and recovering the moment the mouse moves.
+
+    Measured rather than asserted on the flag alone: the app runs unattended for
+    longer than `time_active_after_last_event`, and the frame rate over the LAST
+    stretch has to stay well above `fps_idle`.
+    """
+    if not os.environ.get("MHFU_UI_SMOKE"):
+        print("SKIP: set MHFU_UI_SMOKE=1 (needs a display)")
+        return
+    if not TIGREX.exists():
+        print("SKIP: no game data")
+        return
+    import time
+
+    from imgui_bundle import hello_imgui
+
+    from mhfu_monster_editor.core import open_scene
+    from mhfu_monster_editor.ui import EditorApp
+
+    scene = open_scene(TIGREX)
+    app = EditorApp(scene, size=(700, 500))
+    idle_fps = hello_imgui.RunnerParams().fps_idling.fps_idle
+    hold = hello_imgui.RunnerParams().fps_idling.time_active_after_last_event
+    run_for = hold + 2.5
+    got = {"n": 0, "late": 0, "t0": None, "mark": None, "idling": None, "err": None}
+
+    real = app._viewport_panel
+
+    def wrapped():
+        try:
+            if got["n"] == 0:
+                real()
+                # start playing on the first frame, then never touch the input again.
+                app.viewport.playback.loop = True
+                app.viewport.playback.play()
+                got["t0"] = time.perf_counter()
+            else:
+                real()
+        except BaseException as e:                           # noqa: BLE001
+            import traceback
+            got["err"] = "%s: %s\n%s" % (type(e).__name__, e, traceback.format_exc())
+            hello_imgui.get_runner_params().app_shall_exit = True
+            return
+        got["n"] += 1
+        now = time.perf_counter()
+        if now - got["t0"] >= hold and got["mark"] is None:
+            got["mark"] = (now, got["n"])          # start counting AFTER the idle kicks in
+        if got["mark"] is not None:
+            got["late"] = got["n"] - got["mark"][1]
+        if now - got["t0"] >= run_for:
+            got["idling"] = bool(
+                hello_imgui.get_runner_params().fps_idling.enable_idling)
+            got["elapsed"] = now - got["mark"][0]
+            hello_imgui.get_runner_params().app_shall_exit = True
+
+    app._viewport_panel = wrapped
+    app.run()
+
+    assert got["err"] is None, got["err"]
+    assert got["mark"] is not None, "the app exited before the idle window elapsed"
+    fps = got["late"] / max(got["elapsed"], 1e-6)
+    assert got["idling"] is False, \
+        "idling was left ENABLED while the transport was playing"
+    assert fps > idle_fps * 2, (
+        "only %.1f fps over the %.1f s AFTER the %.0f s idle window — the throttle "
+        "engaged during playback (idle is %.0f fps)"
+        % (fps, got["elapsed"], hold, idle_fps))
+    print("idling            %.0f fps sustained %.1f s after the %.0f s idle window "
+          "(idle would be %.0f)" % (fps, got["elapsed"], hold, idle_fps))
+
+
 def main() -> int:
     test_app_opens_and_draws()
+    test_playback_suppresses_the_idle_throttle()
     print("\ntest_ui_smoke: OK")
     return 0
 

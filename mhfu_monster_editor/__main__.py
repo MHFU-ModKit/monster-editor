@@ -66,6 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--shading", default="textured", choices=list(MODES),
                    help="textured (default), flat, or a colour per vertex group")
     v.add_argument("--wireframe", action="store_true")
+    v.add_argument("--in-place", action="store_true", dest="in_place",
+                   help="strip the clip's travel so it plays in place (the leading-"
+                        "origin chain's location is held at its frame-0 value)")
     v.add_argument("--no-bones", action="store_true", help="hide the joint overlay")
     v.add_argument("--hilite", metavar="J,J,...",
                    help="paint these joints red — `MHFU_VIEW_HILITE`")
@@ -107,6 +110,7 @@ def apply_startup(vp, args) -> None:
     vp.show_ground = not args.no_grid
     vp.show_skeleton = not args.no_bones
     vp.wireframe = args.wireframe
+    vp.strip_root = args.in_place
     vp.mesh.mode = MODES.index(args.shading)
     if args.hilite:
         vp.tag_joints(int(x) for x in args.hilite.replace(" ", "").split(",") if x)
