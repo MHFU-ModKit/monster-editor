@@ -57,7 +57,7 @@ class EditorApp:
 
     def __init__(self, scene, *, size: Tuple[int, int] = (1440, 900),
                  title: Optional[str] = None, view: str = "three",
-                 startup=None) -> None:
+                 startup=None, ini_folder: Optional[str] = None) -> None:
         self.scene = scene
         #: the parsed CLI namespace, applied to the viewport on the first frame so the
         #: window opens showing what the same flags would have rendered headless.
@@ -65,6 +65,10 @@ class EditorApp:
         self.size = size
         self.title = title or "mhfu_monster_editor — %s" % scene.name
         self.initial_view = view
+        #: where the layout `.ini` lives. None = the per-user config folder. A TEST
+        #: passes a temp directory: a smoke run must not overwrite the window size and
+        #: docking layout somebody arranged by hand.
+        self.ini_folder = ini_folder
         self.ctx = None
         self.viewport: Optional[Viewport] = None
         self.status = ""
@@ -76,10 +80,21 @@ class EditorApp:
         #: joints that carry geometry no clip drives. → `render.skeleton`
         self.orphans = {}
         self._counts = None
-        #: ``{frame: label}`` drawn on the timeline's marker strip. Issue #9 fills it
-        #: from the HOST action's expectations; empty until then, and the strip is
-        #: drawn either way so that is a data change, not a UI change.
-        self.markers = {}
+        #: `align.Marker`s drawn on the timeline's marker strip — the HOST action's
+        #: expectations in the CLIP's frame space. Filled by `_recompute_alignment`.
+        self.markers = []
+        #: the current `align.Alignment`, or None. → #9
+        self.alignment = None
+        #: `species/emNN.json` per species, loaded on demand
+        self._intel_cache = {}
+        #: which overlay's action table the panel shows. None = the manifest's host.
+        self._browse = None
+        self._hosts = None
+        #: the `(main, sub)` under inspection — a declared move's, or one being tried
+        self._pair = None
+        self._move = None
+        self._pair_filter = ""
+        self._bind_buf = ""
         self._clip_filter = ""
         self._travel_cache = {}
         #: `clips.Coverage` + `LabelTrack`s + the build id, computed once. → #8
@@ -305,7 +320,7 @@ class EditorApp:
         if self.orphans:
             imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
             imgui.text_wrapped(
-                "⚠ %d vertices hang on joints no clip drives (%s) — they stay at bind, "
+                "! %d vertices hang on joints no clip drives (%s) — they stay at bind, "
                 "which is why they sit apart from the animal."
                 % (sum(self.orphans.values()),
                    ", ".join(str(j) for j in sorted(self.orphans))))
@@ -324,17 +339,19 @@ class EditorApp:
 
         tagged = set(vp.mesh.tagged)
         counts = self._joint_vertex_counts()
-        if imgui.begin_child("##joints"):
-            for j in range(len(sk.positions)):
-                on = j in tagged
-                hit, on = imgui.checkbox("##t%d" % j, on)
-                if hit:
-                    vp.tag_joints((tagged | {j}) if on else (tagged - {j}))
-                imgui.same_line()
-                label = "%2d  %s%s" % (j, "· " * 0, _joint_note(sk, j, counts.get(j, 0)))
-                if imgui.selectable(label, sk.selected == j)[0]:
-                    vp.select_joint(None if sk.selected == j else j)
-            imgui.end_child()
+        # ⚠️ ImGui 1.90+ requires EndChild for EVERY BeginChild, return value or not —
+        # skipping it on a collapsed or fully-clipped panel trips an assertion.
+        imgui.begin_child("##joints")
+        for j in range(len(sk.positions)):
+            on = j in tagged
+            hit, on = imgui.checkbox("##t%d" % j, on)
+            if hit:
+                vp.tag_joints((tagged | {j}) if on else (tagged - {j}))
+            imgui.same_line()
+            if imgui.selectable("%2d  %s" % (j, _joint_note(sk, j, counts.get(j, 0))),
+                                sk.selected == j)[0]:
+                vp.select_joint(None if sk.selected == j else j)
+        imgui.end_child()
 
     # ---- the clip vocabulary (issue #8) ------------------------------- #
     def vocabulary(self):
@@ -400,6 +417,337 @@ class EditorApp:
             return s.save()
         except Exception as e:                                   # noqa: BLE001
             return "%s: %s" % (type(e).__name__, e)
+
+    # ---- the action inspector (issue #9) ------------------------------ #
+    @property
+    def host_species(self):
+        m = self.scene.manifest
+        return None if m is None else m.host_species
+
+    @property
+    def browsing_species(self) -> int:
+        """The overlay whose action table the panel is showing — the host by default."""
+        if self._browse is None:
+            self._browse = self.host_species
+        return self._browse
+
+    def browse_species(self, species: int) -> None:
+        """Look at ANOTHER MHFU monster's action table.
+
+        🔴 Browsing, not re-hosting. `(main,sub)` is dispatched by the overlay the
+        ENGINE loaded for this monster, which is the one `port.host_species` selects —
+        and that same number also picks the host frame PAC the porter files clips into,
+        so changing it is a rebuild, not a view. The panel therefore refuses to BIND a
+        pair from an overlay that is not the host, and says why.
+        """
+        self._browse = int(species)
+        self.clear_pair()
+
+    @property
+    def intel(self):
+        """`species/emNN.json` for the overlay being browsed, or None if not built."""
+        species = self.browsing_species
+        if species is None:
+            return None
+        if species not in self._intel_cache:
+            from ..intel import find_intel
+            self._intel_cache[species] = find_intel(species)
+        return self._intel_cache[species]
+
+    @property
+    def browsing_the_host(self) -> bool:
+        return self.browsing_species == self.host_species
+
+    def host_options(self):
+        """Every overlay on this machine, summarised. Read once, then cached."""
+        if self._hosts is None:
+            from ..intel import survey_hosts
+            self._hosts = survey_hosts()
+        return self._hosts
+
+    def port_rig(self):
+        """What the alignment needs to know about the rig this port ships."""
+        from ..align import PortRig
+
+        driven = set()
+        for c in self.scene.clips:
+            driven |= set(c.driven)
+        return PortRig(n_bones=self.scene.rig.n_bones, driven=driven,
+                       vertices=self._joint_vertex_counts())
+
+    def select_pair(self, main: int, sub: int, move=None) -> None:
+        self._pair, self._move = (int(main), int(sub)), move
+        self._recompute_alignment()
+
+    def _recompute_alignment(self) -> None:
+        """Re-join the host pair with whatever clip is on screen. Cheap; call freely.
+
+        🔴 The clip's length comes from the SCENE, not from the manifest — the manifest
+        may be describing a slot a rebuild has since changed, and "the handler tests
+        frame 60" against a stale length is exactly the wrong answer.
+        """
+        from ..align import align_pair
+
+        m = self.scene.manifest
+        vp = self.viewport
+        if m is None or self._pair is None:
+            self.markers, self.alignment = [], None
+            return
+        clip = vp.clip if vp is not None else None
+        entry = None
+        if clip is not None and self.session is not None:
+            entry = self.session.entry(clip.slot)
+        self.alignment = align_pair(
+            m, self._pair[0], self._pair[1], self.intel, move=self._move,
+            clip=entry.name if entry else (clip.name if clip else None),
+            slot=clip.slot if clip else None,
+            clip_frames=clip.frames if clip else None,
+            impact=entry.impact_frame if entry else None,
+            allow_unentered=(m.moves[self._move].allow_unentered
+                             if self._move in m.moves else False),
+            rig=self.port_rig())
+        self.markers = self.alignment.markers
+
+    def set_impact_here(self) -> str:
+        """Record the current frame as this clip's impact. → `clips.<n>.impact_frame`"""
+        s, vp = self.session, self.viewport
+        if s is None:
+            return "impact frames live in the manifest — open a ports/*.toml"
+        if vp is None or vp.clip is None:
+            return "no clip is playing"
+        from ..manifest import ManifestError
+        slot = vp.clip.slot
+        entry = s.entry(slot)
+        frame = int(round(vp.playback.phase))
+        try:
+            msg = s.stage(slot, entry.name if entry else self._name_buf,
+                          entry.label if entry else self._label_buf,
+                          impact_frame=frame)
+        except ManifestError as e:
+            return str(e)
+        self.scene.attach_manifest(s.manifest)
+        self._vocab = None
+        self._recompute_alignment()
+        return "impact = frame %d.  %s" % (frame, msg)
+
+    def _action_panel(self) -> None:
+        """What the HOST action expects, against the clip on screen. → issue #9"""
+        from imgui_bundle import imgui
+
+        m = self.scene.manifest
+        if m is None:
+            imgui.text_wrapped("An action is a binding between a HOST behaviour pair "
+                               "and one of this port's clips, so it needs a manifest. "
+                               "Open a ports/*.toml.")
+            return
+        self._species_row(imgui, m)
+        if self.intel is None:
+            imgui.text_wrapped("no species/em%02d.json — build the action intel with:"
+                               % self.browsing_species)
+            imgui.text_disabled("  python tools/em_intel.py --all")
+            return
+
+        self._moves_row(imgui, m)
+        if self.alignment is not None:
+            _alignment_view(imgui, self.alignment, self)
+            self._bind_row(imgui)
+            imgui.separator()
+        self._pair_table(imgui)
+
+    def _species_row(self, imgui, m) -> None:
+        """Which overlay's actions you are looking at, and the 17 you could ride.
+
+        🔴 A ported monster has no AI of its own — MHP3rd ships a model, a skeleton and
+        animations, and nothing else. The engine loads ONE MHFU species overlay for it,
+        `port.host_species` picks which, and every `(main,sub)` in this panel is that
+        host's. Riding the Tigrex is a choice among 17, not a fact about the Zinogre.
+        """
+        from ..intel import available
+
+        ids = available()
+        if not ids:
+            return
+        cur = self.browsing_species
+        idx = ids.index(cur) if cur in ids else 0
+        imgui.set_next_item_width(110.0)
+        changed, pick = imgui.combo("##species", idx,
+                                    ["em%02d%s" % (s, "  (host)" if s == self.host_species
+                                                   else "") for s in ids])
+        if changed and ids[pick] != cur:
+            self.browse_species(ids[pick])
+        imgui.same_line()
+        if self.browsing_the_host:
+            imgui.text_disabled("the host this port rides (port.host_species = %d)"
+                                % self.host_species)
+        else:
+            imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
+            imgui.text_wrapped(
+                "! browsing em%02d — this port rides em%02d, so these pairs are NOT "
+                "the ones its engine dispatches. Comparing hosts, not binding: "
+                "host_species also picks the host frame PAC the porter files clips "
+                "into, so changing it is a rebuild."
+                % (cur, self.host_species))
+            imgui.pop_style_color()
+        self._hosts_table(imgui, ids)
+
+    def _hosts_table(self, imgui, ids) -> None:
+        """The 17 overlays side by side — the "which host should this port ride?" view."""
+        if not imgui.collapsing_header("compare the %d MHFU action tables" % len(ids)):
+            return
+        imgui.text_wrapped(
+            "Every overlay has the identical action tick: 8 mains, each fanning into a "
+            "sub_state switch. What differs is how much vocabulary you inherit. "
+            "'timed' pairs test fixed clip frames your animation has to hit; 'budget' "
+            "ones end on the +0x414 countdown instead of on your clip.")
+        flags = (imgui.TableFlags_.borders_inner_h.value
+                 | imgui.TableFlags_.row_bg.value
+                 | imgui.TableFlags_.sizing_stretch_prop.value)
+        if not imgui.begin_table("##hosts", 6, flags):
+            return
+        for name in ("overlay", "pairs", "timed", "budget", "fx", "opaque"):
+            imgui.table_setup_column(name)
+        imgui.table_headers_row()
+        for h in self.host_options():
+            imgui.table_next_row()
+            imgui.table_next_column()
+            if imgui.selectable("em%02d%s##h%d" % (h.species,
+                                                   " *" if h.species == self.host_species
+                                                   else "", h.species),
+                                h.species == self.browsing_species,
+                                imgui.SelectableFlags_.span_all_columns.value)[0]:
+                self.browse_species(h.species)
+            for value in (h.pairs, h.timed, h.budget, h.effects):
+                imgui.table_next_column()
+                imgui.text(str(value))
+            imgui.table_next_column()
+            imgui.text_disabled("%d/8" % h.opaque_mains)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("mains with no visible sub_state jump table — "
+                                  "'we cannot see it', which is not 'it does not "
+                                  "exist'")
+        imgui.end_table()
+
+    def clear_pair(self) -> None:
+        """Back to the list of pairs, keeping the clip and the camera where they are."""
+        self._pair, self._move, self.alignment, self.markers = None, None, None, []
+
+    def _bind_row(self, imgui) -> None:
+        """Write the alignment down: `[moves.<name>] main/sub/clip`.
+
+        Refused outright for a pair the census MEASURED as never entered — the same
+        thing `validate` refuses, and for the same reason. `allow_unentered = true` is
+        the override, and it belongs in the file next to a comment saying why, not
+        behind a button here.
+        """
+        al, s = self.alignment, self.session
+        if al is None or s is None:
+            return
+        if not self.browsing_the_host:
+            imgui.text_disabled("cannot bind: this pair belongs to em%02d, and the "
+                                "engine dispatches em%02d for this port"
+                                % (self.browsing_species, self.host_species))
+            return
+        blocked = [f for f in al.errors if f.code == "NEVER_ENTERED"]
+        imgui.set_next_item_width(140.0)
+        _, self._bind_buf = imgui.input_text("##bindname", self._bind_buf)
+        imgui.same_line()
+        if blocked:
+            imgui.text_disabled("cannot bind: the census says the engine never "
+                                "enters this pair")
+            return
+        if imgui.small_button("bind as move"):
+            from ..manifest import ManifestError
+            try:
+                self._saved = s.stage_move(self._bind_buf or "move_%d_%d" % (al.main,
+                                                                             al.sub),
+                                           al.main, al.sub, al.clip)
+                self.scene.attach_manifest(s.manifest)
+                self.select_pair(al.main, al.sub, self._bind_buf or None)
+            except ManifestError as e:
+                self._saved = str(e)
+        imgui.same_line()
+        imgui.text_disabled("-> [moves] on (%d,%d)%s" % (al.main, al.sub,
+                                                         " / %s" % al.clip
+                                                         if al.clip else ""))
+
+    def _moves_row(self, imgui, m) -> None:
+        if not m.moves:
+            imgui.text_wrapped("[moves] is empty — pick a pair below to try it "
+                               "against the clip on screen; bind it when it fits.")
+            return
+        imgui.text_disabled("moves")
+        for name in sorted(m.moves):
+            mv = m.moves[name]
+            imgui.same_line()
+            if imgui.small_button("%s (%d,%d)" % (name, mv.main, mv.sub)):
+                if mv.clip and self.viewport is not None:
+                    try:
+                        self.viewport.play_clip(self.scene.clip(mv.clip))
+                        self._pick_clip(self.scene.clip(mv.clip).slot)
+                    except KeyError:
+                        pass
+                self.select_pair(mv.main, mv.sub, name)
+
+    #: the pair table never gets less than this many points of height. Below about
+    #: this it is a header and one row, which reads as "the list is gone".
+    _PAIR_TABLE_MIN = 150.0
+
+    def _pair_table(self, imgui) -> None:
+        """Every `(main,sub)` the overlay dispatches — the deciding view.
+
+        Choosing the pair is the authoring act and it happens BEFORE a move exists:
+        `ports/zinogre.toml` ships with `[moves]` deliberately empty because aligning
+        an unlabelled vocabulary is guessing. So the table is browsable and the
+        alignment updates against whatever clip is playing.
+        """
+        imgui.set_next_item_width(120.0)
+        _, self._pair_filter = imgui.input_text("##pf", self._pair_filter)
+        imgui.same_line()
+        imgui.text_disabled("filter %d pairs em%02d dispatches"
+                            % (len(self.intel), self.browsing_species))
+
+        flags = (imgui.TableFlags_.borders_inner_h.value
+                 | imgui.TableFlags_.row_bg.value
+                 | imgui.TableFlags_.scroll_y.value
+                 | imgui.TableFlags_.sizing_stretch_prop.value)
+        # 🔴 An explicit height, not "whatever is left". `begin_table` with ScrollY and
+        # a zero outer size takes the REMAINDER of the panel, and after a headline and
+        # a dozen findings that remainder is a header and one row — which reads as
+        # "selecting a pair made the list of pairs disappear". With a floor the panel
+        # scrolls to it instead.
+        height = max(self._PAIR_TABLE_MIN, imgui.get_content_region_avail().y)
+        if not imgui.begin_table("##pairs", 4, flags, imgui.ImVec2(0.0, height)):
+            return
+        for name, w in (("pair", 0.8), ("ends on", 0.9), ("tests", 1.2), ("fx", 0.4)):
+            imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
+        imgui.table_setup_scroll_freeze(0, 1)
+        imgui.table_headers_row()
+        needle = self._pair_filter.strip().lower()
+        for p in self.intel:
+            gates = p.tested_frames
+            row = "%d,%d %s %s" % (p.main, p.sub, p.ends_on,
+                                   " ".join("%g" % f for f in gates))
+            if needle and needle not in row.lower():
+                continue
+            imgui.table_next_row()
+            imgui.table_next_column()
+            sel = self._pair == (p.main, p.sub)
+            if imgui.selectable("(%d,%d)##p%d_%d" % (p.main, p.sub, p.main, p.sub),
+                                sel, imgui.SelectableFlags_.span_all_columns.value)[0]:
+                self.select_pair(p.main, p.sub)
+            imgui.table_next_column()
+            if p.budget.gated:
+                imgui.push_style_color(imgui.Col_.text,
+                                       imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
+                imgui.text("budget")
+                imgui.pop_style_color()
+            else:
+                imgui.text_disabled(p.ends_on or "?")
+            imgui.table_next_column()
+            imgui.text(", ".join("%g" % f for f in gates[:4]) or "·")
+            imgui.table_next_column()
+            imgui.text(str(len(p.effects)) if p.effects else "")
+        imgui.end_table()
 
     # ---- clips (issues #7, #8) ---------------------------------------- #
     def _clips_panel(self) -> None:
@@ -612,32 +960,96 @@ class EditorApp:
         net, peak = self._travel(self.scene.clip(vp.clip))
         imgui.text_disabled("root travel  net %.0f  peak %.0f%s"
                             % (net, peak, "" if net >= 1.0 else "   (in place)"))
+
+        # 🔴 the alignment answer needs ONE number the file cannot give: where this
+        # clip's own contact is. Scrub to it and press this. → clips.<n>.impact_frame
+        if self.scene.manifest is not None:
+            entry = self.session.entry(vp.clip.slot) if self.session else None
+            if imgui.small_button("set impact = frame %d" % int(round(pb.phase))):
+                self._saved = self.set_impact_here()
+            imgui.same_line()
+            if entry is not None and entry.impact_frame is not None:
+                imgui.text_disabled("impact %d" % entry.impact_frame)
+            else:
+                imgui.text_disabled("no impact frame recorded for this clip")
         self._marker_strip(imgui, pb)
 
     def _marker_strip(self, imgui, pb) -> None:
-        """The frame-markers layer. Empty until issue #9 supplies the action's frames.
+        """The host action's frames, drawn in the CLIP's own frame space. → #9
 
-        Drawn even when there is nothing to draw, so #9 is a data change rather than a
-        UI change: give :attr:`markers` a ``{frame: label}`` and they appear.
+        🔴 A gate past the clip's last frame is drawn HOLLOW at the right edge rather
+        than clamped silently: the cursor never reaches it, so that branch of the
+        handler never runs, and a tick indistinguishable from a reachable one would
+        hide the single most expensive thing this panel can tell you.
         """
-        h = 18.0
+        from ..align import EFFECT, GATE, IMPACT, OURS, WINDOW
+
+        h = 22.0
         w = max(imgui.get_content_region_avail().x, 1.0)
         pos = imgui.get_cursor_screen_pos()
         draw = imgui.get_window_draw_list()
         bg = imgui.get_color_u32(imgui.ImVec4(0.18, 0.19, 0.22, 1.0))
         draw.add_rect_filled(pos, imgui.ImVec2(pos.x + w, pos.y + h), bg, 3.0)
+        hovered, mouse = None, imgui.get_io().mouse_pos
         if pb.end > 0:
-            for frame, label in sorted(self.markers.items()):
-                x = pos.x + w * max(0.0, min(frame / pb.end, 1.0))
-                col = imgui.get_color_u32(imgui.ImVec4(0.98, 0.70, 0.20, 0.95))
-                draw.add_line(imgui.ImVec2(x, pos.y), imgui.ImVec2(x, pos.y + h), col, 2.0)
+            def at(mk):
+                return pos.x + w * max(0.0, min(mk.frame / pb.end, 1.0))
+
+            for mk in self.markers:
+                x = at(mk)
+                col = imgui.get_color_u32(imgui.ImVec4(*_MARKER_COLOR[mk.kind]))
+                if mk.unreachable:
+                    draw.add_rect(imgui.ImVec2(x - 2, pos.y + 3),
+                                  imgui.ImVec2(x + 2, pos.y + h - 3), col, 0.0, 0, 1.5)
+                else:
+                    draw.add_line(imgui.ImVec2(x, pos.y + 1),
+                                  imgui.ImVec2(x, pos.y + h - 1), col, 2.0)
+                if abs(mouse.x - x) < 6 and pos.y <= mouse.y <= pos.y + h:
+                    hovered = mk
+
+            # ⚠️ The labels have to be placed, not just drawn. On a 408-frame clip the
+            # Tigrex's 40/50/58/60 gates land inside 5% of the width and their texts
+            # overprint into an unreadable smear. The IMPACT label is placed first
+            # because it is the answer the panel exists to give; the rest take the room
+            # that is left, and the tick + hover tooltip carry the ones that are
+            # dropped.
+            taken = []
+            for mk in sorted(self.markers,
+                             key=lambda k: (k.kind != IMPACT, k.frame)):
+                x = at(mk) + 3.0
+                tw = imgui.calc_text_size(mk.label).x
+                if any(x < b and x + tw > a for a, b in taken):
+                    continue
+                taken.append((x - 2.0, x + tw + 2.0))
+                draw.add_text(imgui.ImVec2(x, pos.y + 3),
+                              imgui.get_color_u32(
+                                  imgui.ImVec4(*_MARKER_COLOR[mk.kind])), mk.label)
             x = pos.x + w * pb.progress
             head = imgui.get_color_u32(imgui.ImVec4(0.95, 0.25, 0.28, 1.0))
             draw.add_line(imgui.ImVec2(x, pos.y), imgui.ImVec2(x, pos.y + h), head, 2.0)
         imgui.dummy(imgui.ImVec2(w, h))
+        if hovered is not None:
+            imgui.set_tooltip(plain(
+                "frame %g — %s%s"
+                % (hovered.frame, hovered.detail or hovered.label,
+                   "\n! past the clip's last frame: never reached"
+                   if hovered.unreachable else "")))
         if not self.markers:
-            imgui.text_disabled("no frame markers — issue #9 fills these from the "
-                                "host action's expectations")
+            imgui.text_disabled("no frame markers — pick a (main,sub) in Action and "
+                                "the handler's own frames appear here")
+            return
+        first = True
+        for kind, name in ((GATE, "cursor >= F"), (WINDOW, "window edge"),
+                           (EFFECT, "host effect"), (OURS, "our effect"),
+                           (IMPACT, "impact")):
+            if not any(mk.kind == kind for mk in self.markers):
+                continue
+            if not first:
+                imgui.same_line()
+            first = False
+            imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(*_MARKER_COLOR[kind]))
+            imgui.text("| " + name)
+            imgui.pop_style_color()
 
     def _joint_labels(self, imgui, pos, size) -> None:
         """Joint indices drawn over the picture, and click-to-select on the joint.
@@ -698,8 +1110,12 @@ class EditorApp:
         # whatever directory the tool was launched from — the repo root, in practice.
         # The per-user config folder is the right place on all three platforms:
         # ~/Library/Application Support, ~/.config, %APPDATA%.
-        p.ini_folder_type = hello_imgui.IniFolderType.app_user_config_folder
-        p.ini_filename = "%s.ini" % INI_NAME
+        if self.ini_folder is None:
+            p.ini_folder_type = hello_imgui.IniFolderType.app_user_config_folder
+            p.ini_filename = "%s.ini" % INI_NAME
+        else:
+            p.ini_folder_type = hello_imgui.IniFolderType.absolute_path
+            p.ini_filename = "%s/%s.ini" % (self.ini_folder, INI_NAME)
 
         p.imgui_window_params.default_imgui_window_type = \
             hello_imgui.DefaultImGuiWindowType.provide_full_screen_dock_space
@@ -744,7 +1160,12 @@ def _docking(app: EditorApp):
     # the viewport keeps the middle; inspectors left, clips right, timeline under.
     splits = [split("MainDockSpace", "Left", imgui.Dir.left, 0.18),
               split("MainDockSpace", "Right", imgui.Dir.right, 0.20),
-              split("MainDockSpace", "Bottom", imgui.Dir.down, 0.22)]
+              split("MainDockSpace", "Bottom", imgui.Dir.down, 0.30),
+              # the action inspector goes BESIDE the timeline, not in the narrow right
+              # column: its findings are prose, and it has to be readable at the same
+              # time as the marker strip it fills — tabbing it with either would hide
+              # one half of the comparison the panel exists to make.
+              split("Bottom", "BottomRight", imgui.Dir.right, 0.45)]
 
     def win(label, dock, fn, focus=False):
         w = hello_imgui.DockableWindow()
@@ -767,7 +1188,8 @@ def _docking(app: EditorApp):
                           win("Scene", "Left", app._scene_panel),
                           win("View", "Left", app._view_panel),
                           win("Joints", "Left", app._joints_panel),
-                          win("Clips", "Right", app._clips_panel)]
+                          win("Clips", "Right", app._clips_panel),
+                          win("Action", "BottomRight", app._action_panel)]
     return d
 
 
@@ -780,6 +1202,31 @@ def _no_scroll_flags() -> int:
 def _status(app: EditorApp) -> None:
     from imgui_bundle import imgui
     imgui.text(app.status or "attaching to the GL context…")
+
+
+#: hello_imgui's default font covers Latin-1 and general punctuation and NOTHING else,
+#: so a dingbat or an emoji draws as a replacement box. The finding messages are shared
+#: with the CLI, where the symbols carry real weight, so they are translated on the way
+#: to the SCREEN rather than removed at the source.
+_GLYPHS = {"\U0001f534": "[!]", "\u26a0\ufe0f": "[!]", "\u26a0": "[!]",
+           "\u2716": "x", "\u2714": "ok", "\u25cf": "*", "\u2192": "->"}
+
+
+def plain(text: str) -> str:
+    """Text the default imgui font can actually draw, at a length a panel can hold.
+
+    Also shortens absolute paths: `em_intel` records *why* a census is absent as the
+    full path it looked at, which is right in a log and is half a panel on screen.
+    """
+    import os
+
+    for bad, good in _GLYPHS.items():
+        text = text.replace(bad, good)
+    for root, short in ((os.getcwd() + os.sep, ""),
+                        (os.path.expanduser("~") + os.sep, "~" + os.sep)):
+        if root not in (os.sep, ""):
+            text = text.replace(root, short)
+    return text
 
 
 def _framebuffer_scale() -> float:
@@ -894,12 +1341,105 @@ def _label_health(imgui, vocab) -> None:
     if not bad:
         return
     imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
-    imgui.text_wrapped("⚠ %d label(s) do not match this build" % len(bad))
+    imgui.text_wrapped("! %d label(s) do not match this build" % len(bad))
     imgui.pop_style_color()
     for t in bad:
         imgui.bullet_text("%s (slot %d): %s" % (t.name, t.slot, t.status))
         if imgui.is_item_hovered():
             imgui.set_tooltip(t.message)
+
+
+# --------------------------------------------------------------------------- #
+# the action inspector (issue #9)
+# --------------------------------------------------------------------------- #
+_MARKER_COLOR = {"gate": (0.98, 0.70, 0.20, 0.95),
+                 "window": (0.55, 0.82, 0.98, 0.95),
+                 "effect": (0.85, 0.55, 0.98, 0.95),
+                 "ours": (0.55, 0.90, 0.60, 0.95),
+                 "impact": (0.98, 0.35, 0.38, 1.0)}
+
+_LEVEL_COLOR = {"error": (0.98, 0.42, 0.42, 1.0),
+                "warn": (0.98, 0.75, 0.30, 1.0),
+                "info": (0.62, 0.68, 0.78, 1.0)}
+
+
+def _alignment_view(imgui, al, app) -> None:
+    """The headline, then every finding. The headline IS the feature."""
+    if imgui.small_button("< all pairs"):
+        app.clear_pair()
+        return
+    imgui.same_line()
+    imgui.text("%s  ->  (%d,%d)" % (al.move, al.main, al.sub))
+    if al.clip:
+        imgui.same_line()
+        imgui.text_disabled("clip %s%s" % (al.clip,
+                                           "  %df" % al.frames if al.frames else ""))
+    imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.92, 0.94, 0.98, 1.0))
+    imgui.text_wrapped(plain(al.headline))
+    imgui.pop_style_color()
+
+    # The findings are collapsed unless something is actually WRONG. They are prose,
+    # a dozen of them is normal, and left open they push the pair table off the panel —
+    # while the one line anybody reads is the headline above.
+    if al.findings:
+        n = len(al.errors), len(al.warnings)
+        label = "%d finding%s%s###findings" % (
+            len(al.findings), "" if len(al.findings) == 1 else "s",
+            "  —  %d error, %d warning" % n if any(n) else "")
+        imgui.set_next_item_open(bool(al.errors), imgui.Cond_.once.value)
+        open_ = imgui.collapsing_header(label)
+        if not open_:
+            _finding_dots(imgui, al)          # the summary stands in for the list
+        if open_:
+            for f in al.findings:
+                imgui.push_style_color(imgui.Col_.text,
+                                       imgui.ImVec4(*_LEVEL_COLOR[f.level]))
+                imgui.text_wrapped("%s  %s" % ("x" if f.level == "error"
+                                               else "!" if f.level == "warn" else "-",
+                                               plain(f.message)))
+                imgui.pop_style_color()
+            if al.pair is not None and al.pair.handler:
+                imgui.text_disabled("handler 0x%08X   a1 %s" % (
+                    al.pair.handler, ",".join(str(x) for x in al.pair.a1) or "-"))
+            _species_effects(imgui, app)
+
+
+def _finding_dots(imgui, al) -> None:
+    """A one-line summary that stays visible when the findings are collapsed."""
+    bits = [(f.code.replace("_", " ").lower(), f.level) for f in al.findings
+            if f.level != "info"]
+    if not bits:
+        imgui.text_disabled("nothing to flag")
+        return
+    for i, (code, level) in enumerate(bits):
+        if i:
+            imgui.same_line()
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(*_LEVEL_COLOR[level]))
+        imgui.text(code)
+        imgui.pop_style_color()
+
+
+def _species_effects(imgui, app) -> None:
+    """The species' framed spawn vocabulary — where the `@frame` numbers actually are.
+
+    ⚠️ NOT attributed to this pair, and the file says so: em75's 30 framed sites all
+    sit in routines hung off a species-byte switch no pair handler calls. Shown here
+    because they are the only place the effect TIMING is legible, and hidden behind a
+    header so they are never mistaken for this action's own.
+    """
+    fx = app.intel.framed_effects() if app.intel else []
+    if not fx:
+        return
+    if not imgui.collapsing_header("%d framed effect site(s), species-wide" % len(fx)):
+        return
+    imgui.text_wrapped("! these are NOT attributed to any (main,sub) — they hang off a "
+                       "species-byte switch no pair handler calls, so which action "
+                       "fires them is not decidable offline. Bones are the host's.")
+    rig = app.port_rig()
+    for e in fx:
+        imgui.bullet_text("effect %-3d  bone %-3s  frame %d" % (e.id, e.bone, e.frame))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("on YOUR rig: %s" % rig.describe(e.bone))
 
 
 def _joint_note(sk, j: int, verts: int) -> str:

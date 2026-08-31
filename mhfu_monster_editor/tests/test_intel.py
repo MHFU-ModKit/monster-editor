@@ -315,6 +315,33 @@ def test_intel_for_the_wrong_species_still_stops_before_it_guesses():
     assert "MOVE_PAIR_UNOBSERVED" not in _codes(iss)
 
 
+def test_available_and_survey_list_every_overlay_on_this_machine():
+    """The "which host should this port ride?" question — 17 overlays, one shape.
+
+    A ported monster has no AI of its own; the engine loads ONE MHFU species overlay
+    for it and `port.host_species` picks which. So the chooser has to be able to see
+    all of them, not just the Tigrex.
+    """
+    import os
+
+    root = os.path.join(_ROOT, "species")
+    ids = I.available(root)
+    if not ids:
+        print("SKIP: no species/*.json — python tools/em_intel.py --all")
+        return
+    assert all(isinstance(i, int) for i in ids) and ids == sorted(ids), ids
+    hosts = I.survey_hosts(root)
+    assert [h.species for h in hosts] == ids, [h.species for h in hosts]
+    for h in hosts:
+        assert h.handled <= h.pairs and h.timed <= h.pairs, h
+        assert h.free_timing == h.pairs - h.timed
+        assert 0 <= h.opaque_mains <= 8, h          # every overlay has exactly 8 mains
+    big = max(hosts, key=lambda h: h.pairs)
+    assert big.species == 75, big.species           # the Tigrex is the richest of them
+    print("hosts             %d overlays; em75 is the largest at %d pairs (%d timed, "
+          "%d budget-gated)" % (len(hosts), big.pairs, big.timed, big.budget))
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

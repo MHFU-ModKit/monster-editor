@@ -7,6 +7,8 @@
     every field. Stdlib only, like the manifest.
   * :mod:`.clips` — what is in each animation slot (CARRIED / FILLER / HOST) and whether
     a clip's NAME still points at the clip it was written for. Stdlib at import time.
+  * :mod:`.align` — the HOST action's expectations and YOUR clip on one frame axis:
+    cursor gates, what ends the action, effect spawns, measured dwell. Stdlib only.
   * :mod:`.validate` — the checks that need evidence (the built PAC, the action intel).
   * :mod:`.core` — a monster PAC as a render-agnostic :class:`~.core.scene.Scene`:
     skeleton, skinned geometry, textures, clips, ``pose(clip, frame)``. No GL, no UI.

@@ -148,6 +148,10 @@ class PairIntel:
     ends_on: str = ""
     #: cursor thresholds the handler tests, in clip frames. None = loaded from data
     event_frames: List[Optional[float]] = field(default_factory=list)
+    #: the WINDOWED form's literals (`0x08864348` — "cursor inside a range", the shape
+    #: of a hitbox-active test, 280 call sites in em75). Same clip-frame space as
+    #: :attr:`event_frames`; a site whose literal came from data reads ``None``.
+    window_frames: List[Optional[float]] = field(default_factory=list)
     windows: int = 0
     budget: BudgetIntel = field(default_factory=BudgetIntel)
     effects: List[EffectRecipe] = field(default_factory=list)
@@ -199,6 +203,23 @@ class PairIntel:
         """Frames the handler fires things at — a ported clip must hit these."""
         return [f for f in self.event_frames if f is not None]
 
+    @property
+    def fixed_window_frames(self) -> List[float]:
+        """Bounds of the windowed (hitbox-active-shaped) tests, deduplicated.
+
+        ⚠️ Each site contributes ONE literal — the recovered `f12` — so these are the
+        window EDGES the handler names, not resolved (start, end) pairs. Negative
+        values occur (`-5.0` on `(1,13)`) and mean the test brackets the very start of
+        the clip; they are kept rather than clamped, because a clamped number would
+        read as a real frame the port must hit.
+        """
+        return sorted({f for f in self.window_frames if f is not None})
+
+    @property
+    def tested_frames(self) -> List[float]:
+        """Every clip frame this handler names, of either kind, sorted."""
+        return sorted(set(self.fixed_event_frames) | set(self.fixed_window_frames))
+
     def __str__(self) -> str:
         bits = ["(%d,%d)" % (self.main, self.sub)]
         bits.append("0x%08X" % self.handler if self.handler else "inline")
@@ -206,6 +227,8 @@ class PairIntel:
             bits.append("a1=" + ",".join(str(x) for x in self.a1))
         if self.ends_on:
             bits.append("ends:" + self.ends_on)
+        if self.tested_frames:
+            bits.append("f@" + ",".join("%g" % f for f in self.tested_frames))
         if self.effects:
             bits.append("fx " + " ".join(str(e) for e in self.effects))
         bits.append("entered=%s" % ("?" if self.entered is None else self.entered))
@@ -237,6 +260,8 @@ class PairIntel:
             ends_on=str(d.get("ends_on", "")),
             event_frames=[None if f is None else float(f)
                           for f in d.get("event_frames", [])],
+            window_frames=[None if f is None else float(f)
+                           for f in d.get("window_frames", [])],
             windows=int(d.get("windows", 0)),
             budget=BudgetIntel.from_dict(d.get("budget")),
             effects=[EffectRecipe.from_dict(e) for e in d.get("effects", [])],
@@ -329,6 +354,21 @@ class SpeciesIntel:
 
     def pairs_with_effects(self) -> List[PairIntel]:
         return [p for p in self if p.effects]
+
+    def framed_effects(self) -> List[EffectRecipe]:
+        """Every `id @ bone @ FRAME` site in the file, sorted by frame.
+
+        ⚠️ These come from :attr:`unattributed_effects` — em75's 30 framed sites all
+        sit in routines hung off a species-byte switch that no pair handler calls, so
+        the file cannot say WHICH action fires them. They are the species' effect
+        vocabulary with its timing, not a property of any one `(main,sub)`, and every
+        consumer has to present them that way. (No pair-attributed recipe in any of the
+        17 overlays carries a frame — the attributable sites do not go through the
+        frame-gated primitive.)
+        """
+        out = [EffectRecipe.from_dict(s) for u in self.unattributed_effects
+               for s in u.get("sites", []) if s.get("frame") is not None]
+        return sorted(out, key=lambda e: (e.frame, e.id))
 
     def budget_gated(self) -> List[PairIntel]:
         return [p for p in self if p.budget.gated]
@@ -429,6 +469,64 @@ class SpeciesIntel:
         return "\n".join(lines)
 
 
+def available(root: os.PathLike | str = "species") -> List[int]:
+    """Species numbers with a `species/emNN.json` on this machine, ascending.
+
+    MHFU ships **17 big-monster overlays** and every one has the identical action
+    tick — a `switch(entity+0x298)` over exactly 8 mains, each fanning into a
+    `switch(entity+0x299)` (`docs/AI_SCRIPTING_ENGINE.md` §33h). So any of the 17 is a
+    candidate HOST for a port, and which one you ride decides the whole behaviour
+    vocabulary you get.
+    """
+    out = []
+    for p in sorted(Path(root).glob("em*.json")):
+        stem = p.stem[2:]
+        if stem.isdigit():
+            out.append(int(stem))
+    return sorted(out)
+
+
+@dataclass
+class HostSummary:
+    """One overlay, at the size a chooser needs. What riding this host would give you."""
+    species: int
+    pairs: int
+    handled: int
+    #: pairs whose handler tests fixed clip frames — timing you must hit
+    timed: int
+    #: pairs that end on the +0x414 budget rather than on the clip
+    budget: int
+    effects: int
+    #: mains whose sub_state jump table could NOT be enumerated — "we cannot see it",
+    #: which is not "it does not exist"
+    opaque_mains: int
+
+    @property
+    def free_timing(self) -> int:
+        """Pairs that impose no fixed frame — a ported clip's timing is yours there."""
+        return self.pairs - self.timed
+
+
+def survey_hosts(root: os.PathLike | str = "species") -> List[HostSummary]:
+    """Every overlay on this machine, summarised — the "which host?" table.
+
+    ⚠️ Reads all 17 files, so call it when somebody asks, not per frame.
+    """
+    out = []
+    for species in available(root):
+        si = find_intel(species, root)
+        if si is None:                                       # pragma: no cover
+            continue
+        out.append(HostSummary(
+            species=species, pairs=len(si),
+            handled=sum(1 for p in si if p.handler is not None),
+            timed=sum(1 for p in si if p.tested_frames),
+            budget=len(si.budget_gated()),
+            effects=len(si.pairs_with_effects()),
+            opaque_mains=sum(1 for m in si.main_states if not m.get("enumerated"))))
+    return out
+
+
 def find_intel(host_species: int,
                root: os.PathLike | str = "species") -> Optional[SpeciesIntel]:
     """`species/emNN.json` for a host species, or ``None`` if it has not been built.
@@ -471,6 +569,8 @@ def main(argv: Optional[List[str]] = None) -> int:                # pragma: no c
         print(p)
         print("  ends on        : %s" % (p.ends_on or "?"))
         print("  event frames   : %s" % (p.event_frames or "-"))
+        print("  window frames  : %s  (%d windowed test(s))"
+              % (p.window_frames or "-", p.windows))
         print("  budget         : %s" % p.budget)
         print("  effects        : %s" % (" ".join(str(e) for e in p.effects) or "-"))
         print("  measured       : %s" % ("entered %s, dwell %.1f ticks, %s u/tick"

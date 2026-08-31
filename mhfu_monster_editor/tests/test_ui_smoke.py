@@ -28,7 +28,8 @@ TIGREX = _ROOT / "workspace" / "extracted" / "data_files" / "file_06185.bin"
 FRAMES = 10
 
 
-def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None) -> dict:
+def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None,
+              ini_folder: str = None) -> dict:
     """Open the app on ``pac``, draw ``frames`` frames, close. Returns what happened.
 
     🔴 Samples the **real back buffer** in `before_swap`, not our offscreen target.
@@ -44,7 +45,9 @@ def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None) -> dict:
     from mhfu_monster_editor.ui import EditorApp
 
     scene = open_scene(pac)
-    app = EditorApp(scene, size=(1000, 700))
+    # ⚠️ a temp ini folder: the app remembers window size and docking layout per user,
+    # and a smoke run must not overwrite a layout somebody arranged by hand.
+    app = EditorApp(scene, size=(1000, 700), ini_folder=ini_folder or tempfile.mkdtemp())
     got = {"frames": 0, "error": None, "status": "", "fbo": None,
            "screen": None, "lit": 0}
 
@@ -199,7 +202,7 @@ def test_playback_suppresses_the_idle_throttle():
     from mhfu_monster_editor.ui import EditorApp
 
     scene = open_scene(TIGREX)
-    app = EditorApp(scene, size=(700, 500))
+    app = EditorApp(scene, size=(700, 500), ini_folder=tempfile.mkdtemp())
     idle_fps = hello_imgui.RunnerParams().fps_idling.fps_idle
     hold = hello_imgui.RunnerParams().fps_idling.time_active_after_last_event
     run_for = hold + 2.5

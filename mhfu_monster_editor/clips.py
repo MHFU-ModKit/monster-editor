@@ -474,6 +474,34 @@ class LabelSession:
             entry.impact_frame = impact_frame
         return "staged clips.%s — %d edit(s) pending" % (name, self.pending)
 
+    def stage_move(self, name: str, main: int, sub: int,
+                   clip: Optional[str] = None) -> str:
+        """Queue a `[moves.<name>]` binding — a host pair plus the clip it paints.
+
+        The conclusion of the action inspector (#9): you browse pairs against the clip
+        on screen, and when the alignment is right you write it down. Only the three
+        fields that ARE the alignment; `latch`, `min_gap` and `allow_unentered` keep
+        their defaults and are edited in the file, where an override can be argued for
+        in a comment.
+        """
+        from .manifest import ManifestError, Move, SetKey
+
+        name = name.strip()
+        if not all(ch.isalnum() or ch in "-_" for ch in name) or not name:
+            raise ManifestError("%r cannot be a TOML table name — letters, digits, "
+                                "- and _" % name)
+        if clip is not None and clip not in self.manifest.clips:
+            raise ManifestError("clip %r is not named in this manifest yet — name it "
+                                "first, or the move points at nothing" % clip)
+        table = "moves.%s" % name
+        self.edits += [SetKey(table, "main", int(main)), SetKey(table, "sub", int(sub))]
+        if clip is not None:
+            self.edits.append(SetKey(table, "clip", clip))
+        self.manifest.moves[name] = Move(name=name, main=int(main), sub=int(sub),
+                                         clip=clip)
+        return "staged moves.%s = (%d,%d)%s — %d edit(s) pending" % (
+            name, main, sub, " on %s" % clip if clip else "", self.pending)
+
     # -- writing --------------------------------------------------------- #
     def save(self, path: Optional[os.PathLike | str] = None) -> str:
         """Patch the manifest file. Comments, order and formatting are preserved."""

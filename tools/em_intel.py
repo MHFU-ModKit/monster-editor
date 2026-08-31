@@ -212,6 +212,13 @@ def static_intel(ov: Overlay) -> dict:
         rec["event_frames"] = [None if x is None else round(x, 2)
                                for x in g["frames"]]
         rec["windows"] = len(g["windows"])
+        # 🔴 the windowed test's LITERALS, not just how many there were. `0x08864348`
+        # is the shape of a hitbox-active check (280 call sites in em75), so these are
+        # the frames a ported clip has to put its impact between — exactly the numbers
+        # the action inspector (#9) draws on the timeline. Keeping only the count made
+        # the richest gate in the overlay unusable.
+        rec["window_frames"] = [None if x is None else round(x, 2)
+                                for x in g["windows"]]
         rec["clip_done_reads"] = g["clip_done"]
         rec["budget_reads"] = g["timer"]
         if end == "budget":
@@ -329,7 +336,8 @@ def build(path: Path, census: dict | None = None,
         rec = dict(st["pairs"].get(key) or dict(main=m, sub=sub, handler=None))
         prov = {}
         if key in st["pairs"]:
-            for f in ("handler", "a1", "ends_on", "event_frames", "effects",
+            for f in ("handler", "a1", "ends_on", "event_frames", "window_frames",
+                      "effects",
                       "budget"):
                 if f in rec:
                     prov[f] = STATIC
