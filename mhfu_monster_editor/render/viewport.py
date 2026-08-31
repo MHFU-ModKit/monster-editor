@@ -82,6 +82,104 @@ def scene_bounds(scene) -> Bounds:
     return Bounds.union(*parts)
 
 
+def _pose_onto(scene, mesh, skeleton, clip, frame: float, strip_root: bool) -> None:
+    """Deform ``mesh`` and move ``skeleton`` onto one frame of ``clip``.
+
+    Shared by the port and the host reference so the two cannot drift into posing
+    differently — the whole value of a side-by-side is that the only difference on
+    screen is the DATA.
+    """
+    if clip is None:
+        pose, driven = scene.bind_pose(), None
+    else:
+        pose = pose_at(scene, clip, frame, strip_root=strip_root)
+        driven = scene.clip(clip).driven
+    if mesh is not None:
+        mesh.set_pose(None if clip is None else pose)
+    if skeleton is not None:
+        skeleton.set_positions(pose.joints)
+        skeleton.set_driven(driven)
+
+
+class Reference:
+    """A SECOND monster in the viewport, beside the first — issue #34.
+
+    The port answers "what does my animation look like"; the reference answers "what
+    IS action (1,13)". `PairIntel.a1` is the executor argument the host's own handler
+    passes and `a1` IS the clip slot, so selecting a pair names the host clip and this
+    plays it next to yours.
+
+    🔴 Its own transport, deliberately. Both are advanced from the same tick at the
+    same `speed` — the rate comes from the action dispatch and is shared — but each
+    loops at its OWN `end`, because that is what the engine does and because the
+    mismatch is the finding: a 408-frame port clip against a 90-frame host clip means
+    the action is long over before your animation is.
+    """
+
+    #: gap between the two animals, as a fraction of their combined radius
+    GAP = 0.45
+
+    def __init__(self, ctx, scene, *, beside: Bounds, speed: float) -> None:
+        self.scene = scene
+        self.bind_bounds = scene_bounds(scene)
+        self.mesh = SkinnedMesh(ctx, scene)
+        self.skeleton = SkeletonOverlay(ctx, scene)
+        self.skeleton.joint_size = max(4.0, min(9.0, self.bind_bounds.radius / 160.0))
+        self.playback = Playback()
+        self.playback.speed = speed
+        self.clip = None
+        self.visible = True
+        #: world offset — along X, the flank axis, so both animals still face +Z
+        span = (beside.radius + self.bind_bounds.radius)
+        self.offset = np.array([span * (1.0 + self.GAP), 0.0, 0.0])
+        clip, frame = default_pose(scene)
+        self.play(clip, frame)
+
+    # ---- transport ---------------------------------------------------- #
+    def play(self, clip, frame: Optional[float] = None, *,
+             strip_root: bool = False) -> None:
+        if clip is None:
+            self.clip = None
+            self.playback.set_clip(_NO_CLIP)
+            _pose_onto(self.scene, self.mesh, self.skeleton, None, 0.0, strip_root)
+            return
+        c = self.scene.clip(clip)
+        self.clip = c
+        self.playback.set_clip(c)
+        self.playback.seek(c.frames * 0.5 if frame is None else frame)
+        self.pose(strip_root)
+
+    def pose(self, strip_root: bool) -> None:
+        _pose_onto(self.scene, self.mesh, self.skeleton, self.clip,
+                   self.playback.phase, strip_root)
+
+    def tick(self, dt: float, *, strip_root: bool) -> bool:
+        if self.clip is None:
+            return False
+        before = self.playback.phase
+        self.playback.advance(dt)
+        if self.playback.phase == before:
+            return False
+        self.pose(strip_root)
+        return True
+
+    @property
+    def bounds(self) -> Bounds:
+        b = self.mesh.bounds if self.mesh.bounds.radius > 0 else self.bind_bounds
+        return Bounds(np.asarray(b.lo) + self.offset, np.asarray(b.hi) + self.offset)
+
+    def model(self) -> np.ndarray:
+        m = np.eye(4)
+        m[:3, 3] = self.offset
+        return m
+
+    def release(self) -> None:
+        for obj in (self.mesh, self.skeleton):
+            if obj is not None:
+                obj.release()
+        self.mesh = self.skeleton = None
+
+
 class Viewport:
     """Camera + target + the shell's drawables, with a scene bound into them."""
 
@@ -119,6 +217,10 @@ class Viewport:
         #: replace the root joints' location with their bind translation, so a
         #: locomotion clip plays IN PLACE instead of walking out of frame.
         self.strip_root = False
+
+        #: a SECOND monster beside this one — the host whose actions you are reading.
+        #: None until `set_reference`. → issue #34
+        self.reference: Optional[Reference] = None
 
         self._ground = Ground(ctx)
         self._axes = Lines(ctx)
@@ -166,17 +268,7 @@ class Viewport:
             return
         self.clip = clip
         self.frame = float(frame)
-        if clip is None:
-            pose = self.scene.bind_pose()
-            driven = None
-        else:
-            pose = pose_at(self.scene, clip, frame, strip_root=self.strip_root)
-            driven = self.scene.clip(clip).driven
-        if self.mesh is not None:
-            self.mesh.set_pose(None if clip is None else pose)
-        if self.skeleton is not None:
-            self.skeleton.set_positions(pose.joints)
-            self.skeleton.set_driven(driven)
+        _pose_onto(self.scene, self.mesh, self.skeleton, clip, frame, self.strip_root)
 
     def play_clip(self, clip, frame: Optional[float] = None) -> None:
         """Bind a clip to the transport and pose to it. ``frame=None`` keeps the cursor."""
@@ -191,18 +283,53 @@ class Viewport:
         self.playback.seek(c.frames * 0.5 if frame is None else frame)
         self.set_pose(c, self.playback.phase)
 
+    # ---- the host reference (issue #34) ------------------------------- #
+    def set_reference(self, scene, *, frame_camera: bool = True) -> "Reference":
+        """Put a second monster beside this one, offset along the flank axis.
+
+        Framed on the union afterwards, so both are on screen — a comparison you have
+        to pan between is not a comparison.
+        """
+        self.clear_reference()
+        self.reference = Reference(self.ctx, scene, beside=self.bind_bounds,
+                                   speed=self.playback.speed)
+        self.reference.pose(self.strip_root)
+        if frame_camera:
+            self.camera.frame(self.bounds)
+        return self.reference
+
+    def clear_reference(self, *, frame_camera: bool = False) -> None:
+        if self.reference is not None:
+            self.reference.release()
+            self.reference = None
+        if frame_camera:
+            self.camera.frame(self.bounds)
+
+    def play_reference_clip(self, clip, frame: Optional[float] = None) -> None:
+        if self.reference is not None:
+            self.reference.play(clip, frame, strip_root=self.strip_root)
+
     def tick(self, dt: float) -> bool:
         """Advance the transport by ``dt`` real seconds; re-pose if it moved.
 
         Returns whether anything changed, so a caller can skip the CPU skinning on a
         frame where the clip is paused — which is most of them while you read a pose.
         """
+        moved = False
+        if self.reference is not None:
+            # 🔴 the reference is advanced whatever the port is doing. Gating it on the
+            # port having a clip would freeze the host on a port that has none, which
+            # is the one case where you most want to watch the host.
+            self.reference.playback.speed = self.playback.speed
+            self.reference.playback.loop = self.playback.loop
+            self.reference.playback.playing = self.playback.playing
+            moved = self.reference.tick(dt, strip_root=self.strip_root)
         if self.clip is None:
-            return False
+            return moved
         before = self.playback.phase
         self.playback.advance(dt)
         if self.playback.phase == before:
-            return False
+            return moved
         self.set_pose(self.clip, self.playback.phase)
         return True
 
@@ -222,10 +349,17 @@ class Viewport:
 
     @property
     def bounds(self) -> Bounds:
-        """The extent of what is on screen NOW — the posed mesh, else bind."""
-        if self.mesh is not None and self.mesh.bounds.radius > 0:
-            return self.mesh.bounds
-        return self.bind_bounds
+        """The extent of what is on screen NOW — the posed mesh, else bind.
+
+        With a reference loaded this is the UNION of the two, because that is what the
+        camera has to frame for a side-by-side to be one.
+        """
+        own = (self.mesh.bounds if self.mesh is not None and self.mesh.bounds.radius > 0
+               else self.bind_bounds)
+        if self.reference is None or not self.reference.visible:
+            return own
+        other = self.reference.bounds
+        return Bounds(np.minimum(own.lo, other.lo), np.maximum(own.hi, other.hi))
 
     def resize(self, size: Tuple[int, int]) -> bool:
         return self.target.resize(size)
@@ -263,15 +397,24 @@ class Viewport:
         # face culling stays OFF: a monster PAC's triangle winding is not consistent,
         # so culling drops whole plates. The shader's lambert is two-sided for the
         # same reason.
+        ref = self.reference if (self.reference is not None
+                                 and self.reference.visible) else None
+        ref_mvp = None if ref is None else self.camera.mvp(t.aspect, ref.model())
         if self.show_mesh and self.mesh is not None:
             self.mesh.render(mvp, wireframe=self.wireframe)
+            if ref is not None:
+                ref.mesh.render(ref_mvp, wireframe=self.wireframe)
         if self.show_skeleton and self.skeleton is not None:
             if self.skeleton_xray:
                 ctx.disable(ctx.DEPTH_TEST)
                 self.skeleton.render(mvp)
+                if ref is not None:
+                    ref.skeleton.render(ref_mvp)
                 ctx.enable(ctx.DEPTH_TEST)
             else:
                 self.skeleton.render(mvp)
+                if ref is not None:
+                    ref.skeleton.render(ref_mvp)
         if self.show_points:
             self._points.point_size = self.point_size
             self._points.render(mvp)
@@ -292,6 +435,7 @@ class Viewport:
     # ---- teardown ----------------------------------------------------- #
     def _release_scene(self) -> None:
         """Free the per-scene GL objects. Opening a second PAC must not leak them."""
+        self.clear_reference()
         for name in ("mesh", "skeleton"):
             obj = getattr(self, name, None)
             if obj is not None:

@@ -397,6 +397,43 @@ def test_every_framed_effect_site_in_em75_is_unattributed_and_says_so():
           % len(fx))
 
 
+def test_only_half_of_em75s_actions_name_a_clip_the_tigrex_pack_has():
+    """🔴 The finding the host-reference view (#34) has to be honest about.
+
+    `a1` IS the clip slot, so a pair's `a1` names the host's own animation for that
+    action — except that half of them name slots the host's PAC does not populate. A
+    view that quietly fell through to another a1, or showed the default pose without
+    saying so, would display the wrong animation for the action.
+    """
+    from mhfu_monster_editor.clips import clip_table
+    from mhfu_monster_editor.intel import find_intel
+
+    pac = os.path.join(_ROOT, "workspace", "extracted", "data_files", "file_06185.bin")
+    intel = find_intel(75, os.path.join(_ROOT, "species"))
+    if intel is None or not os.path.exists(pac):
+        print("SKIP: needs species/em75.json and the Tigrex PAC")
+        return
+    with open(pac, "rb") as fh:
+        host = clip_table(fh.read())
+    named = [p for p in intel if p.a1]
+    ok = [p for p in named if all(a in host for a in p.a1)]
+    none = [p for p in named if not any(a in host for a in p.a1)]
+    assert len(named) > 200, len(named)
+    assert 0.4 < len(ok) / len(named) < 0.6, (len(ok), len(named))
+    assert len(ok) + len(none) > len(named) * 0.95, "the split is not clean"
+
+    # the split is by SLOT NUMBER: the pack populates 64 slots in 1..98, and what the
+    # handlers name above ~84 is mostly not there.
+    missing = sorted({a for p in none for a in p.a1 if a not in host})
+    assert min(missing) >= 55 and sum(1 for a in missing if a >= 84) > len(missing) * 0.7
+    # and a computed a1 is far likelier to be one of the unresolvable ones
+    rate = lambda g: sum(1 for p in g if p.a1_computed) / len(g)      # noqa: E731
+    assert rate(none) > rate(ok) * 3, (rate(none), rate(ok))
+    print("host a1           %d/%d pairs name a slot the Tigrex pack has; %d name none "
+          "(computed-a1 rate %.0f%% vs %.0f%%)"
+          % (len(ok), len(named), len(none), 100 * rate(none), 100 * rate(ok)))
+
+
 def main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

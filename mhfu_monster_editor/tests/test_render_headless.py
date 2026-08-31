@@ -187,6 +187,58 @@ def test_draw_restores_the_framebuffer_binding(ctx):
     print("state             draw() restores the framebuffer binding AND the viewport")
 
 
+def test_the_reference_actor_stands_beside_the_port(ctx):
+    """Issue #34: a SECOND monster in the same viewport, offset along the flank axis.
+
+    Checked as pixels and as geometry, because "it drew something" and "it drew
+    something in the right place" are different claims: the reference has to widen the
+    framed bounds and light more of the picture, not overprint the first animal.
+    """
+    if not TIGREX.exists():
+        print("SKIP: no game data")
+        return
+    from mhfu_monster_editor.core import open_scene
+    from mhfu_monster_editor.render.viewport import Viewport
+
+    scene = open_scene(TIGREX)
+    with Viewport(ctx, (320, 240)) as vp:
+        vp.set_scene(scene)
+        alone = vp.bounds
+        vp.draw()
+        bg = np.array([int(round(c * 255)) for c in vp.background[:3]])
+        lit_alone = int((np.abs(vp.target.read()[..., :3].astype(int) - bg)
+                         .max(axis=2) > 12).sum())
+
+        ref = vp.set_reference(scene)            # itself, which is enough to place it
+        assert ref.offset[0] > 0 and ref.offset[1] == 0 and ref.offset[2] == 0, ref.offset
+        assert ref.offset[0] > alone.radius, "the two would overlap"
+        both = vp.bounds
+        assert both.radius > alone.radius, (both.radius, alone.radius)
+        assert both.hi[0] > alone.hi[0], "the union did not grow along the offset axis"
+
+        vp.draw()
+        lit_both = int((np.abs(vp.target.read()[..., :3].astype(int) - bg)
+                        .max(axis=2) > 12).sum())
+        assert lit_both > lit_alone, (lit_both, lit_alone)
+
+        # its transport is its OWN: same rate, its own cursor and its own end.
+        vp.play_reference_clip(scene.clips[0])
+        assert ref.playback.end == scene.clips[0].frames
+        vp.playback.speed = 3.0
+        vp.playback.playing = True
+        vp.tick(1.0)
+        assert ref.playback.speed == 3.0, "the rate is the action's and is shared"
+        assert ref.playback.phase > 0, "the reference did not advance"
+
+        vp.clear_reference()
+        assert vp.reference is None
+        # back to the port alone — compared against the port's CURRENT pose, not the
+        # one it had before `tick`, which moved it.
+        assert np.allclose(vp.bounds.hi, vp.mesh.bounds.hi), "the union outlived the reference"
+    print("reference         a second actor at +%.0f u widened the frame and lit "
+          "%d -> %d pixels" % (ref.offset[0], lit_alone, lit_both))
+
+
 def test_render_to_file(ctx):
     """`render_to_file` opens its OWN context — the ``--headless`` path end to end."""
     if not TIGREX.exists():
@@ -223,6 +275,7 @@ def main() -> int:
         test_read_is_top_down(ctx)
         test_viewport_draws_the_scene(ctx)
         test_draw_restores_the_framebuffer_binding(ctx)
+        test_the_reference_actor_stands_beside_the_port(ctx)
         test_render_to_file(ctx)
     finally:
         ctx.release()

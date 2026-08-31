@@ -22,6 +22,7 @@ picture and the `--headless` PNG the same pixels — see :mod:`..render.viewport
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional, Tuple
 
 from ..render.camera import VIEWS
@@ -90,6 +91,11 @@ class EditorApp:
         #: which overlay's action table the panel shows. None = the manifest's host.
         self._browse = None
         self._hosts = None
+        #: draw the HOST monster beside the port, playing the selected action's own
+        #: clip. Off by default: a second PAC parse and a second skinned mesh. → #34
+        self.show_host = False
+        self._host_scene = {}
+        self._host_clip = None
         #: the `(main, sub)` under inspection — a declared move's, or one being tried
         self._pair = None
         self._move = None
@@ -458,6 +464,86 @@ class EditorApp:
     def browsing_the_host(self) -> bool:
         return self.browsing_species == self.host_species
 
+    # ---- the host reference (issue #34) ------------------------------- #
+    def host_scene(self):
+        """The browsed species' own PAC, opened once. None with a reason in `status`.
+
+        🔴 This is the HOST, not the port: `file_0<species + 6110>`. It is what the
+        engine animates for the actions in the list, so it is the only thing that can
+        answer "what IS (1,13)" without a cold boot.
+        """
+        from ..manifest import SPECIES_TO_FRAME
+
+        species = self.browsing_species
+        if species in self._host_scene:
+            return self._host_scene[species]
+        root = getattr(self.startup, "root", None) or "workspace"
+        path = (Path(root) / "extracted" / "data_files"
+                / ("file_%05d.bin" % (species + SPECIES_TO_FRAME)))
+        scene = None
+        if not path.exists():
+            self._saved = "no host PAC at %s — docs/ASSETS.md" % path
+        else:
+            try:
+                from ..core import open_scene
+                scene = open_scene(path)
+            except Exception as e:                               # noqa: BLE001
+                self._saved = "%s: %s" % (type(e).__name__, e)
+        self._host_scene[species] = scene
+        return scene
+
+    def host_clip_table(self):
+        sc = self.host_scene()
+        return {} if sc is None else sc.clip_table()
+
+    def sync_reference(self) -> None:
+        """Make the viewport's reference agree with the toggle and the browsed species.
+
+        Called every frame from the Action panel, so flipping the checkbox or the
+        species combo is all it takes — there is no second place that has to remember.
+        """
+        vp = self.viewport
+        if vp is None:
+            return
+        want = self.host_scene() if self.show_host else None
+        have = None if vp.reference is None else vp.reference.scene
+        if want is have:
+            return
+        if want is None:
+            vp.clear_reference(frame_camera=True)
+            self._host_clip = None
+            return
+        vp.set_reference(want)
+        self._host_clip = None
+        self.follow_action()
+
+    def follow_action(self) -> None:
+        """Put the reference on the selected action's own clip, if one resolves.
+
+        ⚠️ A pair can name SEVERAL a1 (`(1,13)` -> 100, 101, 117, 118) and which one
+        runs depends on runtime state, so this takes the first that the host pack
+        actually populates and leaves the choice visible.
+        """
+        vp = self.viewport
+        if vp is None or vp.reference is None:
+            return
+        for a1 in self.host_a1():
+            if a1 in self.host_clip_table():
+                self.play_host_clip(a1)
+                return
+
+    def host_a1(self):
+        """The executor arguments the selected pair's handler passes, in order."""
+        al = self.alignment
+        return list(al.pair.a1) if (al is not None and al.pair is not None) else []
+
+    def play_host_clip(self, a1: int) -> None:
+        vp = self.viewport
+        if vp is None or vp.reference is None:
+            return
+        self._host_clip = a1
+        vp.play_reference_clip(vp.reference.scene.clip(a1), 0.0)
+
     def host_options(self):
         """Every overlay on this machine, summarised. Read once, then cached."""
         if self._hosts is None:
@@ -478,6 +564,7 @@ class EditorApp:
     def select_pair(self, main: int, sub: int, move=None) -> None:
         self._pair, self._move = (int(main), int(sub)), move
         self._recompute_alignment()
+        self.follow_action()
 
     def _recompute_alignment(self) -> None:
         """Re-join the host pair with whatever clip is on screen. Cheap; call freely.
@@ -541,6 +628,7 @@ class EditorApp:
                                "Open a ports/*.toml.")
             return
         self._species_row(imgui, m)
+        self.sync_reference()
         if self.intel is None:
             imgui.text_wrapped("no species/em%02d.json — build the action intel with:"
                                % self.browsing_species)
@@ -588,6 +676,16 @@ class EditorApp:
                 "into, so changing it is a rebuild."
                 % (cur, self.host_species))
             imgui.pop_style_color()
+        changed, self.show_host = imgui.checkbox("show em%02d beside the port"
+                                                 % cur, self.show_host)
+        if changed and not self.show_host:
+            self.sync_reference()
+        imgui.same_line()
+        imgui.text_disabled("what the action actually looks like")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Loads the host species' own PAC and plays the clip its "
+                              "handler passes to the executor, beside your port. Both "
+                              "run at the same rate; each loops at its OWN end.")
         self._hosts_table(imgui, ids)
 
     def _hosts_table(self, imgui, ids) -> None:
@@ -1377,6 +1475,7 @@ def _alignment_view(imgui, al, app) -> None:
     imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.92, 0.94, 0.98, 1.0))
     imgui.text_wrapped(plain(al.headline))
     imgui.pop_style_color()
+    _host_clip_row(imgui, al, app)
 
     # The findings are collapsed unless something is actually WRONG. They are prose,
     # a dozen of them is normal, and left open they push the pair table off the panel —
@@ -1402,6 +1501,53 @@ def _alignment_view(imgui, al, app) -> None:
                 imgui.text_disabled("handler 0x%08X   a1 %s" % (
                     al.pair.handler, ",".join(str(x) for x in al.pair.a1) or "-"))
             _species_effects(imgui, app)
+
+
+def _host_clip_row(imgui, al, app) -> None:
+    """Which clip the HOST plays for this action — the answer to "what IS (1,13)".
+
+    🔴 Only 110 of em75's 225 pairs that name an a1 name one the Tigrex's own pack
+    populates; the rest name slots 84+ that are simply not there (issue #34 has the
+    numbers). A missing one is drawn disabled and SAYS the slot is absent, because
+    silently falling through to another a1 would show the wrong animation for the
+    action — which is the one mistake this whole panel exists to prevent.
+    """
+    if al.pair is None or not al.pair.a1:
+        return
+    table = app.host_clip_table() if app.show_host else {}
+    imgui.text_disabled("host plays")
+    for a1 in al.pair.a1:
+        imgui.same_line()
+        if not app.show_host:
+            imgui.text_disabled(str(a1))
+            continue
+        if a1 not in table:
+            imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.60, 0.62, 0.68, 1.0))
+            imgui.text("%d?" % a1)
+            imgui.pop_style_color()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("the handler names a1 = %d and em%02d's pack has no "
+                                  "slot %d. Either the action is unreachable, or its "
+                                  "clip comes from somewhere this tool cannot see."
+                                  % (a1, app.browsing_species, a1))
+            continue
+        on = app._host_clip == a1
+        if imgui.small_button("%d%s##a%d" % (a1, " *" if on else "", a1)):
+            app.play_host_clip(a1)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("%d frames%s — which of the %d runs depends on runtime "
+                              "state" % (table[a1][0], ", loops" if table[a1][1] else "",
+                                         len(al.pair.a1)))
+    if app.show_host and table and not any(a in table for a in al.pair.a1):
+        # 🔴 Say it. The reference is still on its default pose, and a viewer who
+        # assumes that IS the action has been misled by the tool — the exact failure
+        # the panel exists to prevent.
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
+        imgui.text_wrapped("! none of this action's clips is in em%02d's pack, so the "
+                           "host beside you is showing its DEFAULT pose, not this "
+                           "action. 112 of em75's 225 pairs are like this — see #34."
+                           % app.browsing_species)
+        imgui.pop_style_color()
 
 
 def _finding_dots(imgui, al) -> None:
