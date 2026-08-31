@@ -1,0 +1,27 @@
+# mhfu_monster_editor — the OPTIONAL render/ui extras.
+#
+# The `manifest`, `intel`, `validate` and `core` layers do NOT need any of this:
+# manifest/intel are stdlib-only and core needs numpy alone. Install this file only to
+# draw something — the app (`python -m mhfu_monster_editor`) or a headless PNG.
+#
+#   pip install -r mhfu_monster_editor/requirements.txt
+
+numpy>=1.21.0            # `core` already requires it
+
+# render/ — OpenGL 3.3 core. macOS supplies 4.1 through Metal; Linux uses EGL or GLX
+# (Mesa's llvmpipe is enough, no GPU needed); Windows uses the driver's WGL.
+moderngl>=5.10
+
+# ui/ — Dear ImGui, with hello_imgui for the window, input, DPI and docking.
+#
+# 🔴 NOT moderngl-window. Its GLFW backend imports the `glfw` PyPI package, which
+# ships its own libglfw.3.dylib — and imgui-bundle ships another. Both in one macOS
+# process register the GLFW Objective-C classes twice ("may cause spurious casting
+# failures and mysterious crashes"). hello_imgui already provides the window, input,
+# DPI, docking and layout persistence that moderngl-window was wanted for, so the
+# second GLFW is simply not installed. See mhfu_monster_editor/ui/app.py.
+imgui-bundle>=1.92
+
+# render/target.py writes PNGs through Pillow when it is present and falls back to a
+# stdlib zlib encoder when it is not, so this is a convenience rather than a need.
+Pillow>=9.0.0
