@@ -74,6 +74,41 @@ def test_png_encoders_agree():
 # --------------------------------------------------------------------------- #
 # GL
 # --------------------------------------------------------------------------- #
+def test_hurtbox_surfaces_are_exact():
+    """The filled shell's maths, with no GL at all.
+
+    A capsule here is ONE sphere lattice whose centre moves with latitude — `b` above
+    the equator, `a` below, with the equator ring duplicated so the quads between the
+    two copies form the tube. That is compact and easy to get subtly wrong, so the
+    check is the definition: every vertex is exactly `radius` from the segment a..b.
+    """
+    from mhfu_monster_editor.render.hitboxes import (capsule_surface,
+                                                     sphere_surface)
+
+    s = sphere_surface((10.0, -5.0, 2.0), 100.0)
+    assert len(s) % 3 == 0 and len(s) > 100
+    r = np.linalg.norm(s - np.array([10.0, -5.0, 2.0]), axis=1)
+    assert np.allclose(r, 100.0), (r.min(), r.max())
+
+    a, b = np.array([0.0, 0.0, 0.0]), np.array([30.0, 0.0, 300.0])
+    c = capsule_surface(a, b, 50.0)
+    ab = b - a
+    t = np.clip(((c - a) @ ab) / float(ab @ ab), 0.0, 1.0)[:, None]
+    d = np.linalg.norm(c - (a + t * ab), axis=1)
+    assert np.allclose(d, 50.0), (d.min(), d.max())
+    # and it really is a capsule, not two loose spheres. The tube carries no vertices
+    # of its own — it is the quads BETWEEN the two duplicated equator rings — so the
+    # check is that some triangle spans the whole segment.
+    tri = t.reshape(-1, 3)
+    spans = (tri.min(axis=1) < 0.05) & (tri.max(axis=1) > 0.95)
+    assert spans.any(), "the two hemispheres are not joined by a tube"
+
+    # a zero-length capsule is a sphere, not a division by zero
+    assert len(capsule_surface((1, 2, 3), (1, 2, 3), 10.0)) == len(sphere_surface(
+        (1, 2, 3), 10.0))
+    print("hurtbox maths     sphere + capsule surfaces exact to the radius (no GL)")
+
+
 def test_target_reads_back_what_was_cleared(ctx):
     from mhfu_monster_editor.render.target import Target
 
@@ -239,6 +274,131 @@ def test_the_reference_actor_stands_beside_the_port(ctx):
           "%d -> %d pixels" % (ref.offset[0], lit_alone, lit_both))
 
 
+def test_the_hurtbox_gizmos_ride_the_pose(ctx):
+    """Issue #10: collision volumes on the LIVE posed skeleton.
+
+    The claim worth testing is not "spheres appeared" — it is that a volume follows
+    its bone's full matrix. A sphere placed at a bone-RELATIVE offset that only
+    tracked the joint ORIGIN would look correct at bind and drift the moment the bone
+    turned, which is exactly the fault a still picture cannot show.
+
+    Also checks the orphan count, because a volume on a bone the rig does not have is
+    drawn nowhere and would otherwise vanish silently — the failure mode of copying a
+    48-joint host's bone indices onto a 46-joint port.
+    """
+    if not TIGREX.exists():
+        print("SKIP: no game data")
+        return
+    from mhfu_monster_editor.core import open_scene
+    from mhfu_monster_editor.render.hitboxes import DIM_ALPHA, Volume
+    from mhfu_monster_editor.render.viewport import Viewport
+
+    scene = open_scene(TIGREX)
+    nb = scene.rig.n_bones
+    vols = [Volume(bone=2, radius=97.0, part=1, hitzone_row=2, a=(0.0, -30.0, 30.0)),
+            Volume(bone=6, radius=65.0, part=4, hitzone_row=5, a=(35.0, 0.0, 0.0),
+                   b=(330.0, 0.0, 0.0)),                        # a capsule
+            Volume(bone=nb + 5, radius=50.0, part=7)]           # off the rig
+    with Viewport(ctx, (320, 240)) as vp:
+        vp.set_scene(scene)
+        bg = np.array([int(round(c * 255)) for c in vp.background[:3]])
+
+        def lit():
+            vp.draw()
+            return int((np.abs(vp.target.read()[..., :3].astype(int) - bg)
+                        .max(axis=2) > 12).sum())
+
+        vp.show_mesh = vp.show_skeleton = vp.show_ground = False
+        assert lit() == 0, "something drew with every layer off"
+
+        ov = vp.set_hitboxes(vols)
+        assert ov is not None and vp.show_hitboxes
+        assert len(ov.orphans) == 1, ov.orphans
+        assert len(ov.shown()) == 2, "the orphan was drawn anyway"
+        assert lit() > 0, "the gizmos drew nothing"
+
+        # ride the pose: advance a clip and the volumes move with their bones
+        before = ov.world_centres().copy()
+        vp.play_clip(scene.clips[0])
+        vp.playback.playing = True
+        vp.tick(0.5)
+        after = ov.world_centres()
+        assert not np.allclose(before, after), "the volumes did not follow the pose"
+
+        # ... and they follow the bone's ROTATION, not just its origin. The offset
+        # from the joint has to change direction as the joint turns.
+        j0 = vp.skeleton.positions[2]
+        assert not np.allclose(after[0] - j0, before[0] - j0, atol=1e-6), \
+            "the offset stayed fixed in world space — the bone matrix was ignored"
+
+        # part isolation: hiding a part removes it from the draw and from picking
+        ov.set_visible_parts([1])
+        assert [v.part for v in ov.shown()] == [1]
+        lit_one_part = lit()
+        ov.set_visible_parts(None)
+        assert lit() > lit_one_part, "un-hiding a part did not draw more"
+
+        # Selecting a part does two things at once, and they pull the pixel count in
+        # OPPOSITE directions — the selection gains a filled shell while everything
+        # else drops to 5%. Measured together they very nearly cancel, so each is
+        # isolated instead.
+        ov.set_visible_parts([1])                    # the selection, alone
+        ov.set_selected_part(None)
+        outline_only = lit()
+        ov.set_selected_part(1)
+        filled = lit()                               # draws, so the shell is built
+        assert ov._fill.count > 0, "selecting a part did not build a shell"
+        assert filled > outline_only, "the filled shell lit no extra pixels"
+
+        ov.set_visible_parts([4])                    # a part that is NOT selected
+        dimmed = lit()
+        ov.set_selected_part(None)
+        assert lit() > dimmed, "an unselected part was not dimmed"
+
+        ov.set_visible_parts(None)
+        ov.set_selected_part(4)
+        lit()
+        assert ov._fill.count > 0, "the shell did not follow the selection"
+        ov.set_selected_part(None)
+        lit()
+        assert ov._fill.count == 0, "the shell outlived the selection"
+
+        # The HOST actor beside the port carries the gizmos too, on ITS rig — the
+        # comparison the side-by-side exists for. Attached in BOTH orders, because the
+        # Parts panel and the Action panel get used in either.
+        ov.set_selected_part(1)
+        vp.set_reference_hitboxes(vols[:2])
+        assert vp.reference is None, "no reference yet — this must not have made one"
+        both = vp.set_reference(scene)                 # ... attached afterwards
+        assert both.hitboxes is not None, "the reference did not pick the volumes up"
+        assert both.hitboxes.selected_part == 1, "the focus did not follow"
+        n_shown = len(both.hitboxes.shown())
+        # measured against the SAME camera with the host's gizmos off, since
+        # `set_reference` reframes on the union and that alone changes every count.
+        with_ref = lit()
+        vp.set_reference_hitboxes(None)
+        assert vp.reference.hitboxes is None
+        assert with_ref > lit(), "the reference's gizmos lit nothing"
+
+        vp.clear_reference()
+        vp.set_reference(scene)                        # attached FIRST this time
+        vp.set_reference_hitboxes(vols[:2])
+        assert vp.reference.hitboxes is not None, "the later volumes were dropped"
+        assert vp.reference.hitboxes.selected_part == 1
+        assert len(vp.reference.hitboxes.shown()) == n_shown, \
+            "the two attach orders produced different geometry"
+
+        vp.clear_hitboxes()
+        assert vp.hitboxes is None and not vp.show_hitboxes
+        assert vp.reference.hitboxes is None, "the reference kept its gizmos"
+        assert lit() == 0, "the gizmos outlived clear_hitboxes"
+        vp.clear_reference()
+    print("hurtboxes         %d volume(s), 1 orphan; centres moved with the pose and "
+          "with the bone's rotation; the selection fills, the rest dims to %d%%; "
+          "the host actor carries them on its own rig"
+          % (len(vols), round(DIM_ALPHA * 100)))
+
+
 def test_render_to_file(ctx):
     """`render_to_file` opens its OWN context — the ``--headless`` path end to end."""
     if not TIGREX.exists():
@@ -265,6 +425,7 @@ def test_render_to_file(ctx):
 
 def main() -> int:
     test_png_encoders_agree()
+    test_hurtbox_surfaces_are_exact()
     ctx = _context()
     if ctx is None:
         print("\ntest_render_headless: SKIPPED (no GL) — the camera maths is covered "
@@ -276,6 +437,7 @@ def main() -> int:
         test_viewport_draws_the_scene(ctx)
         test_draw_restores_the_framebuffer_binding(ctx)
         test_the_reference_actor_stands_beside_the_port(ctx)
+        test_the_hurtbox_gizmos_ride_the_pose(ctx)
         test_render_to_file(ctx)
     finally:
         ctx.release()

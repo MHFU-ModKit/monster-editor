@@ -303,6 +303,180 @@ class ActionIntel(Protocol):
     def pair(self, main: int, sub: int) -> Optional[PairIntel]: ...
 
 
+
+# --------------------------------------------------------------------------- #
+# the part system — `parts` in species/emNN.json (tools/mhfu_model/hitzone.py)
+# --------------------------------------------------------------------------- #
+#: the ten damage-type columns of a hitzone row, in file order.
+HITZONE_COLUMNS = ("raw", "cut", "impact", "shot",
+                   "fire", "water", "dragon", "thunder", "ice", "ko")
+#: how many hitzone rows a grid block has. `hitzone_row` on a sphere indexes this.
+HITZONE_ROWS = 7
+#: how many damage accumulators an entity has (`entity+0x3B8[8]`, `part & 7`).
+PART_SLOTS = 8
+
+SET_HURTBOX = "hurtbox"
+SET_VOLUME = "volume"
+
+
+@dataclass(frozen=True)
+class HitSphere:
+    """One collision volume on the host's rig: what a weapon can touch.
+
+    🔴 `part` and `hitzone_row` are DIFFERENT numbers. `part` is the damage
+    accumulator and the thing that breaks or severs; `hitzone_row` chooses which
+    row of percentages applies. A Tigrex wing is part 6 and row 5.
+    """
+    bone: int
+    part: int
+    hitzone_row: int
+    radius: float
+    shape: str = "sphere"
+    a: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    b: Optional[Tuple[float, float, float]] = None
+
+    @property
+    def is_capsule(self) -> bool:
+        return self.shape == "capsule"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HitSphere":
+        b = d.get("b")
+        return cls(bone=int(d["bone"]), part=int(d.get("part", 0)),
+                   hitzone_row=int(d.get("hitzone_row", 0)),
+                   radius=float(d.get("radius", 0.0)),
+                   shape=str(d.get("shape", "sphere")),
+                   a=tuple(float(v) for v in d.get("a", (0, 0, 0))),
+                   b=None if b is None else tuple(float(v) for v in b))
+
+
+@dataclass
+class HitboxSet:
+    """One sentinel-delimited run of spheres. A species has one to five."""
+    va: int
+    kind: str
+    spheres: List[HitSphere] = field(default_factory=list)
+
+    @property
+    def parts(self) -> List[int]:
+        return sorted({s.part for s in self.spheres})
+
+    @property
+    def bones(self) -> List[int]:
+        return sorted({s.bone for s in self.spheres})
+
+    def by_part(self) -> Dict[int, List[HitSphere]]:
+        out: Dict[int, List[HitSphere]] = {}
+        for s in self.spheres:
+            out.setdefault(s.part, []).append(s)
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HitboxSet":
+        return cls(va=_addr(d.get("va")) or 0, kind=str(d.get("kind", "")),
+                   spheres=[HitSphere.from_dict(x) for x in d.get("spheres", [])])
+
+
+@dataclass
+class HitzoneState:
+    """One `0x48` block: seven rows of ten percentages."""
+    va: int
+    rows: List[List[int]]
+
+    def row(self, i: int) -> List[int]:
+        return self.rows[i]
+
+    def value(self, row: int, column: str) -> int:
+        return self.rows[row][HITZONE_COLUMNS.index(column)]
+
+
+@dataclass
+class PartIntel:
+    """What the host species knows about being hit.
+
+    Two tables from two files, joined by `hitzone_row`: the overlay's collision
+    spheres and the species damage grid in `game_task.ovl`.
+
+    ⚠️ **The grid is SHARED.** It is species data, keyed by the species id, so a
+    port riding host 75 inherits the Tigrex grid and editing it changes the native
+    Tigrex too. The UI has to say that; `grid_note` carries the sentence.
+
+    ⚠️ **Neither table has ever been changed in a running game and verified**
+    (issue #19). `validated_in_game` is False and stays False until it is.
+    """
+    present: bool = False
+    sets: List[HitboxSet] = field(default_factory=list)
+    states: List[HitzoneState] = field(default_factory=list)
+    columns: Tuple[str, ...] = HITZONE_COLUMNS
+    column_provenance: Dict[str, str] = field(default_factory=dict)
+    species_row: Optional[int] = None
+    state_table: Optional[int] = None
+    grid_reason: str = ""
+    grid_note: str = ""
+    unclassified_runs: int = 0
+    validated_in_game: bool = False
+
+    @property
+    def has_grid(self) -> bool:
+        return bool(self.states)
+
+    @property
+    def hurtboxes(self) -> List[HitboxSet]:
+        """The sets a hit can resolve against — the ones that name parts."""
+        return [s for s in self.sets if s.kind == SET_HURTBOX]
+
+    @property
+    def n_states(self) -> int:
+        return len(self.states)
+
+    def spheres(self) -> List[HitSphere]:
+        """Every hurtbox sphere across every set, for drawing."""
+        return [s for st in self.hurtboxes for s in st.spheres]
+
+    def parts(self) -> List[int]:
+        return sorted({s.part for s in self.spheres()})
+
+    def bones_of_part(self, part: int) -> List[int]:
+        return sorted({s.bone for s in self.spheres() if s.part == part})
+
+    def rows_of_part(self, part: int) -> List[int]:
+        """Which hitzone row(s) the spheres of a part use.
+
+        Usually one. More than one means the part's spheres take DIFFERENT
+        percentages, which is real and is worth showing rather than averaging.
+        """
+        return sorted({s.hitzone_row for s in self.spheres() if s.part == part})
+
+    def inferred_columns(self) -> List[str]:
+        """Columns whose NAME is an inference. The five elements and the KO channel
+        were not read out of the game; they are `1 << (id+3)` plus a cross-check.
+        A UI that renders them like the disassembled ones is overclaiming."""
+        return [c for c in self.columns
+                if self.column_provenance.get(c, "").startswith("inferred")]
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> "PartIntel":
+        if not d or not d.get("present"):
+            return cls(present=False,
+                       grid_reason=(d or {}).get("reason", "no parts block — "
+                                                 "regenerate with tools/em_intel.py"))
+        g = d.get("grid") or {}
+        cols = tuple(g.get("columns") or HITZONE_COLUMNS)
+        return cls(
+            present=True,
+            sets=[HitboxSet.from_dict(x) for x in d.get("sets", [])],
+            states=[HitzoneState(va=_addr(s.get("va")) or 0,
+                                 rows=[list(r) for r in s.get("rows", [])])
+                    for s in g.get("states", [])],
+            columns=cols,
+            column_provenance=dict(g.get("column_provenance") or {}),
+            species_row=_addr(g.get("species_row")),
+            state_table=_addr(g.get("state_table")),
+            grid_reason="" if g.get("present") else str(g.get("reason", "")),
+            grid_note=str(g.get("note", "")),
+            unclassified_runs=int(d.get("unclassified_runs", 0)))
+
+
 # --------------------------------------------------------------------------- #
 class SpeciesIntel:
     """`species/emNN.json`, joined from all four offline analysers.
@@ -321,7 +495,8 @@ class SpeciesIntel:
                  enumerated_mains: Optional[Iterable[int]] = None,
                  main_states: Optional[List[dict]] = None,
                  unattributed_effects: Optional[List[dict]] = None,
-                 overlay: Optional[dict] = None) -> None:
+                 overlay: Optional[dict] = None,
+                 parts: Optional["PartIntel"] = None) -> None:
         self.host_species = int(host_species)
         self._by_pair: Dict[Tuple[int, int], PairIntel] = {
             (p.main, p.sub): p for p in pairs}
@@ -330,6 +505,8 @@ class SpeciesIntel:
         self.main_states = list(main_states or [])
         self.unattributed_effects = list(unattributed_effects or [])
         self.overlay = dict(overlay or {})
+        #: the part system — never None, so a caller never has to guard it
+        self.parts: PartIntel = parts if parts is not None else PartIntel()
         self.census_reason = census_reason
         self.census_transitions = int(census_transitions)
         if has_census is None:
@@ -443,7 +620,8 @@ class SpeciesIntel:
                    else int(census.get("transitions", 0)),
                    main_states=d.get("main_states"),
                    unattributed_effects=d.get("unattributed_effects"),
-                   overlay=d.get("overlay"))
+                   overlay=d.get("overlay"),
+                   parts=PartIntel.from_dict(d.get("parts")))
 
     @classmethod
     def from_path(cls, path: os.PathLike | str) -> "SpeciesIntel":
@@ -466,6 +644,12 @@ class SpeciesIntel:
                          + (" " + self.census_reason if self.census_reason else ""))
         lines.append("  %d pair(s) carry effect recipes; %d budget-gated"
                      % (len(self.pairs_with_effects()), len(self.budget_gated())))
+        pt = self.parts
+        if pt.present:
+            lines.append("  parts: %d sphere(s) over %d part(s); grid %s"
+                         % (len(pt.spheres()), len(pt.parts()),
+                            "%d state(s)" % pt.n_states if pt.has_grid
+                            else "ABSENT (%s)" % pt.grid_reason))
         return "\n".join(lines)
 
 

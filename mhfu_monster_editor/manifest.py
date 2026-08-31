@@ -142,14 +142,88 @@ class Move:
     allow_unentered: bool = False
 
 
+#: the ten damage-type columns of a hitzone row, in file order.
+#: `raw` and the five elements + `ko` are named by inference, not read out of the
+#: game — `tools/mhfu_model/hitzone.COLUMN_PROVENANCE` says which is which.
+HITZONE_COLUMNS = ("raw", "cut", "impact", "shot",
+                   "fire", "water", "dragon", "thunder", "ice", "ko")
+HITZONE_ROWS = 7
+#: `entity+0x3B8[8]`, and the deposit masks the sphere's part field with 7.
+PART_SLOTS = 8
+SHAPES = ("sphere", "capsule")
+
+
 @dataclass
 class Hurtbox:
-    """A bone-attached collision sphere — one `hitzone.Volume` (`0x28` record)."""
+    """One collision volume on the port's OWN rig: a sphere, or a capsule.
+
+    The host overlay's records are `0x28` bytes carrying two different indices, and
+    conflating them is the mistake this schema used to make:
+
+    * **`part`** (0..7) is the damage accumulator — `entity+0x3B8[part]` — and the
+      thing that breaks or severs.
+    * **`hitzone_row`** (0..6) chooses which row of `[[hitzone]]` percentages the hit
+      is multiplied by.
+
+    A Tigrex wing is part 6 and row 5. `offset` is BONE-RELATIVE, in engine units;
+    a capsule sweeps the sphere from `offset` to `to`.
+
+    ⚠️ Bone indices are indices into the rig THIS PORT SHIPS. Copying the host's
+    across attaches the head sphere to whatever joint happens to sit at that index.
+    """
     bone: int
     radius: float
-    #: optional back-reference into the separate WEAKNESS table; not part of the volume
     part: Optional[int] = None
+    hitzone_row: Optional[int] = None
+    shape: str = "sphere"
+    offset: Optional[List[float]] = None
+    #: capsule far end, bone-relative. Ignored for a sphere.
+    to: Optional[List[float]] = None
     label: str = ""
+
+    @property
+    def is_capsule(self) -> bool:
+        return self.shape == "capsule"
+
+
+@dataclass
+class Part:
+    """One of the eight damage accumulators, named.
+
+    The engine has no names for these — it has `entity+0x3B8[0..7]`. Naming them is
+    the whole point of writing them down: "part 6" is unreadable and "left wing" is
+    not, and the runtime move table and the break rules both key off the index.
+    """
+    name: str
+    index: int
+    #: the grid row this part's spheres read. Advisory: the row is per SPHERE and a
+    #: part may legitimately use more than one (Tigrex part 6 uses rows 3 and 5).
+    hitzone_row: Optional[int] = None
+    #: severable in the MH sense — the tail comes off. Recorded, NOT yet implemented:
+    #: the sever mechanic is deferred (`docs/BRUTE_TIGREX_PORT.md`).
+    severable: bool = False
+    label: str = ""
+
+
+@dataclass
+class HitzoneState:
+    """One `0x48` grid block: seven rows of ten percentages.
+
+    A species has one to three. The engine picks by `entity.s8[+0x481]`, which is
+    what makes "break it first and THEN it gets weak" expressible.
+
+    🔴 The grid is SPECIES data, shared map-wide. A port riding host 75 inherits the
+    native Tigrex's grid, so authoring one here is a statement about what the port
+    WANTS, not something the build can apply on its own — see `docs/ASSETS.md` and
+    issue #19. `validate` says so.
+    """
+    name: str
+    #: 7 rows x 10 columns, in `HITZONE_COLUMNS` order.
+    rows: List[List[int]] = field(default_factory=list)
+    label: str = ""
+
+    def value(self, row: int, column: str) -> int:
+        return self.rows[row][HITZONE_COLUMNS.index(column)]
 
 
 @dataclass
@@ -223,6 +297,8 @@ class PortManifest:
     clips: Dict[str, Clip] = field(default_factory=dict)
     moves: Dict[str, Move] = field(default_factory=dict)
     hurtboxes: List[Hurtbox] = field(default_factory=list)
+    parts: Dict[str, Part] = field(default_factory=dict)
+    hitzones: List[HitzoneState] = field(default_factory=list)
     effects: List[Effect] = field(default_factory=list)
     schema: int = SCHEMA
     #: where it was loaded from, when it was. Not part of identity — two manifests
@@ -311,6 +387,27 @@ def _need(d: dict, key: str, typ, where: str):
     return _typed(d[key], typ, "%s.%s" % (where, key))
 
 
+def _bounded(d: dict, key: str, where: str, limit: int) -> Optional[int]:
+    """An optional index that must land inside `0..limit-1`. Out of range is a typo,
+    not a policy question: a `hitzone_row` of 9 indexes past the end of a 0x48 block
+    and a `part` of 9 is silently folded to 1 by the engine's `& 7`."""
+    v = _opt(d, key, int, where)
+    if v is not None and not 0 <= v < limit:
+        raise ManifestError("%s.%s: %d is outside 0..%d" % (where, key, v, limit - 1))
+    return v
+
+
+def _vec3(d: dict, key: str, where: str) -> Optional[List[float]]:
+    v = d.get(key)
+    if v is None:
+        return None
+    v = _typed(v, list, "%s.%s" % (where, key))
+    if len(v) != 3:
+        raise ManifestError("%s.%s: %d value(s), not 3 (x, y, z in engine units)"
+                            % (where, key, len(v)))
+    return [float(x) for x in v]
+
+
 def _typed(v, typ, where: str):
     if typ is float and isinstance(v, int) and not isinstance(v, bool):
         return float(v)
@@ -354,9 +451,13 @@ _CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame",
               "labelled_build")
 _MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label",
               "allow_unentered")
-_HURTBOX_KEYS = ("bone", "radius", "part", "label")
+_HURTBOX_KEYS = ("bone", "radius", "part", "hitzone_row", "shape", "offset",
+                 "to", "label")
+_PART_KEYS = ("index", "hitzone_row", "severable", "label")
+_HITZONE_KEYS = ("state", "rows", "label")
 _EFFECT_KEYS = ("move", "frame", "id", "bone", "label")
-_TOP_KEYS = ("schema", "port", "source", "build", "clips", "moves", "hurtbox", "effect")
+_TOP_KEYS = ("schema", "port", "source", "build", "clips", "moves", "hurtbox",
+             "parts", "hitzone", "effect")
 
 
 def loads(text: str, *, path: Optional[os.PathLike | str] = None) -> PortManifest:
@@ -444,9 +545,56 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
         w = "hurtbox[%d]" % i
         h = _typed(h, dict, w)
         _reject_unknown(h, _HURTBOX_KEYS, w)
+        shape = _opt(h, "shape", str, w, "sphere")
+        if shape not in SHAPES:
+            raise ManifestError("%s: shape %r is not one of %s"
+                                % (w, shape, ", ".join(SHAPES)))
         hurtboxes.append(Hurtbox(
             bone=_need(h, "bone", int, w), radius=_need(h, "radius", float, w),
-            part=_opt(h, "part", int, w), label=_opt(h, "label", str, w, "")))
+            part=_bounded(h, "part", w, PART_SLOTS),
+            hitzone_row=_bounded(h, "hitzone_row", w, HITZONE_ROWS),
+            shape=shape, offset=_vec3(h, "offset", w), to=_vec3(h, "to", w),
+            label=_opt(h, "label", str, w, "")))
+
+    parts: Dict[str, Part] = {}
+    for pname, pd in sorted(_typed(raw.get("parts", {}), dict, where + ".parts").items()):
+        w = "parts.%s" % pname
+        pd = _typed(pd, dict, w)
+        _reject_unknown(pd, _PART_KEYS, w)
+        idx = _need(pd, "index", int, w)
+        if not 0 <= idx < PART_SLOTS:
+            raise ManifestError("%s: index %d is outside 0..%d — the engine masks "
+                                "the part field with 7" % (w, idx, PART_SLOTS - 1))
+        parts[pname] = Part(
+            name=pname, index=idx,
+            hitzone_row=_bounded(pd, "hitzone_row", w, HITZONE_ROWS),
+            severable=_opt(pd, "severable", bool, w, False),
+            label=_opt(pd, "label", str, w, ""))
+
+    hitzones = []
+    for i, hz in enumerate(_typed(raw.get("hitzone", []), list, where + ".hitzone")):
+        w = "hitzone[%d]" % i
+        hz = _typed(hz, dict, w)
+        _reject_unknown(hz, _HITZONE_KEYS, w)
+        rows = _typed(hz.get("rows", []), list, w + ".rows")
+        if len(rows) != HITZONE_ROWS:
+            raise ManifestError("%s: %d row(s), not %d — a grid block is seven rows "
+                                "of ten" % (w, len(rows), HITZONE_ROWS))
+        clean = []
+        for ri, row in enumerate(rows):
+            row = _typed(row, list, "%s.rows[%d]" % (w, ri))
+            if len(row) != len(HITZONE_COLUMNS):
+                raise ManifestError("%s.rows[%d]: %d value(s), not %d (%s)"
+                                    % (w, ri, len(row), len(HITZONE_COLUMNS),
+                                       ", ".join(HITZONE_COLUMNS)))
+            for v in row:
+                if not isinstance(v, int) or isinstance(v, bool) \
+                        or not 0 <= v <= 255:
+                    raise ManifestError("%s.rows[%d]: %r is not a percentage 0..255"
+                                        % (w, ri, v))
+            clean.append(list(row))
+        hitzones.append(HitzoneState(name=_need(hz, "state", str, w), rows=clean,
+                                     label=_opt(hz, "label", str, w, "")))
 
     effects = []
     for i, e in enumerate(_typed(raw.get("effect", []), list, where + ".effect")):
@@ -467,7 +615,8 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
         fid=_opt(port, "fid", int, "port"),
         orig=_opt(port, "orig", str, "port"),
         replace=_int_list(port, "replace", "port", []) or [],
-        clips=clips, moves=moves, hurtboxes=hurtboxes, effects=effects,
+        clips=clips, moves=moves, hurtboxes=hurtboxes, parts=parts,
+        hitzones=hitzones, effects=effects,
         schema=schema, path=Path(path) if path else None)
 
     # cross-references are structural: a move pointing at a clip that is not declared
@@ -598,12 +747,36 @@ def dumps(m: PortManifest) -> str:
             _kv(out, "allow_unentered", mv.allow_unentered)
         _kv(out, "label", mv.label)
 
+    for name in sorted(m.parts):
+        pt = m.parts[name]
+        out += ["", "[parts.%s]" % name]
+        _kv(out, "index", pt.index)
+        _kv(out, "hitzone_row", pt.hitzone_row)
+        if pt.severable:
+            _kv(out, "severable", pt.severable)
+        _kv(out, "label", pt.label)
+
     for h in m.hurtboxes:
         out += ["", "[[hurtbox]]"]
         _kv(out, "bone", h.bone)
         _kv(out, "radius", h.radius)
         _kv(out, "part", h.part)
+        _kv(out, "hitzone_row", h.hitzone_row)
+        if h.shape != "sphere":
+            _kv(out, "shape", h.shape)
+        _kv(out, "offset", h.offset)
+        _kv(out, "to", h.to)
         _kv(out, "label", h.label)
+
+    for hz in m.hitzones:
+        out += ["", "[[hitzone]]"]
+        _kv(out, "state", hz.name)
+        out.append("# " + "  ".join("%7s" % c for c in HITZONE_COLUMNS))
+        out.append("rows = [")
+        for row in hz.rows:
+            out.append("  [%s]," % ", ".join("%3d" % v for v in row))
+        out.append("]")
+        _kv(out, "label", hz.label)
 
     for e in m.effects:
         out += ["", "[[effect]]"]
@@ -614,6 +787,34 @@ def dumps(m: PortManifest) -> str:
         _kv(out, "label", e.label)
 
     return "\n".join(out).rstrip("\n") + "\n"
+
+
+def hurtbox_block(h: Hurtbox) -> str:
+    """One `[[hurtbox]]` block, as :func:`dumps` would write it."""
+    out: List[str] = ["[[hurtbox]]"]
+    _kv(out, "bone", h.bone)
+    _kv(out, "radius", h.radius)
+    _kv(out, "part", h.part)
+    _kv(out, "hitzone_row", h.hitzone_row)
+    if h.shape != "sphere":
+        _kv(out, "shape", h.shape)
+    _kv(out, "offset", h.offset)
+    _kv(out, "to", h.to)
+    _kv(out, "label", h.label)
+    return "\n".join(out)
+
+
+def hitzone_block(hz: HitzoneState) -> str:
+    """One `[[hitzone]]` block, with the column header as a comment."""
+    out: List[str] = ["[[hitzone]]"]
+    _kv(out, "state", hz.name)
+    _kv(out, "label", hz.label)
+    out.append("#        " + " ".join("%7s" % c for c in HITZONE_COLUMNS))
+    out.append("rows = [")
+    for i, row in enumerate(hz.rows):
+        out.append("  [%s],   # row %d" % (", ".join("%3d" % v for v in row), i))
+    out.append("]")
+    return "\n".join(out)
 
 
 def save(m: PortManifest, path: os.PathLike | str) -> Path:
@@ -679,7 +880,32 @@ class RenameClip:
     new: str
 
 
-Op = Any            # SetKey | RenameClip
+@dataclass(frozen=True)
+class AppendBlock:
+    """Append a whole `[[array]]` block to the end of the file.
+
+    `SetKey` addresses `[table.key]` and cannot reach an array of tables: a file has
+    many `[[hurtbox]]` blocks and the name does not say which. The editor writes
+    those wholesale instead — a hurtbox record and a hitzone grid are generated
+    numbers, not prose, so replacing one loses nothing a comment was carrying.
+    """
+    text: str
+
+
+@dataclass(frozen=True)
+class ReplaceBlock:
+    """Replace the ``index``-th `[[name]]` block with ``text`` (``None`` deletes it).
+
+    ⚠️ Comments INSIDE the replaced block are lost — it is rewritten, not edited.
+    Everything outside it, including the prose above the header, is untouched, which
+    is what keeps a hand-authored manifest readable after an editing session.
+    """
+    name: str
+    index: int
+    text: Optional[str] = None
+
+
+Op = Any            # SetKey | RenameClip | AppendBlock | ReplaceBlock
 
 
 def _value_end(rest: str, where: str) -> int:
@@ -816,6 +1042,45 @@ def _rename_clip(text: str, old: str, new: str) -> str:
     return text
 
 
+def _array_blocks(lines: List[str], name: str) -> List[tuple]:
+    """``[(header index, stop)]`` for each `[[name]]` block, in file order.
+
+    ``stop`` is one past the block's last CONTENT line, so the blank line and any
+    comment block introducing the next table stay outside — the same rule
+    :func:`_tables` uses, for the same reason.
+    """
+    heads = [(i, m.group("name"), line.lstrip().startswith("[["))
+             for i, line in enumerate(lines)
+             for m in (_TABLE_RE.match(line),) if m]
+    out = []
+    for k, (i, nm, is_arr) in enumerate(heads):
+        if not (is_arr and nm == name):
+            continue
+        end = heads[k + 1][0] if k + 1 < len(heads) else len(lines)
+        stop = end
+        while stop > i + 1 and (not lines[stop - 1].strip()
+                                or lines[stop - 1].lstrip().startswith("#")):
+            stop -= 1
+        out.append((i, stop))
+    return out
+
+
+def _replace_block(text: str, name: str, index: int, body: Optional[str]) -> str:
+    lines = text.split("\n")
+    blocks = _array_blocks(lines, name)
+    if not 0 <= index < len(blocks):
+        raise ManifestError("no [[%s]] block at index %d (the file has %d)"
+                            % (name, index, len(blocks)))
+    i, stop = blocks[index]
+    new = [] if body is None else body.rstrip("\n").split("\n")
+    return "\n".join(lines[:i] + new + lines[stop:])
+
+
+def _append_block(text: str, body: str) -> str:
+    out = text.rstrip("\n")
+    return out + "\n\n" + body.strip("\n") + "\n"
+
+
 def patch(text: str, ops: List[Op], *, path: Optional[os.PathLike | str] = None) -> str:
     """Apply ``ops`` to manifest TEXT, preserving comments, order and formatting.
 
@@ -829,6 +1094,10 @@ def patch(text: str, ops: List[Op], *, path: Optional[os.PathLike | str] = None)
             text = _rename_clip(text, op.old, op.new)
         elif isinstance(op, SetKey):
             text = _set_key(text, op.table, op.key, op.value)
+        elif isinstance(op, AppendBlock):
+            text = _append_block(text, op.text)
+        elif isinstance(op, ReplaceBlock):
+            text = _replace_block(text, op.name, op.index, op.text)
         else:                                                    # pragma: no cover
             raise TypeError("not a manifest op: %r" % (op,))
     loads(text, path=path)

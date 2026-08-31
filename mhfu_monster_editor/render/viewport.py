@@ -33,6 +33,7 @@ from .mesh import (ISOLATE_HIDE, ISOLATE_OFF, ISOLATE_ONLY, MODE_FLAT, MODE_TEXT
 from .overlay import (Ground, Lines, axes_geometry, bounds_geometry,
                       point_cloud_geometry)
 from .playback import Playback, pose_at
+from .hitboxes import HitboxOverlay, Volume, volumes_from
 from .skeleton import SkeletonOverlay
 from .target import SAMPLES, Target
 
@@ -82,12 +83,18 @@ def scene_bounds(scene) -> Bounds:
     return Bounds.union(*parts)
 
 
-def _pose_onto(scene, mesh, skeleton, clip, frame: float, strip_root: bool) -> None:
-    """Deform ``mesh`` and move ``skeleton`` onto one frame of ``clip``.
+def _pose_onto(scene, mesh, skeleton, clip, frame: float, strip_root: bool,
+               hitboxes=None) -> None:
+    """Deform ``mesh`` and move ``skeleton`` (and the hurtboxes) onto one frame.
 
     Shared by the port and the host reference so the two cannot drift into posing
     differently — the whole value of a side-by-side is that the only difference on
     screen is the DATA.
+
+    The hurtboxes take the full ``(n,4,4)`` matrices, not the joint positions: a
+    volume sits at a bone-RELATIVE offset, so it has to be rotated by its bone as
+    well as translated by it, and a sphere that only followed the joint origin would
+    look right at bind and drift the moment anything turned.
     """
     if clip is None:
         pose, driven = scene.bind_pose(), None
@@ -98,6 +105,8 @@ def _pose_onto(scene, mesh, skeleton, clip, frame: float, strip_root: bool) -> N
         mesh.set_pose(None if clip is None else pose)
     if skeleton is not None:
         skeleton.set_positions(pose.joints)
+    if hitboxes is not None:
+        hitboxes.set_pose(pose.world)
         skeleton.set_driven(driven)
 
 
@@ -122,9 +131,15 @@ class Reference:
     def __init__(self, ctx, scene, *, beside: Bounds, speed: float) -> None:
         self.scene = scene
         self.bind_bounds = scene_bounds(scene)
+        self.ctx = ctx
         self.mesh = SkinnedMesh(ctx, scene)
         self.skeleton = SkeletonOverlay(ctx, scene)
         self.skeleton.joint_size = max(4.0, min(9.0, self.bind_bounds.radius / 160.0))
+        #: the host's OWN hurtbox gizmos, on the rig the bone indices belong to. This
+        #: is the comparison the side-by-side exists for: the same table on the host
+        #: and on the port, so a sphere that lands on the wrong joint on YOUR rig has
+        #: the right one next to it to be wrong against.
+        self.hitboxes: Optional[HitboxOverlay] = None
         self.playback = Playback()
         self.playback.speed = speed
         self.clip = None
@@ -141,7 +156,8 @@ class Reference:
         if clip is None:
             self.clip = None
             self.playback.set_clip(_NO_CLIP)
-            _pose_onto(self.scene, self.mesh, self.skeleton, None, 0.0, strip_root)
+            _pose_onto(self.scene, self.mesh, self.skeleton, None, 0.0, strip_root,
+                       self.hitboxes)
             return
         c = self.scene.clip(clip)
         self.clip = c
@@ -151,7 +167,19 @@ class Reference:
 
     def pose(self, strip_root: bool) -> None:
         _pose_onto(self.scene, self.mesh, self.skeleton, self.clip,
-                   self.playback.phase, strip_root)
+                   self.playback.phase, strip_root, self.hitboxes)
+
+    def set_hitboxes(self, volumes, strip_root: bool = False
+                     ) -> Optional[HitboxOverlay]:
+        """Attach collision volumes to the REFERENCE's rig. ``None`` clears them."""
+        if self.hitboxes is not None:
+            self.hitboxes.release()
+            self.hitboxes = None
+        vols = volumes_from(volumes) if volumes else []
+        if vols:
+            self.hitboxes = HitboxOverlay(self.ctx, vols, self.scene.rig.n_bones)
+            self.pose(strip_root)
+        return self.hitboxes
 
     def tick(self, dt: float, *, strip_root: bool) -> bool:
         if self.clip is None:
@@ -174,10 +202,10 @@ class Reference:
         return m
 
     def release(self) -> None:
-        for obj in (self.mesh, self.skeleton):
+        for obj in (self.mesh, self.skeleton, self.hitboxes):
             if obj is not None:
                 obj.release()
-        self.mesh = self.skeleton = None
+        self.mesh = self.skeleton = self.hitboxes = None
 
 
 class Viewport:
@@ -195,6 +223,13 @@ class Viewport:
         # toggles the UI binds checkboxes straight to.
         self.show_mesh = True
         self.show_skeleton = True
+        #: the hurtbox gizmos (#10). Off by default — they are only meaningful once
+        #: a host or a manifest has supplied volumes, and an empty overlay would be
+        #: a checkbox that does nothing.
+        self.show_hitboxes = False
+        #: they live INSIDE the animal, so depth-testing them against the skin hides
+        #: every one. X-ray is the useful default, exactly as for the skeleton.
+        self.hitboxes_xray = True
         #: draw the skeleton THROUGH the mesh. On by default: an overlay you cannot
         #: see is not an overlay, and "which joint owns this plate" is the question
         #: the bone view exists to answer.
@@ -208,6 +243,11 @@ class Viewport:
 
         self.mesh: Optional[SkinnedMesh] = None
         self.skeleton: Optional[SkeletonOverlay] = None
+        self.hitboxes: Optional[HitboxOverlay] = None
+        #: the volumes handed to `set_reference_hitboxes`, kept so a reference
+        #: attached LATER still gets them — the Action panel loads the host actor
+        #: long after the Parts panel decided what to draw, and in the other order too.
+        self._ref_volumes = []
         #: the clip and frame the mesh is currently deformed to. ``clip is None`` = bind.
         self.clip = None
         self.frame = 0.0
@@ -262,13 +302,85 @@ class Viewport:
             # alone while a clip plays, or the camera would chase every frame.
             self.camera.frame(self.bounds).look("three")
 
+    # ---- hurtboxes (#10) ---------------------------------------------- #
+    def set_hitboxes(self, volumes) -> Optional[HitboxOverlay]:
+        """Attach collision volumes to the loaded rig and show them.
+
+        Accepts `intel.HitSphere`s (the host's own), `manifest.Hurtbox`es (the
+        port's authored ones) or `Volume`s. Returns the overlay so a caller can read
+        :attr:`HitboxOverlay.orphans` — volumes whose bone is off the end of THIS
+        rig, which is the fault this whole feature exists to expose and which is
+        invisible if they are quietly skipped.
+        """
+        if self.scene is None:
+            return None
+        if self.hitboxes is not None:
+            self.hitboxes.release()
+            self.hitboxes = None
+        vols = volumes_from(volumes)
+        if not vols:
+            self.show_hitboxes = False
+            return None
+        self.hitboxes = HitboxOverlay(self.ctx, vols, self.scene.rig.n_bones)
+        self.show_hitboxes = True
+        self.set_pose(self.clip, self.frame)          # place them on the live pose
+        return self.hitboxes
+
+    def set_reference_hitboxes(self, volumes) -> Optional[HitboxOverlay]:
+        """The volumes for the HOST actor beside the port.
+
+        Kept apart from :meth:`set_hitboxes` because the two actors do not draw the
+        same table: the reference is the host, so it draws the HOST's own volumes on
+        the rig those bone indices were written for, whatever the port has authored.
+        Remembered even with no reference attached, so the Parts panel and the Action
+        panel can be used in either order.
+        """
+        self._ref_volumes = list(volumes or [])
+        if self.reference is None:
+            return None
+        ov = self.reference.set_hitboxes(self._ref_volumes, self.strip_root)
+        if ov is not None and self.hitboxes is not None:
+            ov.set_selected_part(self.hitboxes.selected_part)
+            ov.set_visible_parts(self.hitboxes.visible_parts)
+        return ov
+
+    def sync_hitbox_focus(self) -> None:
+        """Push the port overlay's selection and part filter onto the reference.
+
+        Both actors have to answer the same question at once — isolating the head and
+        seeing it on only one of them is worse than not isolating at all.
+        """
+        if self.reference is None or self.reference.hitboxes is None \
+                or self.hitboxes is None:
+            return
+        self.reference.hitboxes.set_selected_part(self.hitboxes.selected_part)
+        self.reference.hitboxes.set_visible_parts(self.hitboxes.visible_parts)
+
+    def clear_hitboxes(self) -> None:
+        if self.hitboxes is not None:
+            self.hitboxes.release()
+        self.hitboxes = None
+        self.show_hitboxes = False
+        if self.reference is not None:
+            self.reference.set_hitboxes(None)
+        self._ref_volumes = []
+
+    def pick_hitbox(self, size, x: float, y: float, aspect: Optional[float] = None
+                    ) -> Optional[Volume]:
+        """The volume nearest a click, in PANEL pixels with ``y`` from the top."""
+        if self.hitboxes is None:
+            return None
+        a = float(size[0]) / max(1.0, float(size[1])) if aspect is None else aspect
+        return self.hitboxes.pick(self.camera.mvp(a), size, x, y)
+
     def set_pose(self, clip, frame: float = 0.0) -> None:
         """Deform the mesh and move the skeleton onto one frame. ``clip=None`` = bind."""
         if self.scene is None:
             return
         self.clip = clip
         self.frame = float(frame)
-        _pose_onto(self.scene, self.mesh, self.skeleton, clip, frame, self.strip_root)
+        _pose_onto(self.scene, self.mesh, self.skeleton, clip, frame,
+                   self.strip_root, self.hitboxes)
 
     def play_clip(self, clip, frame: Optional[float] = None) -> None:
         """Bind a clip to the transport and pose to it. ``frame=None`` keeps the cursor."""
@@ -294,6 +406,8 @@ class Viewport:
         self.reference = Reference(self.ctx, scene, beside=self.bind_bounds,
                                    speed=self.playback.speed)
         self.reference.pose(self.strip_root)
+        if self._ref_volumes:
+            self.set_reference_hitboxes(self._ref_volumes)
         if frame_camera:
             self.camera.frame(self.bounds)
         return self.reference
@@ -415,6 +529,16 @@ class Viewport:
                 self.skeleton.render(mvp)
                 if ref is not None:
                     ref.skeleton.render(ref_mvp)
+        if self.show_hitboxes:
+            ref_hb = None if ref is None else ref.hitboxes
+            if self.hitboxes_xray:
+                ctx.disable(ctx.DEPTH_TEST)
+            if self.hitboxes is not None:
+                self.hitboxes.render(mvp)
+            if ref_hb is not None:
+                ref_hb.render(ref_mvp)
+            if self.hitboxes_xray:
+                ctx.enable(ctx.DEPTH_TEST)
         if self.show_points:
             self._points.point_size = self.point_size
             self._points.render(mvp)
@@ -436,6 +560,7 @@ class Viewport:
     def _release_scene(self) -> None:
         """Free the per-scene GL objects. Opening a second PAC must not leak them."""
         self.clear_reference()
+        self.clear_hitboxes()
         for name in ("mesh", "skeleton"):
             obj = getattr(self, name, None)
             if obj is not None:

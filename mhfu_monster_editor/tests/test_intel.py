@@ -342,6 +342,89 @@ def test_available_and_survey_list_every_overlay_on_this_machine():
           "%d budget-gated)" % (len(hosts), big.pairs, big.timed, big.budget))
 
 
+
+# --------------------------------------------------------------------------- #
+# the part system (#10)
+# --------------------------------------------------------------------------- #
+def test_part_intel_is_never_none_so_a_caller_never_guards_it():
+    si = I.SpeciesIntel.from_dict({"host_species": 75, "pairs": []})
+    assert si.parts is not None
+    assert si.parts.present is False and si.parts.spheres() == []
+    assert si.parts.has_grid is False
+
+
+def test_a_sphere_keeps_part_and_row_apart():
+    s = I.HitSphere.from_dict({"bone": 12, "part": 6, "hitzone_row": 5,
+                               "radius": 90.0, "a": [-100.0, 0.0, 0.0]})
+    assert (s.part, s.hitzone_row) == (6, 5)
+    assert s.is_capsule is False and s.b is None
+
+
+def test_a_capsule_carries_its_far_end():
+    s = I.HitSphere.from_dict({"bone": 6, "part": 4, "hitzone_row": 5, "radius": 65.0,
+                               "shape": "capsule", "a": [35.0, 0, 0],
+                               "b": [330.0, 0, 0]})
+    assert s.is_capsule and s.b == (330.0, 0.0, 0.0)
+
+
+def test_only_the_sets_that_name_parts_count_as_hurtboxes():
+    """A part-less set is the thing a cold boot disproved: zeroing those four radii
+    did not stop damage. It must not be drawn as somewhere he can be hit."""
+    pt = I.PartIntel.from_dict({
+        "present": True,
+        "sets": [{"va": "0x09D58CD0", "kind": "hurtbox",
+                  "spheres": [{"bone": 2, "part": 1, "hitzone_row": 2, "radius": 97.0}]},
+                 {"va": "0x09D5EB48", "kind": "volume",
+                  "spheres": [{"bone": 10, "part": 0, "hitzone_row": 0,
+                               "radius": 150.0}]}],
+    })
+    assert len(pt.sets) == 2 and len(pt.hurtboxes) == 1
+    assert [s.bone for s in pt.spheres()] == [2]
+
+
+def test_a_part_may_use_more_than_one_hitzone_row_and_says_so():
+    """Tigrex part 6 uses rows 3 and 5 — its spheres take DIFFERENT percentages.
+    Averaging them, or reporting the first, would invent a number."""
+    si = I.find_intel(75)
+    if si is None or not si.parts.present:
+        return
+    assert si.parts.rows_of_part(6) == [3, 5], si.parts.rows_of_part(6)
+
+
+def test_the_inferred_column_names_are_flagged_as_inferred():
+    """Six of the ten column names were not read out of the game. A panel that
+    renders `thunder` the way it renders `cut` is overclaiming, and it can only
+    avoid that if the data marks them."""
+    si = I.find_intel(75)
+    if si is None or not si.parts.present:
+        return
+    inferred = si.parts.inferred_columns()
+    assert "thunder" in inferred and "ko" in inferred
+    assert "cut" not in inferred and "impact" not in inferred
+
+
+def test_the_tigrex_grid_comes_through_the_editor_layer_intact():
+    si = I.find_intel(75)
+    if si is None or not si.parts.present or not si.parts.has_grid:
+        return
+    pt = si.parts
+    assert pt.n_states == 2
+    assert len(pt.states[0].rows) == I.HITZONE_ROWS
+    assert all(len(r) == len(I.HITZONE_COLUMNS) for r in pt.states[0].rows)
+    assert pt.states[0].value(0, "cut") == 75
+    assert pt.states[0].value(0, "ko") == 110
+    assert pt.grid_note, "the shared-grid warning did not survive the join"
+
+
+def test_every_part_maps_to_bones_on_the_rig():
+    si = I.find_intel(75)
+    if si is None or not si.parts.present:
+        return
+    assert si.parts.parts() == list(range(8)), si.parts.parts()
+    for part in si.parts.parts():
+        assert si.parts.bones_of_part(part), "part %d has no bones" % part
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

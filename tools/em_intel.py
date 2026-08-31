@@ -63,6 +63,8 @@ import em_effects as fx                                             # noqa: E402
 import em_moveset as mvs                                            # noqa: E402
 import em_phase_map as pm                                           # noqa: E402
 import em_state_census as cs                                        # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent / "mhfu_model"))
+import hitzone as hz                                                # noqa: E402
 
 SCHEMA = "mhfu.species_intel/1"
 OUT_ROOT = Path("species")
@@ -320,8 +322,74 @@ def species_of(ov: Overlay) -> int:
     return int(name[2:])
 
 
+# --------------------------------------------------------------------------- #
+# the part system — the overlay's collision spheres, and the species damage grid
+# --------------------------------------------------------------------------- #
+GAME_TASK = "file_00070.bin"
+
+
+def _sphere(s: hz.Sphere) -> dict:
+    d = dict(bone=s.bone, shape=hz.CAPSULE if s.is_capsule else hz.SPHERE,
+             hitzone_row=s.hitzone_row, part=s.part_index,
+             radius=round(s.radius, 4), a=[round(v, 4) for v in s.a])
+    if s.is_capsule:
+        d["b"] = [round(v, 4) for v in s.b]
+    if s.flags:
+        d["flags"] = "0x%X" % s.flags
+    return d
+
+
+def parts_intel(ov: Overlay, species: int, game_task: Path | None) -> dict:
+    """The two halves of "where can he be hit, and for how much".
+
+    Both are STATIC — they are bytes in the ISO, like the moveset. Neither has ever
+    been changed in a running game and verified (issue #19), so the block says that
+    rather than implying the editor is authoring something proven to ship.
+    """
+    img = hz.Image.parse(Path(ov.path).read_bytes())
+    sets = hz.find_sets(img)
+    out = {
+        "present": True,
+        "source": "tools/mhfu_model/hitzone.py",
+        "note": "static: bytes in the ISO. NOT validated in game — no cold boot "
+                "has ever changed either table and confirmed the effect (#19).",
+        "sets": [
+            {"va": "0x%08X" % st.va, "kind": st.kind, "count": len(st.spheres),
+             "bones": st.bones, "parts": st.parts, "rows": st.rows,
+             "spheres": [_sphere(s) for s in st.spheres]}
+            for st in sets if st.kind != hz.KIND_UNKNOWN],
+        "unclassified_runs": sum(1 for st in sets if st.kind == hz.KIND_UNKNOWN),
+        "grid": {"present": False, "reason": "%s not found beside the overlay"
+                                             % GAME_TASK},
+    }
+    if game_task and game_task.exists():
+        grid_img = hz.Image.parse(game_task.read_bytes())
+        g = hz.species_hitzones(grid_img, species)
+        if g is None:
+            out["grid"] = {"present": False,
+                           "reason": "species %d has no hitzone state table at "
+                                     "row+0x2FC" % species}
+        else:
+            out["grid"] = {
+                "present": True,
+                "file": GAME_TASK,
+                "species_row": "0x%08X" % g.row_va,
+                "state_table": "0x%08X" % g.state_table_va,
+                "columns": list(hz.COLUMNS),
+                "column_provenance": dict(hz.COLUMN_PROVENANCE),
+                "element_bits": {k: "0x%X" % v for k, v in hz.ELEMENT_BITS.items()},
+                "states": [{"va": "0x%08X" % b.va,
+                            "rows": [list(r.values) for r in b.rows]}
+                           for b in g.states],
+                "note": "the grid is SHARED: it lives in species data, so a port "
+                        "riding this host inherits it and editing it changes the "
+                        "native monster too.",
+            }
+    return out
+
+
 def build(path: Path, census: dict | None = None,
-          census_reason: str = "") -> dict:
+          census_reason: str = "", game_task: Path | None = None) -> dict:
     ov = Overlay.load_file(path)
     species = species_of(ov)
     st = static_intel(ov)
@@ -395,6 +463,7 @@ def build(path: Path, census: dict | None = None,
         },
         "pairs": pairs_out,
         "unattributed_effects": st["unattributed_effects"],
+        "parts": parts_intel(ov, species, game_task),
     }
     if have:
         doc["census"].update(log=census["log"], since=census["since"],
@@ -432,6 +501,13 @@ def summarise(doc: dict) -> str:
         "  %d budget-gated, %d of them ownable by a slot-32 post-hook"
         % (len(budget), len(owned)),
     ]
+    pt = doc.get("parts") or {}
+    hb = [s for s in pt.get("sets", []) if s["kind"] == hz.KIND_HURTBOX]
+    g = pt.get("grid") or {}
+    out.append("  parts: %d hurtbox set(s), %d sphere(s); grid %s"
+               % (len(hb), sum(s["count"] for s in hb),
+                  "%d state(s)" % len(g["states"]) if g.get("present")
+                  else "ABSENT (%s)" % g.get("reason", "?")))
     c = doc["census"]
     if c["present"]:
         out.append("  census: %d transitions, %d pair(s) observed  (MEASURED)"
@@ -461,6 +537,9 @@ def main(argv: list[str] | None = None) -> int:
                          "census to another species would be a measured lie.")
     ap.add_argument("--no-census", action="store_true",
                     help="never attach measurements, even if a log has them")
+    ap.add_argument("--game-task", default="",
+                    help="game_task.ovl (file_00070.bin) — the species damage "
+                         "grid. Defaults to the overlay's own directory.")
     ap.add_argument("--quiet", "-q", action="store_true",
                     help="write the files without the per-species summary")
     a = ap.parse_args(argv)
@@ -507,7 +586,8 @@ def main(argv: list[str] | None = None) -> int:
             why = ("the census in %s was taken from species %s, not %d"
                    % (a.log, target, sp))
         try:
-            doc = build(p, mine, why)
+            gt = Path(a.game_task) if a.game_task else Path(p).parent / GAME_TASK
+            doc = build(p, mine, why, gt)
         except Exception as e:                                # pragma: no cover
             print("%s: %s" % (p, e), file=sys.stderr)
             rc = 1

@@ -94,6 +94,53 @@ def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None,
 
     app._viewport_panel = counted
 
+    # Drive the states a default-state run never reaches. The parts panel (#10) has
+    # three branches nobody sees on frame 1 — the port source with a staged session,
+    # an isolated part, and the EDITABLE grid — and each of them is a different pile
+    # of imgui calls. A smoke test that only ever exercises the opening state would
+    # have missed the panel that deleted its own helper methods in #8.
+    def exercise():
+        f = got["frames"]
+        if f == 1 and app.scene.manifest is None:
+            # the smoke scene is a bare host PAC, so the parts panel's port branch —
+            # a staged session, an EDITABLE grid, the save row — is unreachable.
+            # Attach a shipped manifest so those imgui calls actually run. Nothing
+            # here saves, so no file is touched.
+            man = _ROOT / "ports" / "zinogre.toml"
+            if man.exists():
+                from mhfu_monster_editor.manifest import load as _load
+                app.scene.attach_manifest(_load(man))
+                app._parts = None
+        if f == 2:
+            app.show_parts = True
+            app.sync_hitboxes()
+        elif f == 4:
+            app.selected_part = 1
+            if app.viewport is not None and app.viewport.hitboxes is not None:
+                app.viewport.hitboxes.set_selected_part(1)
+        elif f == 5:
+            # the host actor beside the port, WITH the gizmos already on: the
+            # branch where both overlays are alive at once.
+            app.show_host = True
+            app.sync_reference()
+        elif f == 6:
+            sess = app.part_session
+            host = app.host_parts()
+            if sess is not None and host is not None:
+                if host.has_grid:
+                    sess.adopt_grid(host.states)
+                sess.adopt_volumes(host.spheres()[:8])
+                app.parts_source = "port"
+                app.sync_hitboxes()
+
+    _counted = counted
+
+    def counted():                                            # noqa: F811
+        exercise()
+        _counted()
+
+    app._viewport_panel = counted
+
     def before_swap():
         """The finished frame, exactly as it is about to be presented.
 

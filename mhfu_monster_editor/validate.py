@@ -112,6 +112,75 @@ def validate(m: PortManifest, *, pac: Optional[bytes | os.PathLike | str] = None
     out += _check_derived(m)
     out += _check_pac(m, pac)
     out += _check_intel(m, intel)
+    out += _check_parts(m, intel)
+    return out
+
+
+def _check_parts(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
+    """The part system: names, rows, and the two things that are easy to believe
+    and wrong — that a part is a hitzone row, and that authoring a grid ships one."""
+    out: List[Issue] = []
+    by_index: Dict[int, List[str]] = {}
+    for name, pt in sorted(m.parts.items()):
+        by_index.setdefault(pt.index, []).append(name)
+    for idx, names in sorted(by_index.items()):
+        if len(names) > 1:
+            out.append(Issue(ERROR, "PART_INDEX_DUPLICATE", "parts",
+                             "%s all claim part %d. The index is the engine's "
+                             "`entity+0x3B8` slot; two names for one slot means two "
+                             "break bars that are secretly the same bar."
+                             % (", ".join(repr(n) for n in names), idx)))
+
+    named = {pt.index for pt in m.parts.values()}
+    for i, h in enumerate(m.hurtboxes):
+        if h.part is None:
+            out.append(Issue(WARNING, "HURTBOX_NO_PART", "hurtbox[%d]" % i,
+                             "no `part`, so a hit here deposits into slot 0 and "
+                             "cannot be told apart from any other unassigned "
+                             "volume. `hitzone_row` is a DIFFERENT field."))
+        elif m.parts and h.part not in named:
+            out.append(Issue(WARNING, "HURTBOX_PART_UNNAMED", "hurtbox[%d]" % i,
+                             "part %d has no entry in [parts], so nothing in this "
+                             "file says what it is." % h.part))
+        if h.is_capsule and h.to is None:
+            out.append(Issue(ERROR, "HURTBOX_CAPSULE_NO_END", "hurtbox[%d]" % i,
+                             "shape = \"capsule\" but no `to` — a capsule with no "
+                             "far end is a sphere at `offset`, so say which you "
+                             "mean."))
+
+    for hz in m.hitzones:
+        if all(v == 0 for row in hz.rows for v in row):
+            out.append(Issue(WARNING, "HITZONE_ALL_ZERO", "hitzone[%s]" % hz.name,
+                             "every percentage is 0, which is a monster nothing can "
+                             "hurt. Probably a stub that was never filled in."))
+    names = [hz.name for hz in m.hitzones]
+    for n in sorted(set(names)):
+        if names.count(n) > 1:
+            out.append(Issue(ERROR, "HITZONE_STATE_DUPLICATE", "hitzone",
+                             "two states are both called %r; the engine picks a "
+                             "state by INDEX (`entity+0x481`), so the name is the "
+                             "only way a human tells them apart." % n))
+
+    # what the host actually has, when we can see it
+    pt = getattr(intel, "parts", None)
+    if m.hitzones and pt is not None and getattr(pt, "has_grid", False):
+        if len(m.hitzones) != pt.n_states:
+            out.append(Issue(WARNING, "HITZONE_STATE_COUNT", "hitzone",
+                             "%d state(s) authored but host species %d ships %d. The "
+                             "state table's length is fixed by the host — an extra "
+                             "block has nothing to point at it."
+                             % (len(m.hitzones), getattr(intel, "host_species", -1),
+                                pt.n_states)))
+    if m.hitzones:
+        out.append(Issue(WARNING, "HITZONE_SHARED_AND_UNVALIDATED", "hitzone",
+                         "the damage grid is SPECIES data, shared map-wide: editing "
+                         "it changes the native host monster too, and no cold boot "
+                         "has ever changed it and confirmed the effect (#19). This "
+                         "records what the port WANTS."))
+    if m.hurtboxes and not m.parts:
+        out.append(Issue(WARNING, "PARTS_UNNAMED", "parts",
+                         "%d hurtbox volume(s) and no [parts] — nothing in this file "
+                         "says which part is the head." % len(m.hurtboxes)))
     return out
 
 

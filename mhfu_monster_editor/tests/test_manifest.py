@@ -352,6 +352,203 @@ def test_patch_edits_the_real_shipped_manifests_without_disturbing_them():
         assert set(m.clips) - set(before.clips) == {"newly_named"}
 
 
+
+# --------------------------------------------------------------------------- #
+# the part system (#10) — hurtbox volumes, named parts, the damage grid
+# --------------------------------------------------------------------------- #
+ROW = [100, 75, 65, 40, 0, 15, 5, 30, 20, 110]
+GRID = [ROW] + [[0] * 10 for _ in range(6)]
+
+
+def _hz(state="normal", rows=None):
+    rows = GRID if rows is None else rows
+    return ('\n[[hitzone]]\nstate = "%s"\nrows = [\n%s\n]\n'
+            % (state, "\n".join("  [%s]," % ", ".join(map(str, r)) for r in rows)))
+
+
+def test_a_part_and_a_hitzone_row_are_stored_as_different_fields():
+    """🔴 The correction #10 rests on. The host's 0x28 record carries BOTH: `part`
+    (0..7) is the damage accumulator that breaks, `hitzone_row` (0..6) chooses the
+    percentages. A Tigrex wing is part 6 and row 5."""
+    m = MF.loads(MINIMAL + """
+[parts.wing]
+index = 6
+hitzone_row = 5
+
+[[hurtbox]]
+bone = 12
+radius = 90.0
+part = 6
+hitzone_row = 5
+""")
+    h = m.hurtboxes[0]
+    assert (h.part, h.hitzone_row) == (6, 5)
+    assert m.parts["wing"].index == 6 and m.parts["wing"].hitzone_row == 5
+    assert MF.loads(MF.dumps(m)) == m
+
+
+def test_a_capsule_keeps_both_of_its_endpoints():
+    m = MF.loads(MINIMAL + """
+[[hurtbox]]
+bone = 6
+radius = 65.0
+shape = "capsule"
+offset = [35.0, 0.0, 0.0]
+to = [330.0, 0.0, 0.0]
+""")
+    h = m.hurtboxes[0]
+    assert h.is_capsule and h.offset == [35.0, 0.0, 0.0] and h.to == [330.0, 0.0, 0.0]
+    assert MF.loads(MF.dumps(m)) == m
+
+
+def test_a_sphere_does_not_emit_a_shape_key():
+    """`shape` defaults to "sphere", and writing the default into every record
+    would triple the size of a hurtbox block for no information."""
+    m = MF.loads(MINIMAL + "\n[[hurtbox]]\nbone = 1\nradius = 10.0\n")
+    assert "shape" not in MF.dumps(m)
+    assert MF.loads(MF.dumps(m)).hurtboxes[0].shape == "sphere"
+
+
+def test_a_grid_that_is_not_seven_by_ten_is_refused():
+    """A `0x48` block is seven rows of ten. Accepting eight rows would write past
+    the block and into the next state's."""
+    for rows, why in [(GRID[:6], "six rows"),
+                      (GRID + [[0] * 10], "eight rows"),
+                      ([[0] * 9] + GRID[1:], "a nine-wide row")]:
+        try:
+            MF.loads(MINIMAL + _hz(rows=rows))
+        except MF.ManifestError:
+            continue
+        raise AssertionError("%s was accepted" % why)
+
+
+def test_a_percentage_outside_a_byte_is_refused():
+    bad = [list(ROW) for _ in range(7)]
+    bad[3][1] = 300
+    try:
+        MF.loads(MINIMAL + _hz(rows=bad))
+    except MF.ManifestError as e:
+        assert "percentage" in str(e), e
+        return
+    raise AssertionError("a hitzone of 300 was accepted")
+
+
+def test_the_grid_round_trips_through_the_emitter():
+    """`dumps` writes the rows as a nested array with a column header comment. The
+    header is a comment, so it must not come back as data."""
+    m = MF.loads(MINIMAL + _hz())
+    text = MF.dumps(m)
+    assert "thunder" in text, "the column header did not survive"
+    back = MF.loads(text)
+    assert back == m
+    assert back.hitzones[0].value(0, "thunder") == 30
+    assert back.hitzones[0].value(0, "ko") == 110
+
+
+def test_a_part_outside_the_engines_eight_slots_is_refused():
+    """The deposit does `entity+0x3B8[part & 7]`, so part 9 is silently part 1.
+    Accepting it would give the author a break bar that shares another one."""
+    for text, why in [("[parts.x]\nindex = 9\n", "a part index of 9"),
+                      ("[[hurtbox]]\nbone=1\nradius=1.0\npart = 8\n",
+                       "a hurtbox part of 8"),
+                      ("[[hurtbox]]\nbone=1\nradius=1.0\nhitzone_row = 7\n",
+                       "a hitzone row of 7")]:
+        try:
+            MF.loads(MINIMAL + "\n" + text)
+        except MF.ManifestError:
+            continue
+        raise AssertionError("%s was accepted" % why)
+
+
+def test_an_unknown_shape_is_refused_rather_than_treated_as_a_sphere():
+    try:
+        MF.loads(MINIMAL + '\n[[hurtbox]]\nbone=1\nradius=1.0\nshape="box"\n')
+    except MF.ManifestError as e:
+        assert "sphere, capsule" in str(e), e
+        return
+    raise AssertionError("shape = \"box\" was accepted")
+
+
+def test_an_offset_must_be_three_numbers():
+    try:
+        MF.loads(MINIMAL + "\n[[hurtbox]]\nbone=1\nradius=1.0\noffset=[1.0, 2.0]\n")
+    except MF.ManifestError as e:
+        assert "not 3" in str(e), e
+        return
+    raise AssertionError("a two-component offset was accepted")
+
+
+def test_the_shipped_manifests_still_load_and_round_trip():
+    """The part block is additive: neither shipped port declares one, and adding the
+    schema must not change how they parse."""
+    for m in MF.discover(PORTS):
+        assert m.parts == {} and m.hitzones == []
+        assert MF.loads(MF.dumps(m)) == m
+
+
+
+def test_a_block_op_appends_a_hurtbox_without_touching_the_prose():
+    """`SetKey` addresses `[table.key]` and cannot reach an array of tables — a file
+    has many `[[hurtbox]]` blocks and the name does not say which. The block ops are
+    how the editor writes them, and the point of patching at all is that the
+    hand-authored comments survive."""
+    src = open(os.path.join(PORTS, "zinogre.toml"), encoding="utf-8").read()
+    h = MF.Hurtbox(bone=10, radius=150.0, part=1, hitzone_row=2, label="head")
+    out = MF.patch(src, [MF.AppendBlock(MF.hurtbox_block(h))])
+    m = MF.loads(out)
+    assert len(m.hurtboxes) == 1 and m.hurtboxes[0].part == 1
+    assert m.hurtboxes[0].hitzone_row == 2
+    assert out.count("#") >= src.count("#"), "comments were lost"
+    assert src.rstrip() in out.replace("\n\n[[hurtbox]]", "@@").replace("@@", "") \
+        or src.splitlines()[0] in out
+
+
+def test_replacing_a_grid_block_leaves_every_other_byte_alone():
+    rows = [[100, 75, 65, 40, 0, 15, 5, 30, 20, 110]] + [[0] * 10 for _ in range(6)]
+    src = open(os.path.join(PORTS, "zinogre.toml"), encoding="utf-8").read()
+    one = MF.patch(src, [MF.AppendBlock(
+        MF.hitzone_block(MF.HitzoneState(name="normal", rows=rows)))])
+    hotter = [list(r) for r in rows]
+    hotter[0][7] = 45
+    two = MF.patch(one, [MF.ReplaceBlock(
+        "hitzone", 0, MF.hitzone_block(MF.HitzoneState(name="normal", rows=hotter)))])
+    assert MF.loads(two).hitzones[0].value(0, "thunder") == 45
+    # everything before the block is byte for byte what it was
+    head = two[:two.index("[[hitzone]]")]
+    assert head == one[:one.index("[[hitzone]]")]
+
+
+def test_replacing_a_block_that_is_not_there_raises():
+    try:
+        MF.patch(MINIMAL, [MF.ReplaceBlock("hitzone", 0, "[[hitzone]]\nstate = \"x\"")])
+    except MF.ManifestError as e:
+        assert "no [[hitzone]] block" in str(e), e
+        return
+    raise AssertionError("replacing a nonexistent block was accepted")
+
+
+def test_a_block_op_that_would_produce_an_unloadable_file_raises_before_disk():
+    """`patch` re-parses its own output. A grid block with six rows is legal TOML and
+    an illegal manifest, and it must fail at the call, not on the next session."""
+    six = "[[hitzone]]\nstate = \"x\"\nrows = [\n" + \
+          "\n".join("  [%s]," % ", ".join(["0"] * 10) for _ in range(6)) + "\n]"
+    try:
+        MF.patch(MINIMAL, [MF.AppendBlock(six)])
+    except MF.ManifestError:
+        return
+    raise AssertionError("a six-row grid was written")
+
+
+def test_a_hurtbox_block_survives_a_round_trip_through_the_patcher():
+    """The emitter used by the patcher and the one used by `dumps` must agree, or the
+    editor writes records `dumps` would write differently."""
+    h = MF.Hurtbox(bone=6, radius=65.0, part=4, hitzone_row=5, shape="capsule",
+                   offset=[35.0, 0.0, 0.0], to=[330.0, 0.0, 0.0], label="left wing")
+    m = MF.loads(MF.patch(MINIMAL, [MF.AppendBlock(MF.hurtbox_block(h))]))
+    assert m.hurtboxes[0] == h
+    assert MF.hurtbox_block(h) in MF.dumps(m).replace("\n\n", "\n")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

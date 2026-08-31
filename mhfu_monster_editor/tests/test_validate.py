@@ -17,6 +17,7 @@ sys.path.insert(0, _ROOT)
 
 from mhfu_monster_editor import manifest as MF
 from mhfu_monster_editor import validate as V
+from mhfu_monster_editor import intel as INTEL
 
 BASE = """
 [port]
@@ -250,6 +251,83 @@ loop = false
         V.clip_table = real
     got = codes["CLIP_FRAMES_MISMATCH"]
     assert "now at slot 61, not 60" in got.message, got.message
+
+
+
+# --------------------------------------------------------------------------- #
+# the part system (#10)
+# --------------------------------------------------------------------------- #
+def _grid(state="normal", cell=None):
+    rows = [[0] * 10 for _ in range(7)]
+    if cell:
+        r, c, v = cell
+        rows[r][c] = v
+    return ('\n[[hitzone]]\nstate = "%s"\nrows = [\n%s\n]\n'
+            % (state, "\n".join("  [%s]," % ", ".join(map(str, r)) for r in rows)))
+
+
+def _report(m, **kw):
+    """Codes from a full validate() run — the part checks need the manifest, not a
+    pre-built issue list, so this is a different helper from `_codes` above."""
+    return {i.code for i in V.validate(m, **kw)}
+
+
+def test_two_names_for_one_part_index_is_an_error():
+    """The index IS the engine's break slot. Two names for slot 1 means two break
+    bars in the UI that are secretly one bar in the game."""
+    m = MF.loads(BASE + "\n[parts.head]\nindex = 1\n[parts.face]\nindex = 1\n")
+    assert "PART_INDEX_DUPLICATE" in _report(m)
+
+
+def test_a_hurtbox_with_no_part_warns_rather_than_silently_becoming_part_zero():
+    m = MF.loads(BASE + "\n[[hurtbox]]\nbone = 10\nradius = 150.0\n")
+    assert "HURTBOX_NO_PART" in _report(m)
+
+
+def test_a_capsule_without_a_far_end_is_an_error():
+    m = MF.loads(BASE + '\n[[hurtbox]]\nbone=1\nradius=1.0\nshape="capsule"\n')
+    assert "HURTBOX_CAPSULE_NO_END" in _report(m)
+
+
+def test_an_all_zero_grid_warns_that_nothing_can_hurt_him():
+    m = MF.loads(BASE + _grid())
+    assert "HITZONE_ALL_ZERO" in _report(m)
+
+
+def test_two_states_with_the_same_name_is_an_error():
+    """The engine picks a state by INDEX; the name is the only thing a human has."""
+    m = MF.loads(BASE + _grid("rage", (0, 1, 50)) + _grid("rage", (0, 1, 60)))
+    assert "HITZONE_STATE_DUPLICATE" in _report(m)
+
+
+def test_authoring_a_grid_always_says_it_is_shared_and_unproven():
+    """🔴 Two facts the author cannot be allowed to forget: the grid is species data
+    so it changes the native host too, and no cold boot has ever confirmed that
+    writing it does anything (#19)."""
+    m = MF.loads(BASE + _grid("normal", (0, 1, 75)))
+    issues = [i for i in V.validate(m) if i.code == "HITZONE_SHARED_AND_UNVALIDATED"]
+    assert len(issues) == 1
+    assert "native host" in issues[0].message and "#19" in issues[0].message
+
+
+def test_more_states_than_the_host_ships_warns_against_the_intel():
+    si = INTEL.find_intel(75)
+    if si is None or not si.parts.has_grid:
+        return
+    m = MF.loads(BASE + _grid("a", (0, 1, 5)) + _grid("b", (0, 1, 6))
+                 + _grid("c", (0, 1, 7)))
+    assert "HITZONE_STATE_COUNT" in _report(m, intel=si)
+    two = MF.loads(BASE + _grid("a", (0, 1, 5)) + _grid("b", (0, 1, 6)))
+    assert "HITZONE_STATE_COUNT" not in _report(two, intel=si)
+
+
+def test_hurtboxes_with_no_named_parts_warns_once():
+    m = MF.loads(BASE + "\n[[hurtbox]]\nbone=1\nradius=1.0\npart=1\n")
+    assert "PARTS_UNNAMED" in _report(m)
+    named = MF.loads(BASE + "\n[parts.head]\nindex=1\n"
+                     "\n[[hurtbox]]\nbone=1\nradius=1.0\npart=1\n")
+    codes = _report(named)
+    assert "PARTS_UNNAMED" not in codes and "HURTBOX_PART_UNNAMED" not in codes
 
 
 if __name__ == "__main__":
