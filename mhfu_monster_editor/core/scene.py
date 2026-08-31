@@ -311,6 +311,24 @@ class Scene:
             sc._attach_manifest_names(manifest)
         return sc
 
+    def attach_manifest(self, m: PortManifest) -> None:
+        """Re-bind the scene to a manifest — after the editor has written one back.
+
+        The PAC is unchanged; only the NAMES are, so nothing is re-read. Public
+        because issue #8 lets a session rename a clip and save, and the clip list has
+        to show the new name without reopening the file.
+        """
+        self.manifest = m
+        self._attach_manifest_names(m)
+
+    def clip_table(self) -> Dict[int, Tuple[int, bool]]:
+        """``{slot: (frames, loop)}`` — this PAC's clip fingerprints.
+
+        The same table :func:`mhfu_monster_editor.clips.clip_table` reads straight out
+        of a file, from a scene that is already open.
+        """
+        return {c.slot: (c.frames, c.loop) for c in self.clips}
+
     def _attach_manifest_names(self, m: PortManifest) -> None:
         by_slot: Dict[int, List[str]] = {}
         for c in m.clips.values():

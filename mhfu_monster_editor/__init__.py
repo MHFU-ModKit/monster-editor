@@ -5,6 +5,8 @@
   * :mod:`.intel` — `species/emNN.json`: what the HOST action expects per `(main,sub)`,
     joined from the offline analysers by `tools/em_intel.py`, with the provenance of
     every field. Stdlib only, like the manifest.
+  * :mod:`.clips` — what is in each animation slot (CARRIED / FILLER / HOST) and whether
+    a clip's NAME still points at the clip it was written for. Stdlib at import time.
   * :mod:`.validate` — the checks that need evidence (the built PAC, the action intel).
   * :mod:`.core` — a monster PAC as a render-agnostic :class:`~.core.scene.Scene`:
     skeleton, skinned geometry, textures, clips, ``pose(clip, frame)``. No GL, no UI.
@@ -14,7 +16,9 @@ re-exported here: it pulls in numpy and `tools/mhfu_model`, and the manifest lay
 meant to stay importable with neither. ``from mhfu_monster_editor.core import open_scene``.
 """
 from .manifest import (SCHEMA, Build, Clip, Effect, Hurtbox, ManifestError, Move,
-                       PortManifest, Source, discover, dumps, load, loads, save)
+                       PortManifest, RenameClip, SetKey, Source, discover, dumps, load,
+                       loads, patch, patch_file, save)
 
 __all__ = ["SCHEMA", "Build", "Clip", "Effect", "Hurtbox", "ManifestError", "Move",
-           "PortManifest", "Source", "discover", "dumps", "load", "loads", "save"]
+           "PortManifest", "RenameClip", "SetKey", "Source", "discover", "dumps",
+           "load", "loads", "patch", "patch_file", "save"]

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .clips import clip_table as _clip_table
 from .manifest import PortManifest, load as load_manifest
 from .intel import (ActionIntel, MIN_DWELL_TICKS, PairIntel,  # noqa: F401
                     SpeciesIntel, find_intel)
@@ -76,27 +77,11 @@ def _tools_on_path() -> None:
         sys.path.insert(0, tools)
 
 
-def clip_table(pac: bytes) -> Dict[int, tuple]:
-    """``{slot: (last_keyframe, loop)}`` for every populated slot of a built PAC.
-
-    Same derivation as `tools/port_clip_probe.py::pac_clip_table`; kept here so the
-    validator does not drag in that module's websockets/debugger imports.
-    """
-    _tools_on_path()
-    from mhfu_model import anim_ingame as ig
-    from mhfu_model.pac import MonsterPac
-
-    sub = MonsterPac.from_bytes(pac).find("anim")
-    if sub is None:
-        raise ValueError("no animation sub-resource in this PAC")
-    a = ig.parse_ingame(sub.data)
-    out: Dict[int, tuple] = {}
-    for slot in sorted({s for st in a.streams for s in st.clips}):
-        blk = next(st.clips[slot] for st in a.streams if slot in st.clips)
-        end = max((kf.frame for bn in blk.bones for ch in bn.channels
-                   for kf in ch.keyframes), default=0)
-        out[slot] = (end, blk.loop)
-    return out
+#: ``{slot: (last_keyframe, loop)}`` for every populated slot of a built PAC — the
+#: fingerprint this validator checks a manifest's clips against. Lives in
+#: :mod:`mhfu_monster_editor.clips` with the coverage classification that reads it, and
+#: is re-exported here because that is the name this module has always had it under.
+clip_table = _clip_table
 
 
 def bone_count(pac: bytes) -> int:
@@ -196,6 +181,11 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
         table = None
 
     if table is not None:
+        # where each named clip's fingerprint actually IS in this build, so a moved
+        # slot can be reported as moved instead of merely wrong. → #8
+        from .clips import AMBIGUOUS, MOVED, track_labels
+        moved = {t.name: t for t in track_labels(m, table)
+                 if t.status in (MOVED, AMBIGUOUS)}
         idle = table.get(1)
         for name in sorted(m.clips):
             c = m.clips[name]
@@ -205,8 +195,8 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
                                  "slot %d is not populated in this build. The porter "
                                  "files a source clip into the host slot of the SAME "
                                  "index, so a source clip the host pack has no slot "
-                                 "for is DROPPED — scripting it reaches nothing."
-                                 % c.slot))
+                                 "for is DROPPED — scripting it reaches nothing.%s"
+                                 % (c.slot, _relocated(moved, name))))
                 continue
             end, loop = table[c.slot]
             if c.frames is not None and c.frames != end:
@@ -214,7 +204,9 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
                                  "declared frames = %d, the build's slot %d ends at "
                                  "%d. Clips are stored unpadded at their authored "
                                  "length, so this is not rounding — the slot holds a "
-                                 "different clip." % (c.frames, c.slot, end)))
+                                 "different clip.%s"
+                                 % (c.frames, c.slot, end,
+                                    _relocated(moved, name))))
             if c.loop is not None and bool(c.loop) != bool(loop):
                 out.append(Issue(ERROR, "CLIP_LOOP_MISMATCH", w,
                                  "declared loop = %s, the build's slot %d has loop = %s"
@@ -225,6 +217,12 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
                                  "— the porter's filler. Forcing it plays IDLE, which "
                                  "on screen is identical to the override failing."
                                  % (c.slot, idle[0], bool(idle[1]))))
+            if c.label and not c.labelled_build:
+                out.append(Issue(WARNING, "LABEL_UNKEYED", w,
+                                 "the label records no build, and clip ids are per "
+                                 "build — so nothing can say whether it describes "
+                                 "slot %d's clip or an earlier build's. Re-label it "
+                                 "in the editor: it stamps the build." % c.slot))
 
     if m.hurtboxes or m.effects:
         try:
@@ -251,6 +249,12 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
                                      "joints; spawn_effect reads that bone's live "
                                      "world position." % (e.bone, nb)))
     return out
+
+
+def _relocated(moved: Dict[str, object], name: str) -> str:
+    """" — and where that clip went", when the fingerprint is elsewhere in the build."""
+    t = moved.get(name)
+    return "" if t is None else " " + t.message
 
 
 def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:

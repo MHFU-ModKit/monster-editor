@@ -245,6 +245,113 @@ def test_the_shipped_ports_survive_a_canonical_rewrite():
         assert MF.loads(MF.dumps(m)) == m, m.name
 
 
+# --------------------------------------------------------------------------- #
+# patch — the editor's write path (issue #8)
+# --------------------------------------------------------------------------- #
+COMMENTED = """# a header that must survive
+schema = 1
+
+[port]
+name = "test"      # trailing comments too
+host_species = 75
+pac = "test.bin"
+
+[source]
+model = 5339
+
+# a comment block that introduces the clips
+[clips.charge]
+slot = 61
+frames = 382       # measured against THIS build
+
+[moves.go]
+main = 2
+sub = 8
+clip = "charge"
+"""
+
+
+def _comments(text):
+    return [l for l in text.splitlines() if l.strip().startswith("#")]
+
+
+def test_patch_keeps_every_comment_and_touches_only_the_key_it_was_given():
+    """🔴 Why `dumps` is not the editor's write path.
+
+    `tomllib` drops comments, so re-emitting a hand-authored `ports/*.toml` destroys
+    the prose in it — and both shipped manifests are about half prose, carrying things
+    like "🔴 CLIP IDS ARE PER BUILD". The editor patches lines instead.
+    """
+    out = MF.patch(COMMENTED, [MF.SetKey("clips.charge", "label", "crazy charge")])
+    assert _comments(out) == _comments(COMMENTED), "a comment was lost"
+    before, after = COMMENTED.splitlines(), out.splitlines()
+    assert [l for l in after if l not in before] == ['label = "crazy charge"']
+    assert MF.loads(out).clips["charge"].label == "crazy charge"
+
+
+def test_patch_replaces_a_value_and_keeps_the_comment_after_it():
+    out = MF.patch(COMMENTED, [MF.SetKey("clips.charge", "frames", 264)])
+    assert "frames = 264       # measured against THIS build" in out, out
+    assert MF.loads(out).clips["charge"].frames == 264
+
+
+def test_patch_inserts_a_new_table_with_the_others_of_its_kind():
+    """A new `[clips.x]` belongs with the clips, not after the moves at the bottom."""
+    out = MF.patch(COMMENTED, [MF.SetKey("clips.roar", "slot", 53)])
+    lines = out.splitlines()
+    assert lines.index("[clips.roar]") < lines.index("[moves.go]"), out
+    assert MF.loads(out).clips["roar"].slot == 53
+
+
+def test_patch_removes_a_key_when_the_value_is_none():
+    out = MF.patch(COMMENTED, [MF.SetKey("clips.charge", "frames", None)])
+    assert MF.loads(out).clips["charge"].frames is None
+    assert _comments(out) == [l for l in _comments(COMMENTED)
+                             if "measured against" not in l]
+
+
+def test_a_rename_moves_the_table_and_the_reference_together():
+    out = MF.patch(COMMENTED, [MF.RenameClip("charge", "roar")])
+    m = MF.loads(out)
+    assert "roar" in m.clips and "charge" not in m.clips
+    assert m.moves["go"].clip == "roar", "the move still points at the old name"
+
+
+def test_a_patch_that_would_not_load_raises_instead_of_landing_on_disk():
+    """`patch` re-parses its own output. A dangling reference is caught HERE."""
+    try:
+        MF.patch(COMMENTED, [MF.SetKey("moves.go", "clip", "nope")])
+    except MF.ManifestError as e:
+        assert "nope" in str(e), e
+    else:
+        raise AssertionError("a move pointing at an undeclared clip was written")
+
+
+def test_strings_with_newlines_and_quotes_survive_the_patch():
+    """The editor writes free text: a label typed with a quote must round-trip."""
+    ugly = 'he said "spin", then\nfell over\ttwice'
+    out = MF.patch(COMMENTED, [MF.SetKey("clips.charge", "label", ugly)])
+    assert MF.loads(out).clips["charge"].label == ugly
+
+
+def test_patch_edits_the_real_shipped_manifests_without_disturbing_them():
+    for name in ("zinogre", "brute_tigrex"):
+        with open(os.path.join(PORTS, name + ".toml"), encoding="utf-8") as fh:
+            src = fh.read()
+        clip = sorted(MF.loads(src).clips)[0]
+        out = MF.patch(src, [
+            MF.SetKey("clips.%s" % clip, "labelled_build", "%s.bin@0badcafe" % name),
+            MF.SetKey("clips.newly_named", "slot", 57),
+            MF.SetKey("clips.newly_named", "frames", 120)])
+        assert _comments(out) == _comments(src), "%s lost a comment" % name
+        m, before = MF.loads(out), MF.loads(src)
+        assert m.clips[clip].labelled_build.endswith("@0badcafe")
+        assert m.clips["newly_named"].slot == 57
+        assert m.build == before.build and m.source == before.source
+        assert set(m.moves) == set(before.moves)
+        assert set(m.clips) - set(before.clips) == {"newly_named"}
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

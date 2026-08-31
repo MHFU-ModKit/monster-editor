@@ -67,6 +67,7 @@ symlink to a game dump that is never committed. Pass it to :func:`PortManifest.b
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,14 @@ class Clip:
     label: str = ""
     #: frame at which the move connects. Not derivable offline today — issue #4.
     impact_frame: Optional[int] = None
+    #: 🔴 WHICH BUILD this label was written against — `clips.build_id`, e.g.
+    #: ``"zinogre_v10.bin@8f3c1a02"``. Clip ids are per PAC build: the porter files a
+    #: source clip into the host slot of the SAME index, so rebuilding with a different
+    #: host frame or a different source shifts them, and a label with no build recorded
+    #: is a label that cannot be checked. `mhfu_monster_editor.clips.track_labels`
+    #: compares it against the build in front of you and says CARRIED / MOVED / LOST
+    #: instead of letting a stale name go on looking authoritative.
+    labelled_build: Optional[str] = None
 
 
 @dataclass
@@ -341,7 +350,8 @@ _PORT_KEYS = ("name", "host_species", "host_frame", "pac", "fid", "orig", "repla
 _SOURCE_KEYS = ("game", "em_id", "model", "geo", "anim")
 _BUILD_KEYS = ("source_skeleton", "skin", "ground_lift", "animated", "bone_offset",
                "skip_bones", "drop_joints", "nb", "hops", "reweight_undriven")
-_CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame")
+_CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame",
+              "labelled_build")
 _MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label",
               "allow_unentered")
 _HURTBOX_KEYS = ("bone", "radius", "part", "label")
@@ -414,7 +424,8 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
             name=cname, slot=_need(c, "slot", int, w),
             frames=_opt(c, "frames", int, w), loop=_opt(c, "loop", bool, w),
             label=_opt(c, "label", str, w, ""),
-            impact_frame=_opt(c, "impact_frame", int, w))
+            impact_frame=_opt(c, "impact_frame", int, w),
+            labelled_build=_opt(c, "labelled_build", str, w))
 
     moves: Dict[str, Move] = {}
     for mname, m in _typed(raw.get("moves", {}), dict, where + ".moves").items():
@@ -572,6 +583,7 @@ def dumps(m: PortManifest) -> str:
             _kv(out, "loop", c.loop)
         _kv(out, "impact_frame", c.impact_frame)
         _kv(out, "label", c.label)
+        _kv(out, "labelled_build", c.labelled_build)
 
     for name in sorted(m.moves):
         mv = m.moves[name]
@@ -614,3 +626,218 @@ def save(m: PortManifest, path: os.PathLike | str) -> Path:
 def discover(root: os.PathLike | str = "ports") -> List[PortManifest]:
     """Every `*.toml` under ``root``, sorted by filename."""
     return [load(p) for p in sorted(Path(root).glob("*.toml"))]
+
+
+# --------------------------------------------------------------------------- #
+# patch — edit a manifest's TEXT in place, keeping everything else byte for byte
+# --------------------------------------------------------------------------- #
+# :func:`dumps` re-emits a manifest from the parsed object, which is correct and
+# lossy: `tomllib` drops comments, so writing a hand-authored `ports/*.toml` back
+# through it destroys the prose. Both shipped manifests are about half comments, and
+# the comments are the part that carries knowledge —
+#
+#     # 🔴 CLIP IDS ARE PER BUILD. docs/brute_tigrex_anim_ids.txt was labelled by
+#     # filming an EARLIER Brute, and on `v67_hostslots` a1 = label - 1 ...
+#
+# — so the editor (issue #8) does not rewrite the file. It patches the LINES it is
+# changing and leaves every other byte alone, which also makes `git diff` after a
+# labelling session show the labels and nothing else.
+#
+# This is a text edit, not a TOML re-serialisation: it knows how to find a table, a
+# key inside it, and where a value ends. Anything it cannot locate unambiguously
+# raises rather than guessing, and :func:`patch` re-parses its own output before
+# returning, so a patch that would produce a file this loader cannot read fails at
+# the call instead of on disk.
+
+_TABLE_RE = re.compile(r"^\s*\[\[?\s*(?P<name>[^\[\]]+?)\s*\]\]?\s*(?:#.*)?$")
+_KEY_RE = re.compile(r"^(?P<indent>\s*)(?P<key>[A-Za-z0-9_\-]+|\"[^\"]*\")"
+                     r"(?P<eq>\s*=\s*)(?P<rest>.*)$")
+
+
+@dataclass(frozen=True)
+class SetKey:
+    """Set ``table.key`` to ``value``. ``value=None`` removes the key.
+
+    The table and the key are both created when missing — a new `[clips.<name>]` is
+    inserted after the last `[clips.*]` table so the file stays grouped.
+    """
+    table: str
+    key: str
+    value: Any
+
+
+@dataclass(frozen=True)
+class RenameClip:
+    """Rename `[clips.old]` to `[clips.new]`, and every `moves.*.clip` that named it.
+
+    Schema-aware on purpose: a clip's name is a *reference target*, so renaming the
+    table alone silently turns `clip = "charge"` into a dangling pointer — which
+    :func:`from_dict` would then refuse to load, on the next session, with no clue
+    that a rename caused it.
+    """
+    old: str
+    new: str
+
+
+Op = Any            # SetKey | RenameClip
+
+
+def _value_end(rest: str, where: str) -> int:
+    """Index in ``rest`` just past the value, so a trailing comment can be kept.
+
+    Handles what this schema emits: basic and literal strings, single-line arrays,
+    numbers and booleans. A value that does not finish on its line raises — a
+    multi-line array is legal TOML that nothing here writes, and truncating one would
+    corrupt the file.
+    """
+    i, n, depth = 0, len(rest), 0
+    while i < n:
+        ch = rest[i]
+        if ch == '"' or ch == "'":
+            quote, i = ch, i + 1
+            while i < n and rest[i] != quote:
+                i += 2 if (quote == '"' and rest[i] == "\\") else 1
+            if i >= n:
+                raise ManifestError("%s: unterminated string in %r" % (where, rest))
+            i += 1
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "#" and depth == 0:
+            break
+        i += 1
+    if depth:
+        raise ManifestError("%s: the value spans more than one line, which this "
+                            "patcher does not edit: %r" % (where, rest))
+    return len(rest[:i].rstrip())
+
+
+def _tables(lines: List[str]) -> Dict[str, tuple]:
+    """``{table name: (header index, first body line, stop)}`` for every `[table]`.
+
+    ``stop`` is one past the table's last *content* line, so blank lines and the
+    comment block that introduces the NEXT table stay outside it — inserting a key at
+    ``stop`` puts it under the keys it belongs with rather than under someone else's
+    heading. `[[array]]` tables are recognised (they end a table) but not addressed:
+    nothing the editor writes lives in one.
+    """
+    heads = [(i, m.group("name")) for i, line in enumerate(lines)
+             for m in (_TABLE_RE.match(line),) if m]
+    out: Dict[str, tuple] = {}
+    for k, (i, name) in enumerate(heads):
+        end = heads[k + 1][0] if k + 1 < len(heads) else len(lines)
+        stop = end
+        while stop > i + 1 and (not lines[stop - 1].strip()
+                                or lines[stop - 1].lstrip().startswith("#")):
+            stop -= 1
+        out.setdefault(name, (i, i + 1, stop))
+    return out
+
+
+def _find_key(lines: List[str], span: tuple, key: str) -> Optional[int]:
+    _, start, stop = span
+    for i in range(start, stop):
+        m = _KEY_RE.match(lines[i])
+        if m and m.group("key").strip('"') == key:
+            return i
+    return None
+
+
+def _set_key(text: str, table: str, key: str, value: Any) -> str:
+    lines = text.split("\n")
+    tables = _tables(lines)
+    where = "%s.%s" % (table, key)
+    span = tables.get(table)
+
+    if span is None:
+        if value is None:
+            return text
+        head = table.split(".")[0]
+        block = ["", "[%s]" % table, "%s = %s" % (key, _atom(value))]
+        at = max((sp[2] for name, sp in tables.items()
+                  if name == head or name.startswith(head + ".")), default=None)
+        if at is None:
+            at = len(lines)
+            while at and not lines[at - 1].strip():
+                at -= 1
+        lines[at:at] = block
+        return "\n".join(lines)
+
+    at = _find_key(lines, span, key)
+    if at is None:
+        if value is None:
+            return text
+        indent = ""
+        for i in range(span[1], span[2]):
+            m = _KEY_RE.match(lines[i])
+            if m:
+                indent = m.group("indent")
+        lines.insert(span[2], "%s%s = %s" % (indent, key, _atom(value)))
+        return "\n".join(lines)
+
+    if value is None:
+        del lines[at]
+        return "\n".join(lines)
+    m = _KEY_RE.match(lines[at])
+    rest = m.group("rest")
+    tail = rest[_value_end(rest, where):]
+    lines[at] = "%s%s%s%s%s" % (m.group("indent"), m.group("key"), m.group("eq"),
+                                _atom(value), tail)
+    return "\n".join(lines)
+
+
+def _rename_clip(text: str, old: str, new: str) -> str:
+    lines = text.split("\n")
+    tables = _tables(lines)
+    if ("clips." + old) not in tables:
+        raise ManifestError("cannot rename clips.%s: it is not in this file" % old)
+    if ("clips." + new) in tables:
+        raise ManifestError("cannot rename clips.%s to %r: that table already exists"
+                            % (old, new))
+    i = tables["clips." + old][0]
+    lines[i] = lines[i].replace("[clips.%s]" % old, "[clips.%s]" % new, 1)
+    text = "\n".join(lines)
+    for name, span in _tables(text.split("\n")).items():
+        if not name.startswith("moves."):
+            continue
+        at = _find_key(text.split("\n"), span, "clip")
+        if at is None:
+            continue
+        rows = text.split("\n")
+        m = _KEY_RE.match(rows[at])
+        rest = m.group("rest")
+        cut = _value_end(rest, name + ".clip")
+        if rest[:cut].strip() == _atom(old):
+            rows[at] = "%s%s%s%s%s" % (m.group("indent"), m.group("key"),
+                                       m.group("eq"), _atom(new), rest[cut:])
+            text = "\n".join(rows)
+    return text
+
+
+def patch(text: str, ops: List[Op], *, path: Optional[os.PathLike | str] = None) -> str:
+    """Apply ``ops`` to manifest TEXT, preserving comments, order and formatting.
+
+    Ops run in the order given, so a :class:`RenameClip` followed by a
+    :class:`SetKey` on the new name does what it reads like. The result is parsed
+    before it is returned: a patch that would write a file this loader cannot read
+    raises :class:`ManifestError` here rather than landing on disk.
+    """
+    for op in ops:
+        if isinstance(op, RenameClip):
+            text = _rename_clip(text, op.old, op.new)
+        elif isinstance(op, SetKey):
+            text = _set_key(text, op.table, op.key, op.value)
+        else:                                                    # pragma: no cover
+            raise TypeError("not a manifest op: %r" % (op,))
+    loads(text, path=path)
+    return text
+
+
+def patch_file(path: os.PathLike | str, ops: List[Op]) -> str:
+    """:func:`patch` a manifest on disk. Returns the new text; writes only on success."""
+    p = Path(path)
+    text = patch(p.read_text(encoding="utf-8"), ops, path=p)
+    p.write_text(text, encoding="utf-8")
+    return text

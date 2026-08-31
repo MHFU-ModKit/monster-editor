@@ -82,6 +82,14 @@ class EditorApp:
         self.markers = {}
         self._clip_filter = ""
         self._travel_cache = {}
+        #: `clips.Coverage` + `LabelTrack`s + the build id, computed once. → #8
+        self._vocab = None
+        #: `clips.LabelSession` — manifest edits typed here, not yet on disk
+        self._session = None
+        self._edit_slot = None
+        self._name_buf = ""
+        self._label_buf = ""
+        self._saved = ""
         #: the user's "Enable idling" setting, borrowed while a clip plays.
         self._idle_pref = None
 
@@ -328,9 +336,81 @@ class EditorApp:
                     vp.select_joint(None if sk.selected == j else j)
             imgui.end_child()
 
-    # ---- clips (issue #7) --------------------------------------------- #
+    # ---- the clip vocabulary (issue #8) ------------------------------- #
+    def vocabulary(self):
+        """Slot coverage, label health and the build id — computed once, on demand.
+
+        Reads two more files (the host pack and the donor moveset) to answer "what is
+        actually IN slot 37", so it is not done at construction: a session that never
+        opens the Clips panel never pays for it, and a machine missing either file
+        gets a partial report rather than an exception.
+        """
+        if self._vocab is None:
+            self._vocab = _vocabulary(self.scene, getattr(self.startup, "root", None))
+        return self._vocab
+
+    # ---- editing a label (issue #8) ----------------------------------- #
+    @property
+    def session(self):
+        """The labelling session — staging and saving live in `clips.LabelSession`.
+
+        Kept out of this file on purpose: the write path is the part of #8 worth
+        testing, and a test for it should not need a window.
+        """
+        if self._session is None and self.scene.manifest is not None:
+            from ..clips import LabelSession
+            self._session = LabelSession(self.scene.manifest, self.scene.clip_table(),
+                                         self.vocabulary().build)
+        return self._session
+
+    @property
+    def manifest_path(self):
+        m = self.scene.manifest
+        return None if m is None or m.path is None else m.path
+
+    def _pick_clip(self, slot: int) -> None:
+        """Select a slot for labelling and load its name/label into the boxes."""
+        from ..clips import clip_key
+
+        self._edit_slot = slot
+        s = self.session
+        entry = None if s is None else s.entry(slot)
+        self._name_buf = entry.name if entry else clip_key(slot)
+        self._label_buf = entry.label if entry else ""
+
+    def stage_label(self) -> str:
+        from ..manifest import ManifestError
+
+        s = self.session
+        if s is None or self._edit_slot is None:
+            return "no manifest to write to"
+        try:
+            msg = s.stage(self._edit_slot, self._name_buf, self._label_buf)
+        except ManifestError as e:
+            return str(e)
+        self.scene.attach_manifest(s.manifest)
+        self._vocab = None                  # the label health changed
+        return msg
+
+    def save_labels(self) -> str:
+        s = self.session
+        if s is None:
+            return "this scene has no manifest file"
+        try:
+            return s.save()
+        except Exception as e:                                   # noqa: BLE001
+            return "%s: %s" % (type(e).__name__, e)
+
+    # ---- clips (issues #7, #8) ---------------------------------------- #
     def _clips_panel(self) -> None:
-        """Every clip in the PAC: slot, frames, loop, driven joints, root travel."""
+        """Every clip in the PAC: what is in the slot, and what we call it.
+
+        The `cov` column is the one that is not obvious from the file. A **FILLER**
+        slot holds a copy of the idle clip — 30 of the built Zinogre's 64 do — and
+        forcing that a1 plays idle, which on screen is identical to the override
+        never firing. Every "the latch didn't work" report has to rule that out
+        first, and this is where it gets ruled out.
+        """
         from imgui_bundle import imgui
 
         vp = self.viewport
@@ -341,10 +421,21 @@ class EditorApp:
         if not clips:
             imgui.text_disabled("this PAC has no animation sub-resource")
             return
+        vocab = self.vocabulary()
 
         imgui.text("%d clips" % len(clips))
         imgui.same_line()
         imgui.text_disabled("%d looping" % sum(1 for c in clips if c.loop))
+        if vocab.build:
+            imgui.text_disabled(vocab.build)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("the build a label typed here is keyed to. Clip ids "
+                                  "are PER BUILD: rebuild and they shift.")
+        _coverage_line(imgui, vocab)
+        for n in vocab.notes:
+            imgui.text_disabled("• %s" % n)
+        _label_health(imgui, vocab)
+
         _, self._clip_filter = imgui.input_text("##filter", self._clip_filter)
         imgui.same_line()
         imgui.text_disabled("filter")
@@ -353,10 +444,17 @@ class EditorApp:
                  | imgui.TableFlags_.row_bg.value
                  | imgui.TableFlags_.scroll_y.value
                  | imgui.TableFlags_.sizing_stretch_prop.value)
-        if not imgui.begin_table("##clips", 5, flags):
+        # leave room for the label editor under the table; it is the point of #8 and
+        # must not be the thing that scrolls off the bottom.
+        editor_h = 150.0 if self.scene.manifest is not None else 34.0
+        if not imgui.begin_table("##clips", 6, flags,
+                                 imgui.ImVec2(0.0, -editor_h)):
             return
-        for name, w in (("slot", 0.6), ("frames", 0.8), ("s", 0.6), ("loop", 0.5),
-                        ("travel", 0.9)):
+        # `a1` gets its own column even when the clip is named: the executor argument
+        # IS the slot index, so it is the number a mod script types, and a renamed
+        # clip ("charge") no longer carries it in its name.
+        for name, w in (("a1", 0.45), ("name", 1.0), ("cov", 0.7), ("frames", 0.75),
+                        ("loop", 0.45), ("travel", 0.6)):
             imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
         imgui.table_setup_scroll_freeze(0, 1)
         imgui.table_headers_row()
@@ -364,20 +462,37 @@ class EditorApp:
         needle = self._clip_filter.strip().lower()
         current = vp.clip.slot if vp.clip is not None else None
         for c in clips:
-            label = "%d %s" % (c.slot, " ".join(c.names))
+            cov = vocab.coverage.slots.get(c.slot)
+            label = "%d %s %s" % (c.slot, " ".join(c.names),
+                                  (cov.kind if cov else ""))
+            entry = self._manifest_clip(c.slot)
+            if entry is not None:
+                label += " " + entry.label
             if needle and needle not in label.lower():
                 continue
             imgui.table_next_row()
             imgui.table_next_column()
-            name = c.name if c.names else str(c.slot)
             if imgui.selectable(
-                    "%s##c%d" % (name, c.slot), current == c.slot,
+                    "%d##c%d" % (c.slot, c.slot), current == c.slot,
                     imgui.SelectableFlags_.span_all_columns.value)[0]:
                 vp.play_clip(c)
+                self._pick_clip(c.slot)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("%s\n%.2f s at speed %.2f%s"
+                                  % (cov.why() if cov else "no coverage verdict",
+                                     wall_clock(c.frames, vp.playback.speed),
+                                     vp.playback.speed,
+                                     "\n" + entry.label if entry and entry.label
+                                     else ""))
+            imgui.table_next_column()
+            if c.names:
+                imgui.text(c.name)
+            else:
+                imgui.text_disabled("—")
+            imgui.table_next_column()
+            _coverage_cell(imgui, cov)
             imgui.table_next_column()
             imgui.text(str(c.frames))
-            imgui.table_next_column()
-            imgui.text("%.1f" % wall_clock(c.frames, vp.playback.speed))
             imgui.table_next_column()
             imgui.text("loop" if c.loop else "")
             imgui.table_next_column()
@@ -386,6 +501,54 @@ class EditorApp:
             if not c.whole_rig and imgui.is_item_hovered():
                 imgui.set_tooltip("partial: present in only some joint-partition streams")
         imgui.end_table()
+        imgui.separator()
+        self._label_editor()
+
+    def _manifest_clip(self, slot: int):
+        m = self.scene.manifest
+        if m is None:
+            return None
+        return next((c for c in m.clips.values() if c.slot == slot), None)
+
+    def _label_editor(self) -> None:
+        """Name a clip, and put the name in the manifest keyed to THIS build. → #8"""
+        from imgui_bundle import imgui
+
+        m = self.scene.manifest
+        if m is None:
+            imgui.text_disabled("labels need a manifest — open a ports/*.toml")
+            return
+        if self._edit_slot is None:
+            imgui.text_disabled("pick a clip to name it")
+            return
+        slot = self._edit_slot
+        cov = self.vocabulary().coverage.slots.get(slot)
+        imgui.text("slot %d" % slot)
+        imgui.same_line()
+        _coverage_cell(imgui, cov)
+        if cov is not None and imgui.is_item_hovered():
+            imgui.set_tooltip(cov.why())
+
+        imgui.set_next_item_width(-64.0)
+        _, self._name_buf = imgui.input_text("name", self._name_buf)
+        imgui.set_next_item_width(-64.0)
+        _, self._label_buf = imgui.input_text("label", self._label_buf)
+
+        if imgui.button("stage"):
+            self._saved = self.stage_label()
+        imgui.same_line()
+        pending = self.session.pending if self.session else 0
+        if pending:
+            if imgui.button("save %d to %s" % (pending, self.manifest_path.name)):
+                self._saved = self.save_labels()
+            imgui.same_line()
+            if imgui.button("discard"):
+                self.session.discard()
+                self._saved = "discarded the pending edits (the file was not touched)"
+        else:
+            imgui.text_disabled("nothing pending")
+        if self._saved:
+            imgui.text_wrapped(self._saved)
 
     def _travel(self, clip):
         """`root_travel`, cached — it evaluates the clip, so not once per frame."""
@@ -624,6 +787,119 @@ def _framebuffer_scale() -> float:
     from imgui_bundle import imgui
     fb = imgui.get_io().display_framebuffer_scale
     return float(max(fb.x, 1.0))
+
+
+# --------------------------------------------------------------------------- #
+# the clip vocabulary (issue #8)
+# --------------------------------------------------------------------------- #
+#: how a slot's coverage verdict is painted. FILLER is the one that has to be loud:
+#: it is a successful override onto the idle clip, and it looks exactly like failure.
+_COV_COLOR = {"CARRIED": (0.55, 0.82, 0.55, 1.0),
+              "FILLER": (0.98, 0.70, 0.20, 1.0),
+              "HOST": (0.60, 0.72, 0.98, 1.0),
+              "ALTERED": (0.90, 0.55, 0.95, 1.0),
+              "UNKNOWN": (0.55, 0.58, 0.64, 1.0)}
+
+
+def _vocabulary(scene, root: Optional[str] = None):
+    """Read the two companion packs and classify the open one's slots.
+
+    A missing companion is a NOTE, never an exception: `workspace/` is a machine-local
+    symlink into a game dump, so a checkout without the donor moveset must still open
+    the editor — it just cannot tell a carried clip from the porter's filler, and says
+    so instead of guessing.
+    """
+    from ..clips import build_id, clip_table, source_clip_table, survey
+
+    m, notes = scene.manifest, []
+    build = None
+    if scene.path is not None:
+        try:
+            build = build_id(scene.path)
+        except OSError as e:                                     # pragma: no cover
+            notes.append("no build id: %s" % e)
+    host = source = None
+    if m is not None and scene.game == "mhfu":
+        for what, path, reader in (
+                ("host pack", m.host_pac_path(root or "workspace"), clip_table),
+                ("donor moveset", m.source_paths(root or "workspace")["anim"],
+                 source_clip_table)):
+            if not path.exists():
+                notes.append("no %s at %s — docs/ASSETS.md" % (what, path))
+                continue
+            try:
+                got = reader(path.read_bytes())
+            except Exception as e:                               # noqa: BLE001
+                notes.append("%s unreadable (%s)" % (what, e))
+                continue
+            if reader is clip_table:
+                host = got
+            else:
+                source = got
+    elif m is None:
+        notes.append("no manifest: slots cannot be classified, and a label typed here "
+                     "would have nowhere to go")
+    elif scene.game != "mhfu":
+        notes.append("this is the DONOR pack — coverage describes a built port")
+    return survey(m, scene.clip_table(), host, source, build, notes)
+
+
+def _is_bare_key(name: str) -> bool:
+    """A TOML bare key, which is what `[clips.<name>]` needs the typed name to be."""
+    return bool(name) and all(ch.isalnum() or ch in "-_" for ch in name)
+
+
+def _coverage_line(imgui, vocab) -> None:
+    n = vocab.coverage.counts()
+    if not vocab.coverage.has_source:
+        return
+    bits = [("%d carried" % n["CARRIED"], "CARRIED"),
+            ("%d filler" % n["FILLER"], "FILLER"),
+            ("%d host" % n["HOST"], "HOST"),
+            ("%d altered" % n["ALTERED"], "ALTERED")]
+    for i, (text, kind) in enumerate(bits):
+        if i:
+            imgui.same_line()
+        if not n[kind]:
+            imgui.text_disabled(text)
+            continue
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(*_COV_COLOR[kind]))
+        imgui.text(text)
+        imgui.pop_style_color()
+    if vocab.coverage.dropped:
+        imgui.text_disabled("%d donor clip(s) dropped: %s"
+                            % (len(vocab.coverage.dropped),
+                               ", ".join(str(s) for s
+                                         in sorted(vocab.coverage.dropped))))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("the host pack has no slot of that index, so the "
+                              "porter had nowhere to file them. They are not in "
+                              "this build at all.")
+
+
+def _coverage_cell(imgui, cov) -> None:
+    if cov is None:
+        imgui.text_disabled("-")
+        return
+    imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(*_COV_COLOR[cov.kind]))
+    imgui.text(cov.kind[:7].lower())
+    imgui.pop_style_color()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(cov.why())
+
+
+def _label_health(imgui, vocab) -> None:
+    """Only speaks up when a label has stopped meaning what it says."""
+    bad = vocab.suspect
+    if not bad:
+        return
+    imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
+    imgui.text_wrapped("⚠ %d label(s) do not match this build" % len(bad))
+    imgui.pop_style_color()
+    for t in bad:
+        imgui.bullet_text("%s (slot %d): %s" % (t.name, t.slot, t.status))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(t.message)
 
 
 def _joint_note(sk, j: int, verts: int) -> str:

@@ -233,6 +233,25 @@ def test_the_shipped_ports_have_no_errors_without_any_evidence():
         assert not [i for i in iss if i.level == V.ERROR], (m.name, iss)
 
 
+def test_a_clip_that_moved_slots_is_told_where_it_went():
+    """🔴 The #8 addition: "wrong clip in slot 60" is not actionable; "your 382f clip
+    is now at slot 61" is. Clip ids shift on every rebuild."""
+    m = MF.loads(BASE + '''
+[clips.charge]
+slot = 60
+frames = 382
+loop = false
+''')
+    real = V.clip_table
+    V.clip_table = lambda blob: {1: (180, True), 60: (252, False), 61: (382, False)}
+    try:
+        codes = {i.code: i for i in V.validate(m, pac=b"x")}
+    finally:
+        V.clip_table = real
+    got = codes["CLIP_FRAMES_MISMATCH"]
+    assert "now at slot 61, not 60" in got.message, got.message
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

@@ -48,8 +48,11 @@ def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None) -> dict:
     got = {"frames": 0, "error": None, "status": "", "fbo": None,
            "screen": None, "lit": 0}
 
-    panels = {name: getattr(app, name) for name in
-              ("_viewport_panel", "_scene_panel", "_view_panel")}
+    # every panel in the docking layout, not a hand-kept subset: a panel added by a
+    # later issue that throws would otherwise be swallowed by the C++ runner and the
+    # smoke test would still pass.
+    panels = {name: getattr(app, name) for name in dir(app)
+              if name.endswith("_panel") and callable(getattr(app, name))}
 
     def guard(name, fn):
         def wrapped():
@@ -67,6 +70,7 @@ def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None) -> dict:
     for name, fn in panels.items():
         setattr(app, name, guard(name, fn))
 
+    got["panels"] = sorted(panels)
     # count on the viewport, which is the panel that has to reach GL.
     viewport = getattr(app, "_viewport_panel")
 
@@ -164,9 +168,9 @@ def test_app_opens_and_draws():
             "the window presented %d lit pixels of %d — it is BLACK. Something left a "
             "framebuffer bound and imgui drew into it instead of the back buffer."
             % (got["lit"], w * h))
-        print("ui                %d frames, viewport FBO %dx%d, back buffer %dx%d with "
-              "%.0f%% lit, %s"
-              % (got["frames"], got["fbo"][0], got["fbo"][1], w, h,
+        print("ui                %d frames, %d panels drew, viewport FBO %dx%d, back "
+              "buffer %dx%d with %.0f%% lit, %s"
+              % (got["frames"], len(got["panels"]), got["fbo"][0], got["fbo"][1], w, h,
                  100.0 * got["lit"] / (w * h), got["status"]))
 
 
