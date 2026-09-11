@@ -331,6 +331,100 @@ def test_hurtboxes_with_no_named_parts_warns_once():
     assert "PARTS_UNNAMED" not in codes and "HURTBOX_PART_UNNAMED" not in codes
 
 
+
+# --------------------------------------------------------------------------- #
+# the attack side (#33)
+# --------------------------------------------------------------------------- #
+HITBOX = "\n[[hitbox]]\nset = %d\nbone = %d\nradius = %g\n"
+
+
+class _AttackHost:
+    """Duck-typed `intel.SpeciesIntel` carrying only an `attacks` block."""
+    class _Set:
+        def __init__(self, index, capacity, rigged=True):
+            self.index, self.capacity, self.rigged = index, capacity, rigged
+            self.spheres = [None] * capacity
+
+    class _Rec:
+        def __init__(self, id, volume):
+            self.id, self.volume, self.is_blank = id, volume, False
+
+    class _Attacks:
+        present = True
+
+        def __init__(self, join="measured"):
+            self.join = join
+            self.sets = [_AttackHost._Set(0, 5), _AttackHost._Set(2, 10),
+                         _AttackHost._Set(3, 1, rigged=False), _AttackHost._Set(9, 2)]
+            self.primary = type("T", (), {"attacks": [
+                _AttackHost._Rec(6, 2), _AttackHost._Rec(31, 2), _AttackHost._Rec(7, 3)]})()
+
+        def set(self, i):
+            return next((s for s in self.sets if s.index == i), None)
+
+        def attack(self, i):
+            return next((a for a in self.primary.attacks if a.id == i), None)
+
+        def attacks_using(self, st):
+            return [a for a in self.primary.attacks if a.volume == st]
+
+    def __init__(self, join="measured"):
+        self.host_species = 75
+        self.attacks = _AttackHost._Attacks(join)
+
+    def pair(self, main, sub):
+        return None
+
+
+def test_a_hitbox_bone_past_the_rig_is_an_error_but_the_marker_bones_are_not():
+    iss = _issues(BASE + HITBOX % (2, 47, 150))
+    assert "HITBOX_BONE_RANGE" in _codes(iss), iss
+    for marker in (125, 126, 127):
+        iss = _issues(BASE + HITBOX % (2, marker, 150))
+        assert "HITBOX_BONE_RANGE" not in _codes(iss), (marker, iss)
+    iss = _issues(BASE + HITBOX % (2, 10, 0))
+    assert "HITBOX_RADIUS" in _codes(iss), iss
+    iss = _issues(BASE + "\n[[hitbox]]\nset = 2\nbone = 10\nradius = 1\nshape = \"capsule\"\n")
+    assert "HITBOX_CAPSULE_NO_END" in _codes(iss), iss
+
+
+def test_without_an_attacks_block_the_hitboxes_are_unchecked_and_say_so():
+    iss = _issues(BASE + HITBOX % (2, 10, 150))
+    assert "HITBOX_UNCHECKED" in _codes(iss), iss
+    assert "HITBOX_SHARED" not in _codes(iss), "shared is stated once the host is known"
+    iss = _issues(BASE + HITBOX % (2, 10, 150), intel=_intel())
+    assert "HITBOX_UNCHECKED" in _codes(iss), "an intel with no attacks block is absent"
+
+
+def test_sets_and_records_are_checked_against_the_hosts_tables():
+    host = _AttackHost()
+    ok = _issues(BASE + HITBOX % (2, 10, 150), intel=host)
+    assert "HITBOX_SHARED" in _codes(ok) and "HITBOX_SET_UNKNOWN" not in _codes(ok), ok
+    assert "ATTACK_JOIN_INFERRED" not in _codes(ok), "em75's join is measured"
+    bad = _issues(BASE + HITBOX % (56, 10, 150), intel=host)
+    assert "HITBOX_SET_UNKNOWN" in _codes(bad), bad
+    over = _issues(BASE + HITBOX % (3, 10, 150) * 2, intel=host)
+    assert "HITBOX_OVER_CAPACITY" in _codes(over), over
+    assert "HITBOX_SET_UNRIGGED" in _codes(over), "set 3 is a projectile's on the host"
+    unused = _issues(BASE + HITBOX % (9, 10, 150), intel=host)
+    assert "HITBOX_SET_UNUSED" in _codes(unused), unused
+    rec = _issues(BASE + "\n[[attack]]\nid = 99\npower = 1\n\n[[attack]]\nid = 6\n"
+                  "volume = 77\n\n[[attack]]\nid = 7\n", intel=host)
+    c = _codes(rec)
+    assert {"ATTACK_RECORD_UNKNOWN", "ATTACK_VOLUME_UNKNOWN", "ATTACK_EMPTY"} <= c, rec
+
+
+def test_an_inferred_join_warns_that_the_move_to_set_link_is_a_guess():
+    iss = _issues(BASE + HITBOX % (2, 10, 150), intel=_AttackHost(join="consistent"))
+    assert "ATTACK_JOIN_INFERRED" in _codes(iss), iss
+    iss = _issues(BASE + HITBOX % (2, 10, 150), intel=_AttackHost(join="measured"))
+    assert "ATTACK_JOIN_INFERRED" not in _codes(iss), iss
+
+
+def test_a_manifest_with_no_attack_side_gets_no_attack_issues():
+    iss = _issues(BASE + "\n[[hurtbox]]\nbone = 10\nradius = 150\n", intel=_AttackHost())
+    assert not any(c.startswith(("HITBOX_", "ATTACK_")) for c in _codes(iss)), iss
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

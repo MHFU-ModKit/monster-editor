@@ -113,6 +113,7 @@ def validate(m: PortManifest, *, pac: Optional[bytes | os.PathLike | str] = None
     out += _check_pac(m, pac)
     out += _check_intel(m, intel)
     out += _check_parts(m, intel)
+    out += _check_attacks(m, intel)
     return out
 
 
@@ -188,6 +189,87 @@ def _check_parts(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
         out.append(Issue(WARNING, "PARTS_UNNAMED", "parts",
                          "%d hurtbox volume(s) and no [parts] — nothing in this file "
                          "says which part is the head." % len(m.hurtboxes)))
+    return out
+
+
+def _check_attacks(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
+    """The attack side (#33): sets that exist, records that exist, capacities, and
+    the two things worth saying out loud — that the tables are shared species data,
+    and that the spawner->table join is only MEASURED on em75."""
+    out: List[Issue] = []
+    if not (m.hitboxes or m.attacks):
+        return out
+    for i, h in enumerate(m.hitboxes):
+        if h.is_capsule and h.to is None:
+            out.append(Issue(ERROR, "HITBOX_CAPSULE_NO_END", "hitbox[%d]" % i,
+                             "shape = \"capsule\" but no `to` — a capsule with no far "
+                             "end is a sphere at `offset`, so say which you mean."))
+    for i, a in enumerate(m.attacks):
+        if a.is_empty:
+            out.append(Issue(WARNING, "ATTACK_EMPTY", "attack[%d]" % i,
+                             "record %d names no lever (power / element / volume), so "
+                             "the block changes nothing." % a.id))
+
+    at = getattr(intel, "attacks", None)
+    sets = sorted({h.set for h in m.hitboxes})
+    if at is None or not getattr(at, "present", False):
+        out.append(Issue(WARNING, "HITBOX_UNCHECKED", "hitbox",
+                         "no attacks block in species/em%02d.json, so set indices, "
+                         "record ids and capacities are unchecked — and the runtime "
+                         "export REFUSES until it is built (tools/em_intel.py --all)."
+                         % m.host_species))
+        return out
+
+    n_sets, n_recs = len(at.sets), len(getattr(at.primary, "attacks", []) or [])
+    for st in sets:
+        hs = at.set(st)
+        if hs is None:
+            out.append(Issue(ERROR, "HITBOX_SET_UNKNOWN", "hitbox",
+                             "set %d — host em%02d has %d volume set(s) (0..%d). The "
+                             "runtime writes through the overlay's pointer table and "
+                             "there is no entry to follow." % (st, m.host_species,
+                                                                n_sets, n_sets - 1)))
+            continue
+        mine = [h for h in m.hitboxes if h.set == st]
+        if len(mine) > hs.capacity:
+            out.append(Issue(WARNING, "HITBOX_OVER_CAPACITY", "hitbox",
+                             "set %d: %d volume(s) but the host's set holds %d — the "
+                             "runtime writes them IN PLACE over that set and truncates "
+                             "the rest." % (st, len(mine), hs.capacity)))
+        if not hs.rigged:
+            out.append(Issue(WARNING, "HITBOX_SET_UNRIGGED", "hitbox",
+                             "set %d is un-rigged on the host (every record on bone "
+                             "126/127, the node's own position — projectile-shaped). "
+                             "A joint index here re-aligns nothing the engine reads."
+                             % st))
+        if not at.attacks_using(st):
+            out.append(Issue(WARNING, "HITBOX_SET_UNUSED", "hitbox",
+                             "no attack record points at set %d, so nothing the host "
+                             "spawns walks it — unless an [[attack]] re-points one "
+                             "(`volume = %d`)." % (st, st)))
+    for i, a in enumerate(m.attacks):
+        if at.attack(a.id) is None:
+            out.append(Issue(ERROR, "ATTACK_RECORD_UNKNOWN", "attack[%d]" % i,
+                             "record %d — host em%02d has %d record(s)."
+                             % (a.id, m.host_species, n_recs)))
+        if a.volume is not None and at.set(a.volume) is None:
+            out.append(Issue(ERROR, "ATTACK_VOLUME_UNKNOWN", "attack[%d]" % i,
+                             "volume %d — host em%02d has %d volume set(s)."
+                             % (a.volume, m.host_species, n_sets)))
+    if getattr(at, "join", "") != "measured":
+        out.append(Issue(WARNING, "ATTACK_JOIN_INFERRED", "hitbox",
+                         "host em%02d's spawner->table join is %s, not measured: only "
+                         "em75's was walked live to the HP write. Which set a move "
+                         "hits with is an inference here." % (m.host_species,
+                                                               getattr(at, "join", "?"))))
+    out.append(Issue(WARNING, "HITBOX_SHARED", "hitbox",
+                     "attack sets and records are SPECIES data in the overlay: with "
+                     "the port REPLACING the host they are his alone; beside a native "
+                     "em%02d they re-arm the native too. Shipped by "
+                     "mhfu_monster_editor.runtime -> P.hit() in place through the "
+                     "overlay's set-pointer table (set replacement proven by RAM poke "
+                     "2026-09-11; the generated path is not cold-boot validated yet)."
+                     % m.host_species))
     return out
 
 
@@ -300,7 +382,7 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
                                  "slot %d's clip or an earlier build's. Re-label it "
                                  "in the editor: it stamps the build." % c.slot))
 
-    if m.hurtboxes or m.effects:
+    if m.hurtboxes or m.effects or m.hitboxes:
         try:
             nb = bone_count(blob)
         except Exception as e:
@@ -318,6 +400,19 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
                 if h.radius <= 0:
                     out.append(Issue(ERROR, "HURTBOX_RADIUS", "hurtbox[%d]" % i,
                                      "radius %g is not a collision sphere" % h.radius))
+            for i, h in enumerate(m.hitboxes):
+                if h.is_marker:
+                    continue           # 125/126/127 are a coordinate space, not a joint
+                if not 0 <= h.bone < nb:
+                    out.append(Issue(ERROR, "HITBOX_BONE_RANGE", "hitbox[%d]" % i,
+                                     "bone %d is outside the shipped skeleton's %d "
+                                     "joints. An attack volume is bone-indexed like a "
+                                     "hurtbox, and the host's set sits on the HOST's "
+                                     "joints." % (h.bone, nb)))
+                if h.radius <= 0:
+                    out.append(Issue(ERROR, "HITBOX_RADIUS", "hitbox[%d]" % i,
+                                     "radius %g is not a volume that can touch anyone"
+                                     % h.radius))
             for i, e in enumerate(m.effects):
                 if not 0 <= e.bone < nb:
                     out.append(Issue(ERROR, "EFFECT_BONE_RANGE", "effect[%d]" % i,
