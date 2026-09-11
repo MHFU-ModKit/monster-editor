@@ -70,15 +70,19 @@ says so per column, and nothing here presents an inference as a measurement.
 `VOL_FILE_OFF` / `WK_FILE_OFF` below are the tables an earlier pass called "hurtbox
 volumes" and "weakness". 🔴 **The volume table is not the player's hurtbox** — a
 cold-boot test (2026-06-28) zeroed all four radii and the monster kept taking damage.
-They are attack/broadphase volumes: `part` and `hitzone_row` are 0 on every record and
-they carry no bone-relative offset, so they cannot feed `node+0x6 & 7` at all. There
-are **six** such tables in em75 and the constant here names one of them. The parse and
-the byte-identical round trip are still real; the label was wrong. `find_sets()` finds
-both kinds and classifies them, which is the honest replacement.
 
-The `0x18` "weakness" records are left as they were: parsed, round-tripped, and
-**undecoded**. Their `part_id` field holds `0x2127`/`0x2128` plus a variant index and
-nothing here knows what that means.
+✅ **Both are now decoded, and they are the two halves of the ATTACK side** (2026-09-11,
+issue #33). The `KIND_VOLUME` sets are the monster's **attack volumes** — proven by
+replacing em75's set 2 in RAM with one bone-1 sphere and watching the Tigrex charge's
+reach follow the radius (645 -> 152 at r=150, -> 1381 at r=1500). The `0x18` records
+are the **attack table**: `0x09B674D0` copies one, by attack id, straight into
+`node+0x1C..+0x33`, and its `+0x02` is the damage (64 -> 10 took the charge from -72 HP
+to -11) while its `+0x0A` picks the volume set. The `0x2127`/`0x2128` that looked like a
+`part_id` is two separate bytes, `+0x08` and `+0x09`, and `+0x09` is the element gate.
+
+`hitbox.py` owns that side: it finds both tables in any overlay from the species
+overlay's own call to `0x09B674C0`, and joins attack id -> record -> volume set.
+Nothing here changes; `find_sets()` still finds and classifies both kinds.
 
 ## Which set is HIS (2026-09-11, offline) — the species row points at it
 
@@ -163,8 +167,10 @@ CAPSULE = "capsule"
 
 #: a set that names parts and hitzone rows — the geometry a hit resolves against.
 KIND_HURTBOX = "hurtbox"
-#: bone-attached spheres with NO part, NO row and no offset. NOT a hurtbox — see
-#: the module docstring's cold-boot note. Attack or broadphase volumes.
+#: bone-attached spheres with NO part and NO row. NOT a hurtbox — see the module
+#: docstring's cold-boot note. These are the ATTACK volumes (confirmed 2026-09-11);
+#: `hitbox.py` reads them through the engine's own pointer table instead of
+#: structurally, which is the accurate route.
 KIND_VOLUME = "volume"
 #: a run of bytes that parses as records and says nothing: one bone, part 0, row 0.
 #: The data section is full of float arrays that validate by accident, and calling
