@@ -109,6 +109,49 @@ def test_hurtbox_surfaces_are_exact():
     print("hurtbox maths     sphere + capsule surfaces exact to the radius (no GL)")
 
 
+def test_attack_volumes_adapt_group_by_set_and_the_markers_are_a_space():
+    """Driver-free (#33): a `manifest.Hitbox` becomes a Volume grouped by its SET,
+    an intel sphere stamped through `attack_volumes_from` likewise, 126/127 are
+    node-space and 125 a marker, and two sets on screen together never share a
+    colour."""
+    from mhfu_monster_editor import manifest as MF
+    from mhfu_monster_editor.render.hitboxes import (PALETTE_PART, PALETTE_SET, Volume,
+                                                     attack_volumes_from, group_color,
+                                                     set_color, volumes_from)
+
+    vs = volumes_from([MF.Hitbox(bone=10, radius=150.0, set=2),
+                       MF.Hitbox(bone=127, radius=300.0, set=5),
+                       MF.Hitbox(bone=125, radius=0.0, set=2, shape="capsule",
+                                 to=[0.0, 0.0, 0.0]),
+                       MF.Hurtbox(bone=3, radius=1.0, part=6, hitzone_row=5)])
+    assert [v.group for v in vs] == [2, 5, 2, 6]
+    assert [v.part for v in vs] == [0, 0, 0, 6], "a hitbox has no part"
+    assert vs[1].is_node_space and vs[1].is_marker
+    assert vs[2].is_marker and not vs[2].is_node_space
+    assert not vs[0].is_marker and not vs[3].is_node_space
+
+    class _S:                      # duck-typed intel.AttackSet
+        def __init__(self, index, spheres):
+            self.index, self.spheres = index, spheres
+
+    class _Sp:
+        def __init__(self, bone, r):
+            self.bone, self.radius, self.a, self.b, self.is_capsule = bone, r, (0, 0, 0), None, False
+
+    got = attack_volumes_from([_S(2, [_Sp(10, 150.0), _Sp(18, 150.0)]), _S(11, [_Sp(35, 300.0)])])
+    assert [(v.bone, v.group) for v in got] == [(10, 2), (18, 2), (35, 11)]
+    # a hurtbox Volume keeps part == group, so the hurtbox path is unchanged
+    hv = Volume(bone=1, radius=1.0, part=9)
+    assert hv.part == 1 and hv.group == 1
+    cols = [set_color(g) for g in range(56)]
+    for i in range(56):
+        for j in range(i + 1, min(56, i + 4)):
+            assert max(abs(a - b) for a, b in zip(cols[i], cols[j])) > 0.08, (i, j)
+    assert group_color(9, PALETTE_PART) == group_color(1, PALETTE_PART), "parts mask & 7"
+    assert group_color(9, PALETTE_SET) != group_color(1, PALETTE_SET), "sets do not"
+    print("attack volume adapters  ok")
+
+
 def test_target_reads_back_what_was_cleared(ctx):
     from mhfu_monster_editor.render.target import Target
 
@@ -399,6 +442,90 @@ def test_the_hurtbox_gizmos_ride_the_pose(ctx):
           % (len(vols), round(DIM_ALPHA * 100)))
 
 
+def test_the_attack_gizmos_draw_by_set_and_at_the_origin_for_node_space(ctx):
+    """Issue #33 on the viewport: attack volumes are their own overlay, coloured and
+    filtered by SET; a 127 sphere sits at the actor's origin rather than counting as
+    an orphan; and the host reference carries the host's own sets beside the port,
+    remembered whichever panel came first."""
+    if not TIGREX.exists():
+        print("SKIP: no game data")
+        return
+    from mhfu_monster_editor import manifest as MF
+    from mhfu_monster_editor.core import open_scene
+    from mhfu_monster_editor.render.hitboxes import PALETTE_SET
+    from mhfu_monster_editor.render.viewport import Viewport
+
+    scene = open_scene(TIGREX)
+    nb = scene.rig.n_bones
+    vols = [MF.Hitbox(bone=10, radius=150.0, set=2),
+            MF.Hitbox(bone=43, radius=120.0, set=2, shape="capsule",
+                      to=[0.0, 0.0, -200.0]),
+            MF.Hitbox(bone=31, radius=700.0, set=3),
+            MF.Hitbox(bone=127, radius=250.0, set=4),            # node-space
+            MF.Hitbox(bone=125, radius=0.0, set=2, shape="capsule", to=[0.0, 0.0, 0.0]),
+            MF.Hitbox(bone=nb + 3, radius=50.0, set=2)]          # off the rig
+    with Viewport(ctx, (320, 240)) as vp:
+        vp.set_scene(scene)
+        bg = np.array([int(round(c * 255)) for c in vp.background[:3]])
+
+        def lit():
+            vp.draw()
+            return int((np.abs(vp.target.read()[..., :3].astype(int) - bg)
+                        .max(axis=2) > 12).sum())
+
+        vp.show_mesh = vp.show_skeleton = vp.show_ground = False
+        assert lit() == 0
+        ov = vp.set_attacks(vols)
+        assert ov is not None and vp.show_attacks and not vp.show_hitboxes
+        assert ov.palette == PALETTE_SET
+        assert [v.bone for v in ov.orphans] == [nb + 3], "markers are not orphans"
+        shown = ov.shown()
+        assert [v.bone for v in shown] == [10, 43, 31, 127], "125 draws nowhere; 127 draws"
+        assert ov.parts() == [2, 3, 4]
+        c = ov.world_centres()
+        assert np.allclose(c[3], (0.0, 0.0, 0.0)), "127 must sit at the actor's origin"
+        all_lit = lit()
+        assert all_lit > 0
+
+        # the node-space sphere does not ride the pose; the rigged ones do
+        vp.play_clip(scene.clips[0])
+        vp.playback.playing = True
+        vp.tick(0.5)
+        c2 = ov.world_centres()
+        assert np.allclose(c2[3], (0.0, 0.0, 0.0)) and not np.allclose(c[0], c2[0])
+
+        # filter by SET, not by part (every attack volume has part 0)
+        ov.set_visible_groups([3])
+        assert [v.group for v in ov.shown()] == [3]
+        assert lit() < all_lit
+        ov.set_visible_groups(None)
+        ov.set_selected_group(2)
+        assert ov.selected_part == 2
+
+        # both overlays at once, each under its own toggle
+        vp.set_hitboxes([MF.Hurtbox(bone=2, radius=90.0, part=1)])
+        assert vp.show_hitboxes and vp.show_attacks
+        both = lit()
+        vp.show_attacks = False
+        assert lit() < both, "hiding the attack layer alone changed nothing"
+        vp.show_attacks = True
+
+        # the reference carries the HOST's sets, remembered in either order
+        vp.set_reference_attacks(vols[:3])
+        ref = vp.set_reference(scene)
+        assert ref.attacks is not None and ref.attacks.selected_part == 2
+        vp.set_reference_attacks(None)
+        assert vp.reference.attacks is None
+        vp.set_reference_attacks(vols[:3])
+        assert vp.reference.attacks is not None
+        vp.clear_attacks()
+        assert vp.attacks is None and not vp.show_attacks
+        assert vp.reference.attacks is None
+        vp.show_hitboxes = False
+        assert lit() == 0, "the attack gizmos outlived clear_attacks"
+    print("attack gizmos          by set, 127 at the origin, reference carries the host's")
+
+
 def test_render_to_file(ctx):
     """`render_to_file` opens its OWN context — the ``--headless`` path end to end."""
     if not TIGREX.exists():
@@ -426,6 +553,7 @@ def test_render_to_file(ctx):
 def main() -> int:
     test_png_encoders_agree()
     test_hurtbox_surfaces_are_exact()
+    test_attack_volumes_adapt_group_by_set_and_the_markers_are_a_space()
     ctx = _context()
     if ctx is None:
         print("\ntest_render_headless: SKIPPED (no GL) — the camera maths is covered "
@@ -438,6 +566,7 @@ def main() -> int:
         test_draw_restores_the_framebuffer_binding(ctx)
         test_the_reference_actor_stands_beside_the_port(ctx)
         test_the_hurtbox_gizmos_ride_the_pose(ctx)
+        test_the_attack_gizmos_draw_by_set_and_at_the_origin_for_node_space(ctx)
         test_render_to_file(ctx)
     finally:
         ctx.release()

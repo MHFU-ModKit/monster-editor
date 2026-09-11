@@ -20,6 +20,15 @@ across the animal is a real fault the picture shows immediately.
 ⚠️ A sphere on a bone the rig does not have is drawn **nowhere**, and
 :attr:`HitboxOverlay.orphans` counts them. Silently skipping would make a port whose
 volumes were copied from a 48-joint host onto a 46-joint rig look correct.
+
+**The ATTACK volumes draw through the same overlay** (issue #33) — the same `0x28`
+record, so the same gizmo — with two differences the overlay carries rather than the
+caller: they are coloured and filtered by their volume SET (`Volume.group`; for a
+hurtbox the group IS the part, so nothing above changes), and bones 126/127 are a
+coordinate space, not a joint: 127 is a sphere at the NODE's own position, 126 a
+capsule between the node's own two points, and for a body attack the node sits at the
+attacker's origin. They draw there, at the actor's origin, and are not orphans. 125 is
+a joiner with no geometry and draws nowhere, like the hurtboxes' `0x7D` tail marker.
 """
 from __future__ import annotations
 
@@ -43,6 +52,37 @@ PART_COLORS = (
 )
 #: a volume whose bone is off the end of the rig. Drawn nowhere; see `orphans`.
 C_ORPHAN = (1.00, 0.15, 0.55, 1.0)
+
+#: bones that are a coordinate space rather than a joint (`hitbox.py`)
+BONE_JOINER = 0x7D
+BONE_NODE_CAPSULE = 0x7E
+BONE_NODE_SPHERE = 0x7F
+NODE_SPACE_BONES = (BONE_NODE_CAPSULE, BONE_NODE_SPHERE)
+MARKER_BONES = (BONE_JOINER, BONE_NODE_CAPSULE, BONE_NODE_SPHERE)
+
+#: the two palettes. "part": one colour per accumulator slot, eight. "set": a hue
+#: walk for attack volume sets — em75 has 56 and a move shows one or two at a time,
+#: so what matters is that two sets on screen together are never the same colour,
+#: not that set 37 has a memorable one. Warm-leaning on purpose: these are where he
+#: hits YOU, and the hurtboxes' cool blues/greens should read as the other thing.
+PALETTE_PART = "part"
+PALETTE_SET = "set"
+
+
+def set_color(group: int) -> Tuple[float, float, float]:
+    """A hue for volume set ``group``, by golden-angle walk, warm-biased."""
+    import colorsys
+    hue = (0.02 + (int(group) * 0.381966)) % 1.0
+    # fold the cool half towards warm: hurtboxes own blue/green
+    hue = hue * 0.55 if hue < 0.5 else 0.72 + (hue - 0.5) * 0.56
+    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, 0.72, 0.96)
+    return (r, g, b)
+
+
+def group_color(group: int, palette: str) -> Tuple[float, float, float]:
+    if palette == PALETTE_SET:
+        return set_color(group)
+    return PART_COLORS[int(group) % len(PART_COLORS)]
 
 #: an unselected part while something else IS selected. Low enough to read as
 #: context rather than as clutter — with 153 volumes on screen, anything brighter
@@ -171,11 +211,11 @@ class Volume:
     side-by-side comparison possible at all.
     """
 
-    __slots__ = ("bone", "part", "hitzone_row", "radius", "a", "b", "label")
+    __slots__ = ("bone", "part", "hitzone_row", "radius", "a", "b", "label", "group")
 
     def __init__(self, bone: int, radius: float, part: int = 0,
                  hitzone_row: int = 0, a=(0.0, 0.0, 0.0), b=None,
-                 label: str = "") -> None:
+                 label: str = "", group: Optional[int] = None) -> None:
         self.bone = int(bone)
         self.radius = float(radius)
         self.part = int(part) & 7
@@ -183,19 +223,36 @@ class Volume:
         self.a = tuple(float(v) for v in a)
         self.b = None if b is None else tuple(float(v) for v in b)
         self.label = label
+        #: the colour/filter key: the PART for a hurtbox, the SET for an attack
+        #: volume. Defaults to the part so the hurtbox path is unchanged.
+        self.group = self.part if group is None else int(group)
 
     @property
     def is_capsule(self) -> bool:
         return self.b is not None
 
+    @property
+    def is_node_space(self) -> bool:
+        """126/127: geometry at the NODE's own position — the actor's origin."""
+        return self.bone in NODE_SPACE_BONES
+
+    @property
+    def is_marker(self) -> bool:
+        return self.bone in MARKER_BONES
+
     @classmethod
-    def from_intel(cls, s) -> "Volume":
-        return cls(bone=s.bone, radius=s.radius, part=s.part,
-                   hitzone_row=s.hitzone_row, a=s.a,
-                   b=s.b if getattr(s, "is_capsule", False) else None)
+    def from_intel(cls, s, group: Optional[int] = None) -> "Volume":
+        return cls(bone=s.bone, radius=s.radius, part=getattr(s, "part", 0),
+                   hitzone_row=getattr(s, "hitzone_row", 0), a=s.a,
+                   b=s.b if getattr(s, "is_capsule", False) else None, group=group)
 
     @classmethod
     def from_manifest(cls, h) -> "Volume":
+        if hasattr(h, "set"):            # manifest.Hitbox — an attack volume
+            return cls(bone=h.bone, radius=h.radius, part=0, hitzone_row=0,
+                       a=h.offset or (0.0, 0.0, 0.0),
+                       b=h.to if getattr(h, "is_capsule", False) else None,
+                       label=getattr(h, "label", ""), group=int(h.set))
         return cls(bone=h.bone, radius=h.radius, part=h.part or 0,
                    hitzone_row=h.hitzone_row or 0,
                    a=h.offset or (0.0, 0.0, 0.0),
@@ -203,13 +260,15 @@ class Volume:
                    label=getattr(h, "label", ""))
 
     def __repr__(self) -> str:                                # pragma: no cover
-        return "<Volume bone=%d part=%d row=%d r=%g%s>" % (
-            self.bone, self.part, self.hitzone_row, self.radius,
+        return "<Volume bone=%d part=%d row=%d group=%d r=%g%s>" % (
+            self.bone, self.part, self.hitzone_row, self.group, self.radius,
             " capsule" if self.is_capsule else "")
 
 
-def volumes_from(source: Iterable) -> List[Volume]:
-    """Adapt intel spheres or manifest hurtboxes — whichever you hand it."""
+def volumes_from(source: Iterable, group: Optional[int] = None) -> List[Volume]:
+    """Adapt intel spheres or manifest hurtboxes/hitboxes — whichever you hand it.
+    ``group`` stamps a set index onto intel spheres (an `AttackSet`'s), so the host's
+    attack volumes colour and filter by set like the port's authored ones."""
     out = []
     for s in source:
         if isinstance(s, Volume):
@@ -217,7 +276,15 @@ def volumes_from(source: Iterable) -> List[Volume]:
         elif hasattr(s, "offset"):
             out.append(Volume.from_manifest(s))
         else:
-            out.append(Volume.from_intel(s))
+            out.append(Volume.from_intel(s, group=group))
+    return out
+
+
+def attack_volumes_from(sets: Iterable) -> List[Volume]:
+    """The host's attack sets (`intel.AttackSet`s) as one list, grouped by index."""
+    out: List[Volume] = []
+    for st in sets:
+        out += volumes_from(st.spheres, group=st.index)
     return out
 
 
@@ -237,18 +304,27 @@ class HitboxOverlay:
     world-space copy to go stale against the animation.
     """
 
-    def __init__(self, ctx, volumes: Sequence[Volume], n_bones: int) -> None:
+    def __init__(self, ctx, volumes: Sequence[Volume], n_bones: int,
+                 palette: str = PALETTE_PART) -> None:
         self.ctx = ctx
         self.volumes = list(volumes)
         self.n_bones = int(n_bones)
+        #: "part" for hurtboxes, "set" for attack volumes — see `group_color`
+        self.palette = palette
+        #: the GROUP filter and selection: parts for hurtboxes, sets for attacks.
+        #: The `*_part` names are kept because the hurtbox panel and its tests use
+        #: them; on an attack overlay they mean the set.
         self.visible_parts: Optional[frozenset] = None
         self.selected_part: Optional[int] = None
         #: ONE volume, by index into :attr:`volumes`, singled out for editing: it
         #: alone gets the shell and everything else dims, whatever its part.
         self.selected_volume: Optional[int] = None
-        #: volumes whose bone is off the end of this rig — drawn NOWHERE, counted here
+        #: volumes whose bone is off the end of this rig — drawn NOWHERE, counted
+        #: here. Marker bones are NOT orphans: 125 is a joiner (no geometry), 126/127
+        #: draw at the actor's origin.
         self.orphans: Tuple[Volume, ...] = tuple(
-            v for v in self.volumes if not 0 <= v.bone < self.n_bones)
+            v for v in self.volumes
+            if not 0 <= v.bone < self.n_bones and not v.is_marker)
         self._lines = Lines(ctx)
         #: the selected part's translucent shell. Same flat program, TRIANGLES.
         self._fill = Lines(ctx, mode=ctx.TRIANGLES)
@@ -261,17 +337,26 @@ class HitboxOverlay:
         self._world = np.asarray(world, dtype=np.float64)
         self._dirty = True
 
+    def _key(self, g: int) -> int:
+        return int(g) & 7 if self.palette == PALETTE_PART else int(g)
+
     def set_visible_parts(self, parts: Optional[Iterable[int]]) -> None:
-        v = None if parts is None else frozenset(int(p) & 7 for p in parts)
+        """Show only these GROUPS (parts, or sets on an attack overlay)."""
+        v = None if parts is None else frozenset(self._key(p) for p in parts)
         if v != self.visible_parts:
             self.visible_parts = v
             self._dirty = True
 
     def set_selected_part(self, part: Optional[int]) -> None:
-        p = None if part is None else int(part) & 7
+        """Focus one GROUP: it gets the shell, the rest dim."""
+        p = None if part is None else self._key(part)
         if p != self.selected_part:
             self.selected_part = p
             self._dirty = True
+
+    # the same two, under the name that is honest on an attack overlay
+    set_visible_groups = set_visible_parts
+    set_selected_group = set_selected_part
 
     def set_selected_volume(self, index: Optional[int]) -> None:
         """Single out one volume. Out-of-range clears, rather than raising in the
@@ -288,25 +373,40 @@ class HitboxOverlay:
                 return i
         return None
 
+    def _drawable(self, v: Volume) -> bool:
+        return (0 <= v.bone < self.n_bones) or v.is_node_space
+
     def shown(self) -> List[Volume]:
-        """The volumes that will actually be drawn, orphans excluded."""
+        """The volumes that will actually be drawn: orphans and joiners excluded,
+        node-space ones (126/127) included at the origin."""
         return [v for v in self.volumes
-                if 0 <= v.bone < self.n_bones
-                and (self.visible_parts is None or v.part in self.visible_parts)]
+                if self._drawable(v)
+                and (self.visible_parts is None or v.group in self.visible_parts)]
 
     def parts(self) -> List[int]:
-        return sorted({v.part for v in self.volumes})
+        """The groups present — parts, or sets on an attack overlay."""
+        return sorted({v.group for v in self.volumes})
+
+    groups = parts
 
     def by_part(self) -> Dict[int, List[Volume]]:
         out: Dict[int, List[Volume]] = {}
         for v in self.volumes:
-            out.setdefault(v.part, []).append(v)
+            out.setdefault(v.group, []).append(v)
         return out
+
+    by_group = by_part
 
     # ---- geometry ----------------------------------------------------- #
     def _place(self, v: Volume) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """The volume's endpoints in world space under the current pose."""
-        if self._world is None or not 0 <= v.bone < len(self._world):
+        """The volume's endpoints in world space under the current pose.
+
+        A node-space volume (bone 126/127) is placed at the ACTOR's origin — the
+        node's position is the owner's, and the owner's origin is world zero in the
+        viewport — so it neither follows a joint nor counts as off the rig.
+        """
+        if v.is_node_space or self._world is None \
+                or not 0 <= v.bone < len(self._world):
             return np.asarray(v.a), (None if v.b is None else np.asarray(v.b))
         m = self._world[v.bone]
         rot, trans = m[:3, :3], m[:3, 3]
@@ -333,14 +433,14 @@ class HitboxOverlay:
             a, b = self._place(v)
             g = (sphere_geometry(a, v.radius) if b is None
                  else capsule_geometry(a, b, v.radius))
-            rgb = PART_COLORS[v.part % len(PART_COLORS)]
+            rgb = group_color(v.group, self.palette)
             alpha = LIVE_ALPHA
             if one is not None:
                 # a single volume singled out overrides the part focus: it is the
                 # one being edited, and the question is "where is THIS one"
                 focus = v is one
             else:
-                focus = self.selected_part is not None and v.part == self.selected_part
+                focus = self.selected_part is not None and v.group == self.selected_part
             if (one is not None or self.selected_part is not None) and not focus:
                 alpha = DIM_ALPHA
             pos.append(g)
@@ -400,5 +500,6 @@ class HitboxOverlay:
         self._fill.release()
 
     def __repr__(self) -> str:                                # pragma: no cover
-        return "<HitboxOverlay %d volume(s), %d orphan(s), parts %s>" % (
-            len(self.volumes), len(self.orphans), self.parts())
+        return "<HitboxOverlay %d volume(s), %d orphan(s), %s %s>" % (
+            len(self.volumes), len(self.orphans),
+            "sets" if self.palette == PALETTE_SET else "parts", self.parts())
