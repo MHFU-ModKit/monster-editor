@@ -554,6 +554,98 @@ def test_a_hurtbox_block_survives_a_round_trip_through_the_patcher():
     assert MF.hurtbox_block(h) in MF.dumps(m).replace("\n\n", "\n")
 
 
+
+# --------------------------------------------------------------------------- #
+# the attack side (#33): [[hitbox]] is a hurtbox record keyed by SET, [[attack]] the
+# three measured levers on a record
+# --------------------------------------------------------------------------- #
+def test_a_hitbox_is_keyed_by_set_and_carries_no_part_or_row():
+    m = MF.loads(MINIMAL + '''
+[[hitbox]]
+set = 2
+bone = 10
+radius = 150.0
+
+[[hitbox]]
+set = 2
+bone = 43
+radius = 120.0
+shape = "capsule"
+offset = [0.0, 0.0, 0.0]
+to = [0.0, 0.0, -200.0]
+label = "tail tip"
+''')
+    assert [h.set for h in m.hitboxes] == [2, 2]
+    assert m.hitboxes[1].is_capsule and m.hitboxes[1].to == [0.0, 0.0, -200.0]
+    assert not hasattr(m.hitboxes[0], "part") and not hasattr(m.hitboxes[0], "hitzone_row")
+    try:
+        MF.loads(MINIMAL + "\n[[hitbox]]\nset = 2\nbone = 1\nradius = 1.0\npart = 1\n")
+    except MF.ManifestError as e:
+        assert "part" in str(e), e
+    else:
+        raise AssertionError("a hitbox with a part field was accepted")
+    try:
+        MF.loads(MINIMAL + "\n[[hitbox]]\nbone = 1\nradius = 1.0\n")
+    except MF.ManifestError as e:
+        assert "set" in str(e), e
+    else:
+        raise AssertionError("a hitbox with no set was accepted")
+
+
+def test_the_hitbox_marker_bones_are_a_coordinate_space():
+    m = MF.loads(MINIMAL + "\n[[hitbox]]\nset = 0\nbone = 126\nradius = 150.0\n"
+                 "shape = \"capsule\"\n\n[[hitbox]]\nset = 0\nbone = 125\nradius = 0.0\n"
+                 "\n[[hitbox]]\nset = 0\nbone = 12\nradius = 90.0\n")
+    a, b, c = m.hitboxes
+    assert a.is_marker and a.is_node_space, "126 hangs on the node's own two points"
+    assert b.is_marker and not b.is_node_space, "125 is a joiner with no geometry"
+    assert not c.is_marker and not c.is_node_space
+
+
+def test_an_attack_block_names_a_record_and_only_the_levers_it_sets():
+    m = MF.loads(MINIMAL + "\n[[attack]]\nid = 6\npower = 40\n\n[[attack]]\nid = 31\n"
+                 "element = 0x81\nvolume = 5\nlabel = \"dragon\"\n\n[[attack]]\nid = 9\n")
+    a6, a31, a9 = m.attacks
+    assert (a6.power, a6.element, a6.volume) == (40, None, None)
+    assert (a31.power, a31.element, a31.volume) == (None, 0x81, 5)
+    assert a9.is_empty and not a6.is_empty
+    for bad in ("power = 300", "element = -1", "volume = 256"):
+        try:
+            MF.loads(MINIMAL + "\n[[attack]]\nid = 1\n%s\n" % bad)
+        except MF.ManifestError:
+            continue
+        raise AssertionError("%s was accepted on an attack record" % bad)
+
+
+def test_two_attack_blocks_for_one_record_are_refused():
+    try:
+        MF.loads(MINIMAL + "\n[[attack]]\nid = 6\npower = 1\n\n[[attack]]\nid = 6\npower = 2\n")
+    except MF.ManifestError as e:
+        assert "record 6" in str(e), e
+        return
+    raise AssertionError("the same record twice was accepted — the last write would win")
+
+
+def test_hitbox_and_attack_blocks_round_trip_through_dumps_and_the_patcher():
+    h = MF.Hitbox(bone=43, radius=120.0, set=2, shape="capsule",
+                  offset=[0.0, 0.0, 0.0], to=[0.0, 0.0, -200.0], flags=0x101,
+                  label="tail tip")
+    a = MF.Attack(id=6, power=40, element=0x21, volume=2, label="charge")
+    m = MF.loads(MF.patch(MINIMAL, [MF.AppendBlock(MF.hitbox_block(h)),
+                                    MF.AppendBlock(MF.attack_block(a))]))
+    assert m.hitboxes == [h] and m.attacks == [a]
+    text = MF.dumps(m)
+    assert MF.hitbox_block(h) in text.replace("\n\n", "\n")
+    assert MF.attack_block(a) in text.replace("\n\n", "\n")
+    assert "element = 0x21" in text, "a gate byte is written as a mask"
+    again = MF.loads(text)
+    assert again.hitboxes == [h] and again.attacks == [a]
+    # replacing the block by index leaves the head of the file byte for byte
+    h2 = MF.Hitbox(bone=44, radius=120.0, set=2, label="tail tip moved")
+    two = MF.patch(text, [MF.ReplaceBlock("hitbox", 0, MF.hitbox_block(h2))])
+    assert MF.loads(two).hitboxes == [h2]
+    assert two[:two.index("[[hitbox]]")] == text[:text.index("[[hitbox]]")]
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

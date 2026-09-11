@@ -26,7 +26,9 @@ Shape
     [build]                      what the porter needs (skin, source_skeleton, ...)
     [clips.<name>]               slot = executor a1, plus the frame fingerprint
     [moves.<name>]               main / sub / clip — the two-channel alignment
-    [[hurtbox]]                  bone + radius (hitzone.Volume)
+    [[hurtbox]]                  bone + radius + part + hitzone_row (where he is HIT)
+    [[hitbox]]                   bone + radius + set — an ATTACK volume (where he HITS)
+    [[attack]]                   id + power / element / volume — one attack record's levers
     [[effect]]                   move / frame / id / bone
 
 Where this differs from the issue's sketch, and why
@@ -237,6 +239,87 @@ class HitzoneState:
         return self.rows[row][HITZONE_COLUMNS.index(column)]
 
 
+#: bones that are a COORDINATE SPACE in an attack volume, not a joint (`hitbox.py`):
+#: 125 a joiner with no geometry of its own, 126 a capsule between the NODE's own two
+#: points, 127 a sphere at the node's own position — i.e. at the attacker.
+HITBOX_BONE_JOINER = 0x7D
+HITBOX_BONE_NODE_CAPSULE = 0x7E
+HITBOX_BONE_NODE_SPHERE = 0x7F
+HITBOX_MARKER_BONES = (HITBOX_BONE_JOINER, HITBOX_BONE_NODE_CAPSULE,
+                       HITBOX_BONE_NODE_SPHERE)
+
+
+@dataclass
+class Hitbox:
+    """One ATTACK volume on the port's own rig — where he hits YOU (issue #33).
+
+    The same `0x28` record as a :class:`Hurtbox` with `part` and `hitzone_row`
+    unused: an attack volume does not need to say where it can be hit. What it
+    carries instead is **`set`** — which of the host overlay's volume sets it belongs
+    to. A handler spawns an attack by id, the attack record's `+0x0A` names a set,
+    and the engine walks that set's records; so the sets are the unit the runtime
+    replaces IN PLACE (each at its own address, each with its own capacity) and the
+    unit the editor lists moves by: `[moves.lunge]` is `(1,4)`, `(1,4)` spawns
+    attacks 6 and 31, both on set 2 — edit set 2 and the lunge hits where you put it.
+
+    ⚠️ Bone indices are indices into the rig THIS PORT SHIPS, exactly as for a
+    hurtbox: the host's set 2 sits on Tigrex bones 10/18/34/4/2/41/42/43, and on the
+    Zinogre's rig those numbers are other joints. That misalignment is what this
+    block exists to fix.
+
+    🔴 The sets are SPECIES data in the overlay: a port REPLACING its host owns
+    them; beside a native monster of the host species it re-arms the native too.
+    """
+    bone: int
+    radius: float
+    set: int
+    shape: str = "sphere"
+    offset: Optional[List[float]] = None
+    to: Optional[List[float]] = None
+    #: the record's `+0x08` word, shipped verbatim. Attack volumes in em75 carry 0.
+    flags: int = 0
+    label: str = ""
+
+    @property
+    def is_capsule(self) -> bool:
+        return self.shape == "capsule"
+
+    @property
+    def is_marker(self) -> bool:
+        """125/126/127: not a joint. 125 draws nowhere; 126/127 hang on the NODE's
+        own position, which for a body attack is the attacker's origin."""
+        return self.bone in HITBOX_MARKER_BONES
+
+    @property
+    def is_node_space(self) -> bool:
+        """126/127 — geometry, but at the node's position rather than on a joint."""
+        return self.bone in (HITBOX_BONE_NODE_CAPSULE, HITBOX_BONE_NODE_SPHERE)
+
+
+@dataclass
+class Attack:
+    """The measured levers on one `0x18` attack record, by record id.
+
+    Three fields were edited live and the game followed each (#33): `power`
+    (`+0x02`; 64 -> 10 took the Tigrex charge from -72 HP to -11), `element`
+    (`+0x09`, the byte the player-damage resolver masks to pick a resistance) and
+    `volume` (`+0x0A`, which set the node walks). Nothing else on the record is
+    decoded, so nothing else is authorable here — `None` leaves the host's byte.
+
+    `id` is the RECORD index — for the host's own species the handler literal; a
+    species sharing the overlay adds its offset (`intel.AttackIntel.id_offset`).
+    """
+    id: int
+    power: Optional[int] = None
+    element: Optional[int] = None
+    volume: Optional[int] = None
+    label: str = ""
+
+    @property
+    def is_empty(self) -> bool:
+        return self.power is None and self.element is None and self.volume is None
+
+
 @dataclass
 class Effect:
     """`at frame F, effect E at bone B`, anchored to a move.
@@ -310,6 +393,8 @@ class PortManifest:
     hurtboxes: List[Hurtbox] = field(default_factory=list)
     parts: Dict[str, Part] = field(default_factory=dict)
     hitzones: List[HitzoneState] = field(default_factory=list)
+    hitboxes: List[Hitbox] = field(default_factory=list)
+    attacks: List[Attack] = field(default_factory=list)
     effects: List[Effect] = field(default_factory=list)
     schema: int = SCHEMA
     #: where it was loaded from, when it was. Not part of identity — two manifests
@@ -466,9 +551,11 @@ _HURTBOX_KEYS = ("bone", "radius", "part", "hitzone_row", "shape", "offset",
                  "to", "flags", "label")
 _PART_KEYS = ("index", "hitzone_row", "severable", "label")
 _HITZONE_KEYS = ("state", "rows", "label")
+_HITBOX_KEYS = ("bone", "radius", "set", "shape", "offset", "to", "flags", "label")
+_ATTACK_KEYS = ("id", "power", "element", "volume", "label")
 _EFFECT_KEYS = ("move", "frame", "id", "bone", "label")
 _TOP_KEYS = ("schema", "port", "source", "build", "clips", "moves", "hurtbox",
-             "parts", "hitzone", "effect")
+             "parts", "hitzone", "hitbox", "attack", "effect")
 
 
 def loads(text: str, *, path: Optional[os.PathLike | str] = None) -> PortManifest:
@@ -608,6 +695,43 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
         hitzones.append(HitzoneState(name=_need(hz, "state", str, w), rows=clean,
                                      label=_opt(hz, "label", str, w, "")))
 
+    hitboxes = []
+    for i, h in enumerate(_typed(raw.get("hitbox", []), list, where + ".hitbox")):
+        w = "hitbox[%d]" % i
+        h = _typed(h, dict, w)
+        _reject_unknown(h, _HITBOX_KEYS, w)
+        shape = _opt(h, "shape", str, w, "sphere")
+        if shape not in SHAPES:
+            raise ManifestError("%s: shape %r is not one of %s"
+                                % (w, shape, ", ".join(SHAPES)))
+        st = _need(h, "set", int, w)
+        if st < 0:
+            raise ManifestError("%s: set %d — a volume-set index is 0 or more" % (w, st))
+        hitboxes.append(Hitbox(
+            bone=_need(h, "bone", int, w), radius=_need(h, "radius", float, w),
+            set=st, shape=shape, offset=_vec3(h, "offset", w), to=_vec3(h, "to", w),
+            flags=_opt(h, "flags", int, w, 0), label=_opt(h, "label", str, w, "")))
+
+    attacks = []
+    for i, a in enumerate(_typed(raw.get("attack", []), list, where + ".attack")):
+        w = "attack[%d]" % i
+        a = _typed(a, dict, w)
+        _reject_unknown(a, _ATTACK_KEYS, w)
+        aid = _need(a, "id", int, w)
+        if aid < 0:
+            raise ManifestError("%s: id %d — a record index is 0 or more" % (w, aid))
+        attacks.append(Attack(
+            id=aid, power=_bounded(a, "power", w, 256),
+            element=_bounded(a, "element", w, 256),
+            volume=_bounded(a, "volume", w, 256),
+            label=_opt(a, "label", str, w, "")))
+    seen_ids = [a.id for a in attacks]
+    for aid in sorted(set(seen_ids)):
+        if seen_ids.count(aid) > 1:
+            raise ManifestError("attack: record %d is declared %d times — one block "
+                                "per record, or the last write wins silently"
+                                % (aid, seen_ids.count(aid)))
+
     effects = []
     for i, e in enumerate(_typed(raw.get("effect", []), list, where + ".effect")):
         w = "effect[%d]" % i
@@ -628,7 +752,7 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
         orig=_opt(port, "orig", str, "port"),
         replace=_int_list(port, "replace", "port", []) or [],
         clips=clips, moves=moves, hurtboxes=hurtboxes, parts=parts,
-        hitzones=hitzones, effects=effects,
+        hitzones=hitzones, hitboxes=hitboxes, attacks=attacks, effects=effects,
         schema=schema, path=Path(path) if path else None)
 
     # cross-references are structural: a move pointing at a clip that is not declared
@@ -781,6 +905,12 @@ def dumps(m: PortManifest) -> str:
         out.append("]")
         _kv(out, "label", hz.label)
 
+    for h in m.hitboxes:
+        out += ["", hitbox_block(h)]
+
+    for a in m.attacks:
+        out += ["", attack_block(a)]
+
     for e in m.effects:
         out += ["", "[[effect]]"]
         _kv(out, "move", e.move)
@@ -819,6 +949,36 @@ def hitzone_block(hz: HitzoneState) -> str:
     for i, row in enumerate(hz.rows):
         out.append("  [%s],   # row %d" % (", ".join("%3d" % v for v in row), i))
     out.append("]")
+    return "\n".join(out)
+
+
+def hitbox_block(h: Hitbox) -> str:
+    """One `[[hitbox]]` block, as :func:`dumps` would write it."""
+    out: List[str] = ["[[hitbox]]"]
+    _kv(out, "set", h.set)
+    _kv(out, "bone", h.bone)
+    _kv(out, "radius", h.radius)
+    if h.shape != "sphere":
+        _kv(out, "shape", h.shape)
+    _kv(out, "offset", h.offset)
+    _kv(out, "to", h.to)
+    if h.flags:
+        out.append("flags = 0x%X" % h.flags)
+    _kv(out, "label", h.label)
+    return "\n".join(out)
+
+
+def attack_block(a: Attack) -> str:
+    """One `[[attack]]` block: the record id and only the levers that are set."""
+    out: List[str] = ["[[attack]]"]
+    _kv(out, "id", a.id)
+    if a.power is not None:
+        _kv(out, "power", a.power)
+    if a.element is not None:
+        out.append("element = 0x%02X" % a.element)      # a gate byte reads as a mask
+    if a.volume is not None:
+        _kv(out, "volume", a.volume)
+    _kv(out, "label", a.label)
     return "\n".join(out)
 
 
