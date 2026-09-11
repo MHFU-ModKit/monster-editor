@@ -74,6 +74,29 @@ def test_selected_scope_puts_the_predecessors_in_a_column_to_the_left():
     assert lay.nodes[(0, 3)].entry
 
 
+def test_moves_scope_never_reroots_a_pair_that_is_already_in_the_picture():
+    """Selecting a hub that is on screen as a terminal must not unfold it — that is
+    where the self-loop and the six extra arrows came from. A selected pair that is
+    NOT in the picture joins the roots, so the Action tab's pick is always visible."""
+    lay = G.build(_si(), MOVES, (0, 1), "moves")
+    assert lay.nodes[(0, 1)].hub and not lay.nodes[(0, 1)].entry
+    assert not any(a.src == (0, 1) for a in lay.arrows)
+    assert set(lay.nodes) == set(G.build(_si(), MOVES, None, "moves").nodes)
+    lay2 = G.build(_si(), MOVES, (3, 9), "moves")
+    assert (3, 9) in lay2.nodes and lay2.nodes[(3, 9)].entry and lay2.nodes[(3, 9)].layer == 0
+
+
+def test_the_info_lines_read_the_hand_offs_as_text():
+    lay = G.build(_si(), MOVES, None, "moves")
+    lines = G._info_lines(_si(), (1, 4), lay, MOVES)
+    assert lines[0].startswith("(1,4)  lunge -> clip c  (after = lunge_stop)")
+    assert any("-> (0,3)" in t and "budget spent" in t for t in lines), lines
+    assert any("-> (0,6)" in t and "collided" in t for t in lines)
+    assert any(t.startswith("entered from: the brain") for t in lines)
+    hub = G._info_lines(_si(), (0, 1), lay, MOVES)
+    assert any("never ends by itself" in t for t in hub)
+
+
 def test_attacks_scope_groups_pairs_with_the_same_handler_exits_and_ids():
     lay = G.build(_si(), MOVES, None, "attacks")
     assert (3, 9) in lay.nodes and (3, 10) not in lay.nodes
