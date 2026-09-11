@@ -185,6 +185,8 @@ def build(intel, moves: dict, selected: Optional[Pair], scope: str = "moves",
     for key in order:
         p = intel.pair(*key)
         lines = _label(p, bound.get(key))
+        if key in hubs and key not in roots:
+            lines = lines[:2]                  # the footer "brain picks next" is line 3
         sib = siblings.get(key, ())
         if sib:
             lines[0] += "  +%d alike" % len(sib)
