@@ -140,6 +140,19 @@ SEAM.land_as = nil
 set_pair(0, 1); ticks(3)
 assert(zin.move == nil)
 
+-- 3b. landed and already OVER within the tick (a charge the 30 Hz rule ended in
+--     0.5 s): result-after-call is our pair, the cells are past it -> not a
+--     decline; the ended path adopts `after` where the engine stands
+local t3b = #logs
+assert(zin:play("lunge"))
+set_pair(0, 3)                        -- ... and the rule handed him to the skid
+ticks(1)
+assert(count("'lunge' entered natively %(1,4%) and was over within the tick %(now %(0,3%)%)", t3b) == 1)
+assert(count("was requested and issued but", t3b) == 0, "not read as a decline")
+assert(zin.move == "lunge_stop" and count("adopted", t3b) == 1, "after adopted from the skid")
+set_pair(0, 1); ticks(3)
+assert(zin.move == nil)
+
 -- 4. the engine declines the request: reported with the ring, `after` NOT walked
 SEAM.land = false
 local before = #logs

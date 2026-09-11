@@ -256,19 +256,23 @@ label = "the engine's own skid after a charge, with the port's dash stop painted
 # cold-boot questions, not static ones.
 # ⚠️ No census covers (1,4): `entered` is UNKNOWN, not zero.
 
-# THE NATIVE "PAST YOU" RULE — evaluated every frame by the slot-29 stub, no Lua in
-# the loop (issue #16). In (1,4) for >= 15 frames (the hitbox spawns at clip frame 40
-# at speed 2.4, ~17 frames in), the gap to the hunter GROWING and >= 250 units ->
-# lunge_stop. Fires once per charge (the pair changes), then a 1 s cooldown. The
+# THE NATIVE "JUST PAST YOU" RULE — evaluated every frame by the slot-29 stub, no Lua
+# in the loop (issue #16). In (1,4) for >= 15 frames (the hitbox spawns at clip frame
+# 40 at speed 2.4, ~17 frames in), the gap to the hunter GROWING and 250..1000 units
+# -> lunge_stop. Fires once per charge (the pair changes), then a 1 s cooldown. The
 # 2 Hz `closing < 0` shortcut in zinogre_lunge.lua only runs without the seam.
+# 🔴 The window is the rule: as `[250, inf)` it fired on 62 of 65 charges in take 2
+# (2026-09-11) — with the hunter 2000+ units off, any charge not aimed dead at him
+# reads as receding at frame 15. Receding AND close is "just past you"; at ~650
+# units/tick the window is about one tick wide, which is why it lives at 30 Hz.
 [[rule]]
 from = "lunge"
 min_frames = 15
-dist = [250, 1e9]
+dist = [250, 1000]
 receding = true
 play = "lunge_stop"
 cooldown = 30
-label = "past you -> skid"
+label = "just past you -> skid"
 
 [[hurtbox]]
 bone = 35
