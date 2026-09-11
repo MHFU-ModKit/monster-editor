@@ -25,7 +25,31 @@ from mhfu_monster_editor import manifest as MF
 from mhfu_monster_editor import parts as P
 
 PORTS = os.path.join(_ROOT, "ports")
-ZINOGRE = os.path.join(PORTS, "zinogre.toml")
+SHIPPED = os.path.join(PORTS, "zinogre.toml")
+
+
+def _bare(shipped=SHIPPED):
+    """The shipped manifest with its `[[hurtbox]]` / `[[hitzone]]` blocks stripped.
+
+    Every test here starts from "nothing authored yet"; since 2026-09-11 the shipped
+    file carries the user's own tables (the #19 experiment), so the fixture is a
+    temp copy with those blocks patched out — the prose and the clips untouched.
+    """
+    text = open(shipped, encoding="utf-8").read()
+    m = MF.loads(text)
+    assert not m.parts, "the fixture cannot strip named [parts.*] tables"
+    ops = [MF.ReplaceBlock("hurtbox", i, None) for i in range(len(m.hurtboxes) - 1, -1, -1)]
+    ops += [MF.ReplaceBlock("hitzone", i, None) for i in range(len(m.hitzones) - 1, -1, -1)]
+    bare = MF.patch(text, ops) if ops else text
+    d = tempfile.mkdtemp(prefix="mhfu_bare_")
+    path = os.path.join(d, "zinogre.toml")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(bare)
+    return path
+
+
+#: the bare fixture; a temp file, so `save()` in a test never touches ports/
+ZINOGRE = _bare()
 
 ROW = [100, 75, 65, 40, 0, 15, 5, 30, 20, 110]
 GRID = [list(ROW)] + [[0] * 10 for _ in range(6)]
@@ -177,10 +201,13 @@ def test_adopting_volumes_reports_the_bones_that_do_not_fit():
     s = _session(n_bones=46)
     got = s.adopt_volumes([S(2), S(45), S(46), S(125)], source="em75")
     assert got.adopted == 4
-    assert got.off_rig == [46, 125], got.off_rig
+    # 125 (0x7D) is the walker's tail-sever MARKER, not a joint: expected off-rig,
+    # kept in order, and not a fault to report
+    assert got.off_rig == [46], got.off_rig
     assert not got.clean
     assert "does not have" in got.describe()
     assert "em75" in got.describe()
+    assert s.volumes()[3].is_marker and not s.volumes()[2].is_marker
 
 
 def test_a_clean_adoption_still_refuses_to_claim_the_bones_are_right():
@@ -304,18 +331,137 @@ def test_a_manifest_with_no_path_says_where_it_would_go_rather_than_guessing():
 # --------------------------------------------------------------------------- #
 # against the real host
 # --------------------------------------------------------------------------- #
-def test_the_tigrex_volumes_do_not_fit_the_zinogre_rig():
-    """The measured version of the warning: the Zinogre ships 46 joints and 19 of
-    em75's 153 volumes name a bone it does not have. Adopting them is still the right
-    starting point — you can SEE where they land — but the count has to be told."""
+def test_the_tigrex_volumes_adopt_as_the_set_he_walks():
+    """The measured version of the warning. Since 2026-09-11 the intel names the
+    ONE set species 75 walks (42 records, bones up to 44 plus three 0x7D markers), so
+    on the Zinogre's 46-joint rig every index EXISTS — which is precisely the case
+    the adoption text refuses to call correct. An older intel file without the
+    active set still hands over all 153, 19 of them off the rig."""
     si = I.find_intel(75)
     if si is None or not si.parts.present:
         return
     s = _session(n_bones=46)
     got = s.adopt_volumes(si.parts.spheres(), source="em75")
     assert got.adopted == len(si.parts.spheres())
-    assert got.off_rig, "every host bone index fitted, which would be a surprise"
+    if si.parts.active is not None:
+        assert got.adopted == si.parts.capacity == 42
+        assert got.clean, got.off_rig
+        assert sum(1 for v in s.volumes() if v.is_marker) == 3
+        assert "not the same as pointing at the right joint" in got.describe()
+    else:
+        assert got.off_rig, "every host bone index fitted, which would be a surprise"
     assert s.preview(open(ZINOGRE, encoding="utf-8").read())
+
+
+# --------------------------------------------------------------------------- #
+# editing the volumes (2026-09-11)
+# --------------------------------------------------------------------------- #
+class _Sphere:
+    def __init__(self, bone, part=1, row=2, r=100.0, flags=0):
+        self.bone, self.part, self.hitzone_row, self.radius = bone, part, row, r
+        self.a, self.b, self.is_capsule, self.flags = (0.0, 5.0, 0.0), None, False, flags
+
+
+def _with_volumes(n=3):
+    s = _session(n_bones=46)
+    s.adopt_volumes([_Sphere(2, r=100.0), _Sphere(3, r=80.0, flags=0x101),
+                     _Sphere(4, part=2, row=3, r=60.0)][:n])
+    return s
+
+
+def test_scaling_a_volume_changes_its_radius_and_nothing_else():
+    s = _with_volumes()
+    before = s.volumes()[1]
+    got = s.scale_volume(1, 3.0)
+    assert got.radius == 240.0
+    assert (got.bone, got.part, got.hitzone_row, got.flags) == (3, 1, 2, 0x101)
+    assert s.volumes()[0] == _with_volumes().volumes()[0]
+    assert before.radius == 80.0, "the previous record was mutated in place"
+
+
+def test_editing_a_volume_is_checked_like_the_loader():
+    s = _with_volumes()
+    for bad in (dict(part=8), dict(hitzone_row=7), dict(shape="box"),
+                dict(radius=-1.0), dict(offset=[1.0, 2.0]), dict(bone=70000),
+                dict(colour="red")):
+        try:
+            s.edit_volume(0, **bad)
+        except MF.ManifestError:
+            continue
+        raise AssertionError("%r was accepted" % (bad,))
+    s.edit_volume(0, bone=7, offset=[0.0, 55.0, 0.0], hitzone_row=0, part=1)
+    v = s.volumes()[0]
+    assert (v.bone, v.offset, v.hitzone_row, v.part) == (7, [0.0, 55.0, 0.0], 0, 1)
+
+
+def test_keep_only_leaves_one_volume_and_counts_the_rest():
+    """The #19 experiment in one call: one sphere, and a hit lands there or nowhere."""
+    s = _with_volumes()
+    assert s.keep_only(2) == 2
+    assert [v.bone for v in s.volumes()] == [4]
+    s.remove_volume(0)
+    assert s.volumes() == []
+    try:
+        s.remove_volume(0)
+    except MF.ManifestError:
+        return
+    raise AssertionError("removing from an empty list was accepted")
+
+
+def test_volume_ops_replace_append_and_delete_by_file_index():
+    """An edit to a block the FILE has is a ReplaceBlock at its index; a new one is
+    appended; a dropped one is deleted last and from the back so the earlier
+    indices stay valid. Checked against the ops, then against the patched text."""
+    import tempfile
+    text = open(ZINOGRE, encoding="utf-8").read()
+    base = _with_volumes()
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "z.toml")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(base.preview(text))
+        m = MF.load(path)
+        assert len(m.hurtboxes) == 3
+        s = P.PartSession(m, n_bones=46)
+        assert s.pending == 0
+        s.scale_volume(0, 2.0)                       # replace [0]
+        s.remove_volume(1)                           # delete file index 1
+        s.add_volume(MF.Hurtbox(bone=9, radius=10.0, part=3, hitzone_row=4))
+        kinds = [type(op).__name__ + (":%d" % op.index if hasattr(op, "index") else "")
+                 for op in s.ops()]
+        assert kinds == ["ReplaceBlock:0", "AppendBlock", "ReplaceBlock:1"], kinds
+        assert s.pending == 3 and s.pending_volumes == 3
+        assert s.volume_changed(0) and not s.volume_changed(1) and s.volume_changed(2)
+        s.save()
+        m2 = MF.load(path)
+        assert [(h.bone, h.radius) for h in m2.hurtboxes] == \
+            [(2, 200.0), (4, 60.0), (9, 10.0)], m2.hurtboxes
+        assert m2.hurtboxes[0].flags == 0 and MF.load(path).hurtboxes[1].part == 2
+
+
+def test_flags_round_trip_through_the_manifest_as_hex():
+    s = _with_volumes()
+    text = s.preview(open(ZINOGRE, encoding="utf-8").read())
+    assert "flags = 0x101" in text
+    m = MF.loads(text)
+    assert [h.flags for h in m.hurtboxes] == [0, 0x101, 0]
+
+
+def test_over_capacity_counts_what_would_not_fit_in_place():
+    s = _with_volumes()
+    assert s.over_capacity == 0                      # capacity unknown = no check
+    s.capacity = 2
+    assert s.over_capacity == 1
+    s.keep_only(0)
+    assert s.over_capacity == 0
+
+
+def test_fill_row_sets_the_weapon_columns_at_once():
+    s = _session()
+    s.adopt_grid([_State(GRID), _State(GRID)])
+    s.fill_row(0, 0, 255)
+    row = s.state(0).rows[0]
+    assert row[1:4] == [255, 255, 255] and row[0] == 100 and row[9] == 110
+    assert s.state(1).rows[0] == ROW
 
 
 def test_summarise_says_the_port_inherits_a_grid_it_has_not_authored():

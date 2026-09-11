@@ -388,7 +388,15 @@ def test_a_part_may_use_more_than_one_hitzone_row_and_says_so():
     si = I.find_intel(75)
     if si is None or not si.parts.present:
         return
-    assert si.parts.rows_of_part(6) == [3, 5], si.parts.rows_of_part(6)
+    # ⚠️ corrected 2026-09-11: "part 6 uses rows 3 AND 5" was an artefact of merging
+    # all four em75 sets — set 0 (the one species 75 walks) has the wing on row 5
+    # only; row 3 is species 81's and 88's. The real Tigrex example is the HEAD:
+    # part 1's spheres sit on rows 1 and 2.
+    if si.parts.active is not None:
+        assert si.parts.rows_of_part(6) == [5], si.parts.rows_of_part(6)
+        assert si.parts.rows_of_part(1) == [1, 2], si.parts.rows_of_part(1)
+    else:
+        assert si.parts.rows_of_part(6) == [3, 5], si.parts.rows_of_part(6)
 
 
 def test_the_inferred_column_names_are_flagged_as_inferred():

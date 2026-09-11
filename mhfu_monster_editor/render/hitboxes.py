@@ -243,6 +243,9 @@ class HitboxOverlay:
         self.n_bones = int(n_bones)
         self.visible_parts: Optional[frozenset] = None
         self.selected_part: Optional[int] = None
+        #: ONE volume, by index into :attr:`volumes`, singled out for editing: it
+        #: alone gets the shell and everything else dims, whatever its part.
+        self.selected_volume: Optional[int] = None
         #: volumes whose bone is off the end of this rig — drawn NOWHERE, counted here
         self.orphans: Tuple[Volume, ...] = tuple(
             v for v in self.volumes if not 0 <= v.bone < self.n_bones)
@@ -269,6 +272,21 @@ class HitboxOverlay:
         if p != self.selected_part:
             self.selected_part = p
             self._dirty = True
+
+    def set_selected_volume(self, index: Optional[int]) -> None:
+        """Single out one volume. Out-of-range clears, rather than raising in the
+        middle of a frame after a list the panel just shortened."""
+        i = None if index is None or not 0 <= int(index) < len(self.volumes) \
+            else int(index)
+        if i != self.selected_volume:
+            self.selected_volume = i
+            self._dirty = True
+
+    def index_of(self, v: Volume) -> Optional[int]:
+        for i, x in enumerate(self.volumes):
+            if x is v:
+                return i
+        return None
 
     def shown(self) -> List[Volume]:
         """The volumes that will actually be drawn, orphans excluded."""
@@ -309,17 +327,25 @@ class HitboxOverlay:
 
     def _rebuild(self) -> None:
         pos, col, fpos, fcol = [], [], [], []
+        one = (None if self.selected_volume is None
+               else self.volumes[self.selected_volume])
         for v in self.shown():
             a, b = self._place(v)
             g = (sphere_geometry(a, v.radius) if b is None
                  else capsule_geometry(a, b, v.radius))
             rgb = PART_COLORS[v.part % len(PART_COLORS)]
             alpha = LIVE_ALPHA
-            if self.selected_part is not None and v.part != self.selected_part:
+            if one is not None:
+                # a single volume singled out overrides the part focus: it is the
+                # one being edited, and the question is "where is THIS one"
+                focus = v is one
+            else:
+                focus = self.selected_part is not None and v.part == self.selected_part
+            if (one is not None or self.selected_part is not None) and not focus:
                 alpha = DIM_ALPHA
             pos.append(g)
             col.append(np.tile(np.array((*rgb, alpha), dtype="f4"), (len(g), 1)))
-            if self.selected_part is not None and v.part == self.selected_part:
+            if focus:
                 f = (sphere_surface(a, v.radius) if b is None
                      else capsule_surface(a, b, v.radius))
                 fpos.append(f)

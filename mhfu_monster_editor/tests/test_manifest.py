@@ -479,11 +479,15 @@ def test_an_offset_must_be_three_numbers():
 
 
 def test_the_shipped_manifests_still_load_and_round_trip():
-    """The part block is additive: neither shipped port declares one, and adding the
-    schema must not change how they parse."""
+    """The part block is additive: adding the schema must not change how the shipped
+    ports parse. (The Zinogre carries authored tables since 2026-09-11 — the #19
+    experiment — so "declares none" is no longer asserted; the round trip is.)"""
     for m in MF.discover(PORTS):
-        assert m.parts == {} and m.hitzones == []
         assert MF.loads(MF.dumps(m)) == m
+        for h in m.hurtboxes:
+            assert 0 <= (h.part or 0) < MF.PART_SLOTS
+        for hz in m.hitzones:
+            assert len(hz.rows) == MF.HITZONE_ROWS
 
 
 
@@ -493,11 +497,12 @@ def test_a_block_op_appends_a_hurtbox_without_touching_the_prose():
     how the editor writes them, and the point of patching at all is that the
     hand-authored comments survive."""
     src = open(os.path.join(PORTS, "zinogre.toml"), encoding="utf-8").read()
+    had = len(MF.loads(src).hurtboxes)          # the shipped file may carry some
     h = MF.Hurtbox(bone=10, radius=150.0, part=1, hitzone_row=2, label="head")
     out = MF.patch(src, [MF.AppendBlock(MF.hurtbox_block(h))])
     m = MF.loads(out)
-    assert len(m.hurtboxes) == 1 and m.hurtboxes[0].part == 1
-    assert m.hurtboxes[0].hitzone_row == 2
+    assert len(m.hurtboxes) == had + 1 and m.hurtboxes[-1].part == 1
+    assert m.hurtboxes[-1].hitzone_row == 2
     assert out.count("#") >= src.count("#"), "comments were lost"
     assert src.rstrip() in out.replace("\n\n[[hurtbox]]", "@@").replace("@@", "") \
         or src.splitlines()[0] in out

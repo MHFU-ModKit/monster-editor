@@ -179,11 +179,21 @@ class Hurtbox:
     offset: Optional[List[float]] = None
     #: capsule far end, bone-relative. Ignored for a sphere.
     to: Optional[List[float]] = None
+    #: the record's `+0x08` word, shipped verbatim. The engine's walkers SKIP a
+    #: record whose flags meet `hitzone.WALK_SKIP_MASK` (0x050A0A04); a hurtbox
+    #: the hunter can hit is 0 or 0x101 on the Tigrex. Leave it 0 unless copying.
+    flags: int = 0
     label: str = ""
 
     @property
     def is_capsule(self) -> bool:
         return self.shape == "capsule"
+
+    @property
+    def is_marker(self) -> bool:
+        """Bones 0x7D..0x7F are walker markers (0x7D = the tail-sever skip), not
+        joints. They draw nowhere and are kept in order when adopted."""
+        return self.bone in (0x7D, 0x7E, 0x7F)
 
 
 @dataclass
@@ -197,7 +207,8 @@ class Part:
     name: str
     index: int
     #: the grid row this part's spheres read. Advisory: the row is per SPHERE and a
-    #: part may legitimately use more than one (Tigrex part 6 uses rows 3 and 5).
+    #: part may legitimately use more than one (the Tigrex head, part 1, sits on
+    #: rows 1 and 2).
     hitzone_row: Optional[int] = None
     #: severable in the MH sense — the tail comes off. Recorded, NOT yet implemented:
     #: the sever mechanic is deferred (`docs/BRUTE_TIGREX_PORT.md`).
@@ -452,7 +463,7 @@ _CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame",
 _MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label",
               "allow_unentered")
 _HURTBOX_KEYS = ("bone", "radius", "part", "hitzone_row", "shape", "offset",
-                 "to", "label")
+                 "to", "flags", "label")
 _PART_KEYS = ("index", "hitzone_row", "severable", "label")
 _HITZONE_KEYS = ("state", "rows", "label")
 _EFFECT_KEYS = ("move", "frame", "id", "bone", "label")
@@ -554,6 +565,7 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
             part=_bounded(h, "part", w, PART_SLOTS),
             hitzone_row=_bounded(h, "hitzone_row", w, HITZONE_ROWS),
             shape=shape, offset=_vec3(h, "offset", w), to=_vec3(h, "to", w),
+            flags=_opt(h, "flags", int, w, 0),
             label=_opt(h, "label", str, w, "")))
 
     parts: Dict[str, Part] = {}
@@ -757,16 +769,7 @@ def dumps(m: PortManifest) -> str:
         _kv(out, "label", pt.label)
 
     for h in m.hurtboxes:
-        out += ["", "[[hurtbox]]"]
-        _kv(out, "bone", h.bone)
-        _kv(out, "radius", h.radius)
-        _kv(out, "part", h.part)
-        _kv(out, "hitzone_row", h.hitzone_row)
-        if h.shape != "sphere":
-            _kv(out, "shape", h.shape)
-        _kv(out, "offset", h.offset)
-        _kv(out, "to", h.to)
-        _kv(out, "label", h.label)
+        out += ["", hurtbox_block(h)]
 
     for hz in m.hitzones:
         out += ["", "[[hitzone]]"]
@@ -800,6 +803,8 @@ def hurtbox_block(h: Hurtbox) -> str:
         _kv(out, "shape", h.shape)
     _kv(out, "offset", h.offset)
     _kv(out, "to", h.to)
+    if h.flags:
+        out.append("flags = 0x%X" % h.flags)     # TOML hex; readable as a mask
     _kv(out, "label", h.label)
     return "\n".join(out)
 

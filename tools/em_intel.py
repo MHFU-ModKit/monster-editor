@@ -348,6 +348,16 @@ def parts_intel(ov: Overlay, species: int, game_task: Path | None) -> dict:
     """
     img = hz.Image.parse(Path(ov.path).read_bytes())
     sets = hz.find_sets(img)
+    grid_img = (hz.Image.parse(game_task.read_bytes())
+                if game_task and game_task.exists() else None)
+    # Which set THIS species walks is not in the overlay at all: its game_task.ovl
+    # row points at it (`+0x240`). The structural search finds most of them and
+    # misses five (em01/15/40/58/82); the pointer walk is the authority, so a set
+    # it names that `find_sets` did not is added rather than left out.
+    own = hz.own_set(img, grid_img, species) if grid_img is not None else None
+    owners = hz.species_sets(img, grid_img) if grid_img is not None else {}
+    if own is not None and own.va not in {st.va for st in sets}:
+        sets.append(own)
     out = {
         "present": True,
         "source": "tools/mhfu_model/hitzone.py",
@@ -356,14 +366,23 @@ def parts_intel(ov: Overlay, species: int, game_task: Path | None) -> dict:
         "sets": [
             {"va": "0x%08X" % st.va, "kind": st.kind, "count": len(st.spheres),
              "bones": st.bones, "parts": st.parts, "rows": st.rows,
+             # the species id(s) whose row points at exactly this set. The overlay
+             # serves several ids (em75: 75, 76, 81, 88 — one set each).
+             "species": [sp for va, sp in sorted(owners.items()) if va == st.va],
              "spheres": [_sphere(s) for s in st.spheres]}
-            for st in sets if st.kind != hz.KIND_UNKNOWN],
+            for st in sorted(sets, key=lambda st: st.va)
+            if st.kind != hz.KIND_UNKNOWN],
         "unclassified_runs": sum(1 for st in sets if st.kind == hz.KIND_UNKNOWN),
+        # the set a weapon resolves against for THIS species, and the u32 that
+        # says so — the in-place runtime seam and its capacity
+        "active_set": None if own is None else "0x%08X" % own.va,
+        "active_capacity": None if own is None else len(own.spheres),
+        "sphere_table_field": ("0x%08X" % (hz.SPECIES_TABLE + hz.SPHERE_TABLE_FIELD
+                                           + species * hz.SPECIES_STRIDE)),
         "grid": {"present": False, "reason": "%s not found beside the overlay"
                                              % GAME_TASK},
     }
-    if game_task and game_task.exists():
-        grid_img = hz.Image.parse(game_task.read_bytes())
+    if grid_img is not None:
         g = hz.species_hitzones(grid_img, species)
         if g is None:
             out["grid"] = {"present": False,

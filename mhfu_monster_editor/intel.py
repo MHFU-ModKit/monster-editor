@@ -334,10 +334,20 @@ class HitSphere:
     shape: str = "sphere"
     a: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     b: Optional[Tuple[float, float, float]] = None
+    #: the record's `+0x08` word. Both engine walkers skip a record whose flags
+    #: meet `hitzone.WALK_SKIP_MASK`; set 0's hurtboxes are 0 or 0x101. Carried so
+    #: an adopted volume ships the word it came with instead of a guess.
+    flags: int = 0
 
     @property
     def is_capsule(self) -> bool:
         return self.shape == "capsule"
+
+    @property
+    def is_marker(self) -> bool:
+        """Bones 0x7D..0x7F are not joints: 0x7D is the tail-sever skip the
+        walker hands to `0x09C38658`. Drawn nowhere, but real, and kept in order."""
+        return self.bone in (0x7D, 0x7E, 0x7F)
 
     @classmethod
     def from_dict(cls, d: dict) -> "HitSphere":
@@ -347,15 +357,20 @@ class HitSphere:
                    radius=float(d.get("radius", 0.0)),
                    shape=str(d.get("shape", "sphere")),
                    a=tuple(float(v) for v in d.get("a", (0, 0, 0))),
-                   b=None if b is None else tuple(float(v) for v in b))
+                   b=None if b is None else tuple(float(v) for v in b),
+                   flags=_addr(d.get("flags")) or 0)
 
 
 @dataclass
 class HitboxSet:
-    """One sentinel-delimited run of spheres. A species has one to five."""
+    """One sentinel-delimited run of spheres. An OVERLAY has one to five; a species
+    walks exactly one of them — the one its `game_task.ovl` row points at."""
     va: int
     kind: str
     spheres: List[HitSphere] = field(default_factory=list)
+    #: the species id(s) whose row points at this set. em75's four sets belong to
+    #: 75, 81, 76 and 88 respectively — the overlay serves four ids.
+    species: List[int] = field(default_factory=list)
 
     @property
     def parts(self) -> List[int]:
@@ -374,7 +389,8 @@ class HitboxSet:
     @classmethod
     def from_dict(cls, d: dict) -> "HitboxSet":
         return cls(va=_addr(d.get("va")) or 0, kind=str(d.get("kind", "")),
-                   spheres=[HitSphere.from_dict(x) for x in d.get("spheres", [])])
+                   spheres=[HitSphere.from_dict(x) for x in d.get("spheres", [])],
+                   species=[int(x) for x in d.get("species", [])])
 
 
 @dataclass
@@ -415,6 +431,11 @@ class PartIntel:
     grid_note: str = ""
     unclassified_runs: int = 0
     validated_in_game: bool = False
+    #: the set THIS species walks — its `game_task.ovl` row's `+0x240` pointer,
+    #: followed. None on a `species/emNN.json` older than 2026-09-11.
+    active_set_va: Optional[int] = None
+    #: the u32 holding that pointer: the runtime seam (`0x09BC11F0` for em75)
+    sphere_table_field: Optional[int] = None
 
     @property
     def has_grid(self) -> bool:
@@ -426,11 +447,41 @@ class PartIntel:
         return [s for s in self.sets if s.kind == SET_HURTBOX]
 
     @property
+    def active(self) -> Optional[HitboxSet]:
+        """The one set a weapon resolves against for this species.
+
+        The overlay holds several and the engine walks ONE: em75's other three are
+        species 76, 81 and 88's. Drawing all four on the animal — which this used
+        to do — showed 153 volumes where the game sees 42.
+        """
+        for st in self.sets:
+            if st.va == self.active_set_va:
+                return st
+        return None
+
+    @property
+    def capacity(self) -> Optional[int]:
+        """How many records fit IN PLACE — the active set's own count."""
+        st = self.active
+        return None if st is None else len(st.spheres)
+
+    @property
     def n_states(self) -> int:
         return len(self.states)
 
     def spheres(self) -> List[HitSphere]:
-        """Every hurtbox sphere across every set, for drawing."""
+        """The spheres the species walks, for drawing and adopting.
+
+        The active set when the intel names one; every hurtbox set otherwise, which
+        is the pre-2026-09-11 behaviour and is only right for a one-set overlay.
+        """
+        st = self.active
+        if st is not None:
+            return list(st.spheres)
+        return [s for st in self.hurtboxes for s in st.spheres]
+
+    def all_spheres(self) -> List[HitSphere]:
+        """Every hurtbox sphere across every set, whoever walks it."""
         return [s for st in self.hurtboxes for s in st.spheres]
 
     def parts(self) -> List[int]:
@@ -474,7 +525,9 @@ class PartIntel:
             state_table=_addr(g.get("state_table")),
             grid_reason="" if g.get("present") else str(g.get("reason", "")),
             grid_note=str(g.get("note", "")),
-            unclassified_runs=int(d.get("unclassified_runs", 0)))
+            unclassified_runs=int(d.get("unclassified_runs", 0)),
+            active_set_va=_addr(d.get("active_set")),
+            sphere_table_field=_addr(d.get("sphere_table_field")))
 
 
 # --------------------------------------------------------------------------- #

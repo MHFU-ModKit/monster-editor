@@ -129,8 +129,11 @@ def test_the_shipped_manifests_validate_against_their_own_builds():
             assert not errs, "%s: %s" % (m.name, [str(e) for e in errs])
             # the two we expect: no census on this machine (#4), and the shipped
             # labels predate #8 so none of them records the build it was written
-            # against. Anything ELSE is a real finding.
-            assert all(i.code in ("INTEL_ABSENT", "LABEL_UNKEYED") for i in issues), \
+            # against — plus, since the Zinogre carries authored hit tables (#19,
+            # 2026-09-11), the two advisories authoring them always earns.
+            # Anything ELSE is a real finding.
+            assert all(i.code in ("INTEL_ABSENT", "LABEL_UNKEYED", "HITZONE_SHARED",
+                                  "PARTS_UNNAMED") for i in issues), \
                 "%s: %s" % (m.name, [str(i) for i in issues])
 
 

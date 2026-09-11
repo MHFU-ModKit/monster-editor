@@ -172,11 +172,18 @@ def _check_parts(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
                              % (len(m.hitzones), getattr(intel, "host_species", -1),
                                 pt.n_states)))
     if m.hitzones:
-        out.append(Issue(WARNING, "HITZONE_SHARED_AND_UNVALIDATED", "hitzone",
-                         "the damage grid is SPECIES data, shared map-wide: editing "
-                         "it changes the native host monster too, and no cold boot "
-                         "has ever changed it and confirmed the effect (#19). This "
-                         "records what the port WANTS."))
+        out.append(Issue(WARNING, "HITZONE_SHARED", "hitzone",
+                         "the damage grid is SPECIES data, shared map-wide: with the "
+                         "port REPLACING the host it is his alone; beside a native "
+                         "host monster it changes that one too. Shipped by "
+                         "mhfu_monster_editor.runtime -> P.hit() over the species' "
+                         "0x48 blocks (grid writes proven live 2026-06-28)."))
+    cap = getattr(pt, "capacity", None) if pt is not None else None
+    if m.hurtboxes and cap is not None and len(m.hurtboxes) > cap:
+        out.append(Issue(WARNING, "HURTBOX_OVER_CAPACITY", "hurtbox",
+                         "%d volume(s) but the host set holds %d: the runtime writes "
+                         "them IN PLACE over that set and truncates the rest (#19)."
+                         % (len(m.hurtboxes), cap)))
     if m.hurtboxes and not m.parts:
         out.append(Issue(WARNING, "PARTS_UNNAMED", "parts",
                          "%d hurtbox volume(s) and no [parts] — nothing in this file "

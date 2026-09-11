@@ -132,6 +132,22 @@ def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None,
                 sess.adopt_volumes(host.spheres()[:8])
                 app.parts_source = "port"
                 app.sync_hitboxes()
+        elif f == 7:
+            # the volume editor (#19): one volume singled out, its field widgets,
+            # and the capsule branch — the pile of imgui calls added 2026-09-11
+            sess = app.part_session
+            if sess is not None and sess.volumes():
+                app.select_volume(0)
+                sess.edit_volume(0, shape="capsule", to=[0.0, 0.0, 100.0])
+                sess.scale_volume(0, 3.0)
+                app.sync_hitboxes()
+        elif f == 8:
+            sess = app.part_session
+            if sess is not None and sess.volumes():
+                sess.keep_only(0)
+                app.select_volume(0)
+                app._only_selected_part = True
+                app.sync_hitboxes()
 
     _counted = counted
 

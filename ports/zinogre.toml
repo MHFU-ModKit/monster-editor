@@ -231,3 +231,39 @@ latch = 1                    # (1,4) names a single a1, so one dispatch covers t
 # `cursor`, so the clip's length does not end the action; the handler does. Both are
 # cold-boot questions, not static ones.
 # ⚠️ No census covers (1,4): `entered` is UNKNOWN, not zero.
+
+[[hurtbox]]
+bone = 35
+radius = 230.0
+part = 0
+hitzone_row = 0
+offset = [0.0, 0.0, 0.0]
+flags = 0x8000000
+
+[[hitzone]]
+state = "normal"
+label = "adopted from the host species; the port inherits these at runtime either way"
+#            raw     cut  impact    shot    fire   water  dragon thunder     ice      ko
+rows = [
+  [100, 255, 255, 255,   0,  15,   5,  30,  20, 110],   # row 0
+  [ 90, 255, 255, 255,   0,  10,   5,  20,  15,   0],   # row 1
+  [ 80, 255, 255, 255,  15,  15,  10,  25,  15,   0],   # row 2
+  [ 70, 255, 255, 255,   0,  15,  10,  25,   5,  10],   # row 3
+  [ 60, 255, 255, 255,   0,   5,   0,  15,  15,   0],   # row 4
+  [ 50, 255, 255, 255,   0,  15,  10,  20,  15,   0],   # row 5
+  [ 40, 255, 255, 255,   0,   5,   0,  10,   5,   0],   # row 6
+]
+
+[[hitzone]]
+state = "enraged"
+label = "adopted from the host species; the port inherits these at runtime either way"
+#            raw     cut  impact    shot    fire   water  dragon thunder     ice      ko
+rows = [
+  [100,  80,  70,  45,   0,  15,   5,  35,  20, 150],   # row 0
+  [ 90,  55,  55,  20,   0,  10,   5,  20,  15,   0],   # row 1
+  [ 80,  30,  35,  20,  15,  15,  10,  25,  15,   0],   # row 2
+  [ 70,  50,  45,  20,   0,  15,  10,  25,   5,   0],   # row 3
+  [ 60,  35,  30,  10,   0,   5,   0,  15,  15,   0],   # row 4
+  [ 50,  30,  25,  30,   0,  15,  10,  25,  15,   0],   # row 5
+  [ 40,  40,  45,  40,   0,   5,   0,  10,   5,   0],   # row 6
+]

@@ -325,8 +325,11 @@ def test_the_shipped_manifests_labels_still_point_at_their_clips():
     tracks = C.track_labels(m, port, build)
     assert tracks and all(t.trusted for t in tracks), \
         [str(t) for t in tracks if not t.trusted]
-    assert all(t.status == C.STILL_VALID for t in tracks), \
-        "none of them records a build yet, so none can be CURRENT"
+    # since the 2026-09-10 labelling session every label records the build it was
+    # named against (`zinogre_v10.bin@09091d56`), so against that build they are
+    # CURRENT; against any other build they may only be STILL_VALID
+    assert all(t.status in (C.CURRENT, C.STILL_VALID) for t in tracks), \
+        [str(t) for t in tracks if t.status not in (C.CURRENT, C.STILL_VALID)]
     assert "@" in build and build.startswith("zinogre_v10.bin"), build
     print("zinogre           %d manifest labels still point at their clips (%s)"
           % (len(tracks), build))

@@ -198,8 +198,10 @@ def test_a_manifest_opens_both_sides_and_its_clip_fingerprints_check_out():
         port = open_scene(m, pac=_built("zinogre", td))
     assert port.game == "mhfu" and port.rig.n_bones == 51
     assert port.clip_mismatches() == [], port.clip_mismatches()
-    assert port.clip("clip_10").slot == 10 and port.clip("clip_10").frames == 408
-    assert port.clip("clip_10").loop is True
+    # slot 10 was `clip_10` until the 2026-09-10 labelling session named it
+    c10 = next(c for c in port.clips if c.slot == 10)
+    assert c10.name == "standing_charge_up" and c10.frames == 408
+    assert port.clip("standing_charge_up").loop is True
     src = open_scene(m, side="source")
     assert src.game == "mhp3rd" and src.record_to_bone is not None
     assert src.manifest is m

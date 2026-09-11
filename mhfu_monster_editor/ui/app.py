@@ -108,10 +108,15 @@ class EditorApp:
         #: "host" = the host overlay's own volumes, "port" = this manifest's.
         self.parts_source = "host"
         self.selected_part: Optional[int] = None
+        #: ONE volume singled out for editing — an index into the port's list
+        self.selected_volume: Optional[int] = None
+        self._only_selected_part = False
         self._parts = None
         self._orphans = ()
         self._part_name_buf = ""
         self._grid_state = 0
+        #: the last runtime module the Parts panel exported, for the deploy button
+        self._hit_export = None
         #: `clips.Coverage` + `LabelTrack`s + the build id, computed once. → #8
         self._vocab = None
         #: `clips.LabelSession` — manifest edits typed here, not yet on disk
@@ -406,22 +411,33 @@ class EditorApp:
             vp.clear_hitboxes()          # clears the reference's too
             self._orphans = ()
             return
+        host = self.host_parts()
         if self.parts_source == "port":
             sess = self.part_session
+            if sess is not None and host is not None:
+                sess.capacity = host.capacity
             vols = sess.volumes() if sess is not None else list(
                 getattr(self.scene.manifest, "hurtboxes", []) or [])
         else:
-            host = self.host_parts()
             vols = host.spheres() if host is not None else []
         ov = vp.set_hitboxes(vols)
         self._orphans = () if ov is None else ov.orphans
         if ov is not None:
             ov.set_selected_part(self.selected_part)
+            ov.set_selected_volume(self.selected_volume
+                                   if self.parts_source == "port" else None)
         # the HOST actor beside the port draws the HOST's own volumes, whatever the
         # port has authored — those bone indices were written for that rig, and the
         # side-by-side is what makes a sphere on the wrong joint legible.
-        host = self.host_parts()
         vp.set_reference_hitboxes([] if host is None else host.spheres())
+
+    def select_volume(self, index: Optional[int]) -> None:
+        """Single out one of the port's volumes, in the list and in the viewport."""
+        self.selected_volume = index
+        vp = self.viewport
+        if vp is not None and vp.hitboxes is not None:
+            vp.hitboxes.set_selected_volume(index if self.parts_source == "port"
+                                            else None)
 
     def _parts_panel(self) -> None:
         """Where he can be hit, and for how much — the two tables, on the live pose."""
@@ -455,6 +471,9 @@ class EditorApp:
 
         _part_table(imgui, self, host)
         imgui.separator()
+        if self.parts_source == "port":
+            _volume_editor(imgui, self, host)
+            imgui.separator()
         _grid_view(imgui, self, host)
         imgui.separator()
         _part_actions(imgui, self, host, m)
@@ -1276,9 +1295,19 @@ class EditorApp:
         if self._hovered and imgui.is_mouse_clicked(_DRAG_ORBIT) \
                 and not imgui.is_mouse_dragging(_DRAG_ORBIT):
             m = imgui.get_io().mouse_pos
-            hit = sk.pick(mvp, size, m.x - pos.x, m.y - pos.y)
-            if hit is not None:
-                vp.select_joint(None if sk.selected == hit else hit)
+            # a shown volume under the cursor wins over a joint: with the gizmos
+            # on, the click is "this sphere", and the joint is still one key away
+            picked = None
+            if self.show_parts and self.parts_source == "port" \
+                    and vp.hitboxes is not None:
+                v = vp.hitboxes.pick(mvp, size, m.x - pos.x, m.y - pos.y)
+                picked = None if v is None else vp.hitboxes.index_of(v)
+            if picked is not None:
+                self.select_volume(None if self.selected_volume == picked else picked)
+            else:
+                hit = sk.pick(mvp, size, m.x - pos.x, m.y - pos.y)
+                if hit is not None:
+                    vp.select_joint(None if sk.selected == hit else hit)
 
         if not self.show_joint_ids and sk.selected is None:
             return
@@ -1726,8 +1755,22 @@ def _part_table(imgui, app, host) -> None:
     """One row per accumulator slot: colour, name, what is attached, and isolate."""
     vols = _volumes_now(app)
     nb = app.scene.rig.n_bones
-    imgui.text_disabled("%d volume(s) on %d bone(s) of %d"
-                        % (len(vols), len({v.bone for v in vols}), nb))
+    real = [v for v in vols if not getattr(v, "is_marker", False)]
+    imgui.text_disabled("%d volume(s) on %d bone(s) of %d%s"
+                        % (len(real), len({v.bone for v in real}), nb,
+                           "" if len(real) == len(vols)
+                           else ", +%d walker marker(s)" % (len(vols) - len(real))))
+    if app.parts_source == "host" and host is not None:
+        if host.active is not None:
+            imgui.text_disabled("the set species %s walks: 0x%08X (%d records). The "
+                                "overlay holds %d; the rest are other species ids'."
+                                % (",".join(str(x) for x in host.active.species)
+                                   or "?", host.active.va, host.capacity,
+                                   len(host.hurtboxes)))
+        else:
+            imgui.text_disabled("every hurtbox set in the overlay — rebuild "
+                                "species/emNN.json (tools/em_intel.py --all) to "
+                                "see only the one this species walks")
     if app._orphans:
         imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.35, 0.35, 1.0))
         imgui.text_wrapped(
@@ -1819,6 +1862,190 @@ def _bone_span(bones) -> str:
     return ", ".join(out)
 
 
+_SHAPES = ("sphere", "capsule")
+
+
+def _volume_editor(imgui, app, host) -> None:
+    """The port's volumes, one selectable row each, and the selected one's fields.
+
+    This is the authoring half of issue #19: pick a sphere, make it obviously
+    different (scale it, move it, keep only it), and ship it. Every change lands in
+    `PartSession` and the viewport re-draws it on the live pose, so what the table
+    says and what the gizmo shows are the same object.
+    """
+    sess = app.part_session
+    if sess is None:
+        imgui.text_disabled("no manifest, so no volumes to edit")
+        return
+    vols = sess.volumes()
+    cap = sess.capacity
+    if not vols:
+        imgui.text_disabled("no [[hurtbox]] authored — adopt the host's below, or "
+                            "add one")
+        if imgui.button("add a sphere"):
+            from ..manifest import Hurtbox
+            i = sess.add_volume(Hurtbox(bone=1, radius=150.0, part=1, hitzone_row=0,
+                                        offset=[0.0, 0.0, 0.0]))
+            app.select_volume(i)
+            app.sync_hitboxes()
+        return
+
+    over = sess.over_capacity
+    head = "%d volume(s)" % len(vols)
+    if cap is not None:
+        head += ", %d fit in place" % cap
+    imgui.text_disabled(head)
+    if over:
+        imgui.same_line()
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.35, 0.35, 1.0))
+        imgui.text(plain("⚠ %d over — the runtime truncates" % over))
+        imgui.pop_style_color()
+    if app.selected_part is not None:
+        imgui.same_line()
+        _, app._only_selected_part = imgui.checkbox("only part %d" % app.selected_part,
+                                                    app._only_selected_part)
+
+    flags = (imgui.TableFlags_.borders_inner_h.value
+             | imgui.TableFlags_.row_bg.value
+             | imgui.TableFlags_.scroll_y.value
+             | imgui.TableFlags_.sizing_stretch_prop.value)
+    if imgui.begin_table("##vols", 7, flags, imgui.ImVec2(0.0, 150.0)):
+        for name, w in (("#", 0.3), ("bone", 0.4), ("shape", 0.55), ("r", 0.5),
+                        ("part", 0.4), ("row", 0.4), ("offset", 1.2)):
+            imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
+        imgui.table_setup_scroll_freeze(0, 1)
+        imgui.table_headers_row()
+        for i, v in enumerate(vols):
+            part = int(v.part or 0) & 7
+            if app._only_selected_part and app.selected_part is not None \
+                    and part != app.selected_part:
+                continue
+            imgui.table_next_row()
+            imgui.table_next_column()
+            sel = app.selected_volume == i
+            if imgui.selectable("%d##v%d" % (i, i), sel,
+                                imgui.SelectableFlags_.span_all_columns.value)[0]:
+                app.select_volume(None if sel else i)
+            if sess.volume_changed(i) and imgui.is_item_hovered():
+                imgui.set_tooltip("changed — not saved yet")
+            imgui.table_next_column()
+            if v.is_marker:
+                imgui.text_disabled("0x%X" % v.bone)
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(plain("a walker MARKER, not a joint: 0x7D is "
+                                            "the tail-sever skip. Drawn nowhere."))
+            else:
+                imgui.text(str(v.bone))
+            imgui.table_next_column()
+            imgui.text(v.shape[:4] if not v.is_marker else "mark")
+            imgui.table_next_column()
+            imgui.text("%g" % v.radius)
+            imgui.table_next_column()
+            _part_swatch(imgui, part)
+            imgui.same_line()
+            imgui.text(str(part))
+            imgui.table_next_column()
+            imgui.text(str(int(v.hitzone_row or 0)))
+            imgui.table_next_column()
+            o = v.offset or (0.0, 0.0, 0.0)
+            imgui.text("%g %g %g" % tuple(o))
+        imgui.end_table()
+
+    i = app.selected_volume
+    if i is None or not 0 <= i < len(vols):
+        imgui.text_disabled("select a volume (here, or click its gizmo) to edit it")
+        return
+    v = vols[i]
+    from ..manifest import ManifestError
+
+    def stage(**fields):
+        try:
+            sess.edit_volume(i, **fields)
+            app.sync_hitboxes()
+            app.status = "volume %d: %s (unsaved)" % (
+                i, ", ".join("%s=%s" % kv for kv in fields.items()))
+        except ManifestError as e:
+            app.status = str(e)
+
+    imgui.text("volume %d%s" % (i, " — " + v.label if v.label else ""))
+    imgui.set_next_item_width(70)
+    ch, bone = imgui.input_int("bone##vb", int(v.bone), 1, 5)
+    if ch:
+        stage(bone=max(0, bone))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain("an index into THIS port's rig (%d joints). "
+                                "Click a joint in the viewport to read its number."
+                                % app.scene.rig.n_bones))
+    imgui.same_line()
+    imgui.set_next_item_width(60)
+    ch, part = imgui.input_int("part##vp", int(v.part or 0), 1, 1)
+    if ch:
+        stage(part=max(0, min(7, part)))
+    imgui.same_line()
+    imgui.set_next_item_width(60)
+    ch, row = imgui.input_int("row##vr", int(v.hitzone_row or 0), 1, 1)
+    if ch:
+        stage(hitzone_row=max(0, min(6, row)))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain("hitzone_row: which grid row's percentages this "
+                                "volume takes. NOT the part."))
+    imgui.same_line()
+    imgui.set_next_item_width(90)
+    ch, si = imgui.combo("##vshape", _SHAPES.index(v.shape), list(_SHAPES))
+    if ch:
+        stage(shape=_SHAPES[si], to=(list(v.to) if v.to else [0.0, 0.0, 200.0])
+              if _SHAPES[si] == "capsule" else v.to)
+
+    imgui.set_next_item_width(140)
+    ch, r = imgui.drag_float("radius##vrad", float(v.radius), 1.0, 0.0, 5000.0, "%.1f")
+    if ch:
+        stage(radius=max(0.0, r))
+    imgui.same_line()
+    if imgui.button("x2"):
+        stage(radius=v.radius * 2.0)
+    imgui.same_line()
+    if imgui.button("x3"):
+        stage(radius=v.radius * 3.0)
+    imgui.same_line()
+    if imgui.button("x0.5"):
+        stage(radius=v.radius * 0.5)
+
+    imgui.set_next_item_width(230)
+    ch, off = imgui.input_float3("offset##voff", list(v.offset or (0.0, 0.0, 0.0)),
+                                 "%.1f")
+    if ch:
+        stage(offset=[float(x) for x in off])
+    if v.is_capsule:
+        imgui.set_next_item_width(230)
+        ch, to = imgui.input_float3("to##vto", list(v.to or (0.0, 0.0, 0.0)), "%.1f")
+        if ch:
+            stage(to=[float(x) for x in to])
+    imgui.text_disabled("flags 0x%X%s" % (v.flags, "" if not v.flags else
+                                          "  (shipped as-is)"))
+
+    if imgui.button("keep only this"):
+        n = sess.keep_only(i)
+        app.select_volume(0)
+        app.sync_hitboxes()
+        app.status = ("kept volume %d, dropped %d — one sphere: a hit lands there "
+                      "or nowhere (unsaved)" % (i, n))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain("issue #19's experiment: with ONE volume left, where "
+                                "a hit registers is the whole answer"))
+    imgui.same_line()
+    if imgui.button("delete"):
+        sess.remove_volume(i)
+        app.select_volume(None)
+        app.sync_hitboxes()
+        app.status = "deleted volume %d (unsaved)" % i
+    imgui.same_line()
+    if imgui.button("duplicate"):
+        j = sess.add_volume(v)
+        app.select_volume(j)
+        app.sync_hitboxes()
+        app.status = "volume %d duplicated as %d (unsaved)" % (i, j)
+
+
 def _grid_view(imgui, app, host) -> None:
     """The damage grid: seven rows of ten, per state, editable when the port owns it."""
     sess = app.part_session
@@ -1845,8 +2072,9 @@ def _grid_view(imgui, app, host) -> None:
         imgui.text_wrapped(plain("⚠ " + host.grid_note))
         imgui.pop_style_color()
     imgui.text_wrapped(plain(
-        "⚠ never validated in game: no cold boot has changed either table and "
-        "confirmed the effect (#19). A * marks a column whose NAME is inferred."))
+        "grid writes were proven live (2026-06-28: every byte 0xFF -> 411-damage "
+        "hits); the VOLUMES are what #19 is still testing. A * marks a column whose "
+        "NAME is inferred."))
 
 
 def _grid_table(imgui, app, state, index: int, editable: bool) -> None:
@@ -1875,6 +2103,19 @@ def _grid_table(imgui, app, state, index: int, editable: bool) -> None:
         imgui.text("%d" % r)
         if name and imgui.is_item_hovered():
             imgui.set_tooltip("used by %s" % name)
+        if editable:
+            imgui.same_line()
+            if imgui.small_button("255##max%d_%d" % (index, r)):
+                try:
+                    sess.fill_row(index, r, 255)
+                    app.status = ("%s row %d: cut/impact/shot = 255 — the most a "
+                                  "byte can say (unsaved)" % (state.name, r))
+                except Exception as e:                          # noqa: BLE001
+                    app.status = str(e)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(plain("cut, impact and shot to 255%% — every "
+                                        "weapon class does the most the grid can "
+                                        "express against this row"))
         for c, value in enumerate(row):
             imgui.table_next_column()
             if not editable:
@@ -1937,6 +2178,8 @@ def _part_actions(imgui, app, host, m) -> None:
                 "a copied sphere lands on whatever joint happens to sit at that "
                 "index — a starting point you can SEE, not a correct answer."))
 
+    _export_buttons(imgui, app, m)
+
     pending = sess.pending
     if not pending:
         imgui.text_disabled("nothing staged")
@@ -1958,6 +2201,51 @@ def _part_actions(imgui, app, host, m) -> None:
         sess.discard()
         app.sync_hitboxes()
         app.status = "discarded the staged part edits"
+
+
+def _export_buttons(imgui, app, m) -> None:
+    """The manifest's tables -> the runtime's `<name>_hit.lua`, and onto the memstick.
+
+    Exports what is SAVED: the file is the source of truth and the generated module
+    says which file and which content it came from, so an unsaved edit would make
+    the two disagree without a trace.
+    """
+    from .. import runtime as RT
+
+    if app.manifest_path is None:
+        return
+    authored = bool(m.hurtboxes or m.hitzones)
+    if not authored:
+        imgui.text_disabled("nothing to export yet — save volumes or a grid first")
+        return
+    if imgui.button("export runtime table"):
+        try:
+            path = RT.export(m, capacity=RT.host_capacity(m))
+            app._hit_export = path
+            app.status = "wrote %s (id %s)" % (path.name, RT.content_id(m))
+        except Exception as e:                                  # noqa: BLE001
+            app.status = "%s: %s" % (type(e).__name__, e)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain(
+            "framework/prx/mods/lua_host/scripts/%s_hit.lua — the SAVED [[hurtbox]] "
+            "and [[hitzone]] as the P.hit() call mhfu_port.lua writes into the game "
+            "(in place, over the host set; the grid over the species blocks)." % m.name))
+    if RT.MEMSTICK_MODS.is_dir():
+        imgui.same_line()
+        if imgui.button("deploy to memstick"):
+            try:
+                path = app._hit_export or RT.export(m, capacity=RT.host_capacity(m))
+                app._hit_export = path
+                dst = RT.deploy(path)
+                app.status = ("deployed %s -> %s. Cold boot; a running game "
+                              "hot-reloads it" % (path.name, dst))
+            except Exception as e:                              # noqa: BLE001
+                app.status = "%s: %s" % (type(e).__name__, e)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(plain("copy the module to %s" % RT.MEMSTICK_MODS))
+    if app.selected_volume is not None and app.part_session is not None \
+            and app.part_session.pending:
+        imgui.text_disabled("(exports the SAVED file — save first)")
 
 
 def _joint_note(sk, j: int, verts: int) -> str:

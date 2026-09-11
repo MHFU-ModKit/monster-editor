@@ -80,6 +80,24 @@ The `0x18` "weakness" records are left as they were: parsed, round-tripped, and
 **undecoded**. Their `part_id` field holds `0x2127`/`0x2128` plus a variant index and
 nothing here knows what that means.
 
+## Which set is HIS (2026-09-11, offline) — the species row points at it
+
+em75 holds four hurtbox sets and nothing in the overlay references any of them. The
+pointer is in the OTHER file: `game_task.ovl`'s species row, `0x09BB8A00 + species*0x1D0`
+(field `+0x240` of the `0x09BB87C0` table), holds the VA of the set that species uses.
+Tigrex 75 -> `0x09BC11F0` -> `0x09D58CD0` (42 records); species 76, 81 and 88 own the
+other three. So the four sets are per SPECIES ID, not per state or per action — the
+record caught live in 2026-06-28 (`0x09D591D0`) is set 0's head sphere, as it should be.
+
+Both readers walk from that pointer to the `bone == -1` sentinel — `0x09C37F30` in
+`game_sub.ovl` (`lh a2,0(a1); beq a2,-1`) and `0x09A84AFC` in `game_task.ovl` — and
+they gate each record on its flag bytes (`+0x08 & 0x04`, `+0x09 & 0x0A`/`0x0E`,
+`+0x0A & 0x0A`/`0x0F`, `+0x0B & 0x05`/`0x01` skip). Bones `0x7D`/`0x7E`/`0x7F` are
+markers, not joints: `0x7D` hands the cursor to `0x09C38658` (the tail-sever skip —
+set 0 has one before each tail sphere). Which means the runtime seam is simply:
+overwrite the records IN PLACE through the pointer, fewer than the original and
+sentinel-terminated, or repoint the u32 at a table of your own.
+
 → `docs/agent_memory_map.md` "Hitzone / collision data", issues #10 / #11 / #19
 """
 from __future__ import annotations
@@ -375,6 +393,16 @@ STATE_TABLE_FIELD = 0x2FC
 #: Located, not decoded — `0x09BB8AFA + species*0x1D0`.
 BREAK_FIELD = 0x33A
 
+#: the species row field holding the VA of THIS species' hurtbox set (`0x09BB8A00`
+#: for species 0). The overlay never references its own sets; this does.
+SPHERE_TABLE_FIELD = 0x240
+#: a record's flag bytes that make BOTH walkers skip it (`+0x08..+0x0B`, little
+#: endian). A record with `flags & WALK_SKIP_MASK == 0` is seen by the weapon-hit
+#: walker `0x09C37F30` and by `0x09A84AFC` alike; set 0's hurtboxes are all 0/0x101.
+WALK_SKIP_MASK = 0x050A0A04
+#: bones that are markers, not joints. 0x7D calls `0x09C38658` with the cursor.
+MARKER_BONES = (0x7D, 0x7E, 0x7F)
+
 GRID_ROWS = 7
 GRID_COLS = 10
 GRID_BLOCK = 0x48                    # 7 * 10, then two zero bytes
@@ -495,6 +523,77 @@ def species_hitzones(img: Image, species: int) -> Optional[SpeciesHitzones]:
     return SpeciesHitzones(
         species=species, row_va=row_va, state_table_va=tbl,
         states=[parse_block(img.data, img.off(va), va) for va in blocks])
+
+
+def species_sphere_table(img: Image, species: int) -> Optional[int]:
+    """The VA of the hurtbox set THIS species walks, from its `game_task.ovl` row.
+
+    Returns None when the row is outside the file. The value is only meaningful
+    together with the overlay it points into — `species_sets` does that join.
+    """
+    at = SPECIES_TABLE + SPHERE_TABLE_FIELD + species * SPECIES_STRIDE
+    if not img.holds(at + 4):
+        return None
+    return img.u32(at)
+
+
+#: a walk bound for `walk_set` — the longest set in the game is em59's 49.
+MAX_SET_RECORDS = 512
+
+
+def walk_set(img: Image, va: int, limit: int = MAX_SET_RECORDS) -> Optional[SphereSet]:
+    """The set at a KNOWN VA, read the way the engine reads it: record after
+    record until the sentinel. No plausibility gate — this is the authoritative
+    reader once the species row has said where the table is, and the gate is what
+    makes `find_sets` miss em58 (a 1100-unit sphere) and em55 (a marker with
+    shape 8). Returns None if the VA is outside the image or no sentinel turns up
+    within ``limit`` records.
+    """
+    if not img.holds(va + SPHERE_STRIDE):
+        return None
+    recs: List[Sphere] = []
+    off = img.off(va)
+    for _ in range(limit):
+        if off + SPHERE_STRIDE > len(img.data):
+            return None
+        if _is_sentinel(img.data, off):
+            return SphereSet(va=va, spheres=recs, kind=KIND_HURTBOX)
+        recs.append(parse_sphere(img.data, off))
+        off += SPHERE_STRIDE
+    return None
+
+
+def own_set(overlay: Image, game_task: Image, species: int) -> Optional[SphereSet]:
+    """The hurtbox set ``species`` actually walks: its row's pointer, followed.
+
+    This is the one a weapon resolves against and the one a runtime table replaces
+    IN PLACE — its record count is the capacity. All 17 big-monster species resolve
+    (2026-09-11); a None here means the pointer left the overlay.
+    """
+    va = species_sphere_table(game_task, species)
+    if va is None:
+        return None
+    lo, hi = overlay.data_range
+    if not lo <= overlay.off(va) < hi:
+        return None
+    return walk_set(overlay, va)
+
+
+def species_sets(overlay: Image, game_task: Image,
+                 limit: int = 0x100) -> Dict[int, int]:
+    """`{set_va: species}` for every species whose row points INTO this overlay.
+
+    em75 answers `{0x09D58CD0: 75, 0x09D599A0: 76, 0x09D59388: 81, 0x09D59FB8: 88}`:
+    one overlay, four species ids, one set each. A set no row points at is dead
+    data as far as a weapon is concerned.
+    """
+    lo, hi = overlay.data_range
+    out: Dict[int, int] = {}
+    for sp in range(limit):
+        va = species_sphere_table(game_task, sp)
+        if va is not None and lo <= overlay.off(va) < hi and va not in out:
+            out[va] = sp
+    return out
 
 
 def all_species_hitzones(img: Image, limit: int = 0x100) -> Dict[int, SpeciesHitzones]:
@@ -641,11 +740,19 @@ def report(img: Image, grid: Optional[Image] = None,
     unk = [s for s in sets if s.kind == KIND_UNKNOWN]
     out.append("collision spheres — %d hurtbox set(s), %d part-less volume set(s), "
                "%d run(s) that say nothing" % (len(hb), len(vol), len(unk)))
+    owners = species_sets(img, grid) if grid is not None else {}
     for s in hb + vol:
         caps = sum(1 for x in s.spheres if x.is_capsule)
-        out.append("  0x%08X  %-8s %3d recs (%d capsule)  bones %2d  parts %s  rows %s"
+        who = owners.get(s.va)
+        out.append("  0x%08X  %-8s %3d recs (%d capsule)  bones %2d  parts %s  rows %s%s"
                    % (s.va, s.kind, len(s.spheres), caps, len(s.bones),
-                      s.parts, s.rows))
+                      s.parts, s.rows,
+                      "" if who is None else "  <- species %d" % who))
+    if grid is not None and species is not None:
+        mine = species_sphere_table(grid, species)
+        if mine is not None and mine in {s.va for s in hb}:
+            out.append("  species %d walks 0x%08X (row field +0x%X); the others "
+                       "belong to other species ids" % (species, mine, SPHERE_TABLE_FIELD))
     if vol:
         out += ["", "  ⚠️ a part-less set is NOT the player's hurtbox: zeroing the "
                 "four radii", "     at 0x09D5EB48 did not stop damage (cold boot, "
@@ -687,6 +794,18 @@ def verify() -> int:
             if st.pack(sentinel=False) != b"".join(s.raw for s in st.spheres):
                 print("    ROUND TRIP FAILED at 0x%08X" % st.va)
                 bad += 1
+    print("\n== the set each species WALKS (row +0x%X), read to the sentinel"
+          % SPHERE_TABLE_FIELD)
+    for i, sp in enumerate(EM_SPECIES):
+        img = _load("file_%05d.bin" % (6094 + i))
+        own = own_set(img, grid, sp)
+        if own is None:
+            print("  em%-3d NO OWN SET — the row pointer left the overlay" % sp)
+            bad += 1
+            continue
+        found = own.va in {st.va for st in find_sets(img)}
+        print("  em%-3d 0x%08X %3d recs  %s" % (sp, own.va, len(own.spheres),
+              "also found structurally" if found else "MISSED by find_sets"))
     print("\n== damage grid, every species with a state table")
     hz = all_species_hitzones(grid)
     pad = {b.pad for h in hz.values() for b in h.states}

@@ -300,14 +300,15 @@ def test_two_states_with_the_same_name_is_an_error():
     assert "HITZONE_STATE_DUPLICATE" in _report(m)
 
 
-def test_authoring_a_grid_always_says_it_is_shared_and_unproven():
-    """🔴 Two facts the author cannot be allowed to forget: the grid is species data
-    so it changes the native host too, and no cold boot has ever confirmed that
-    writing it does anything (#19)."""
+def test_authoring_a_grid_always_says_it_is_shared():
+    """🔴 The fact the author cannot be allowed to forget: the grid is species data,
+    so beside a native host monster it changes that one too. (It used to also say
+    "unvalidated"; the grid write was proven live 2026-06-28 and the runtime ships
+    it since 2026-09-11, so the code is now HITZONE_SHARED.)"""
     m = MF.loads(BASE + _grid("normal", (0, 1, 75)))
-    issues = [i for i in V.validate(m) if i.code == "HITZONE_SHARED_AND_UNVALIDATED"]
+    issues = [i for i in V.validate(m) if i.code == "HITZONE_SHARED"]
     assert len(issues) == 1
-    assert "native host" in issues[0].message and "#19" in issues[0].message
+    assert "native host" in issues[0].message and "P.hit" in issues[0].message
 
 
 def test_more_states_than_the_host_ships_warns_against_the_intel():

@@ -282,6 +282,57 @@ def test_the_tigrex_sphere_named_in_the_memory_map_decodes_as_documented():
     assert s.radius == 97.0 and s.a == (0.0, -30.0, 30.0), s
 
 
+# --------------------------------------------------------------------------- #
+# which set is HIS (2026-09-11)
+# --------------------------------------------------------------------------- #
+def test_the_species_row_points_at_the_set_the_live_record_came_from():
+    """The overlay never references its own sets; game_task.ovl's species row
+    does (`+0x240`). For the Tigrex it names set 0 — the set holding the record
+    caught live in 2026-06-28 — and the three other em75 sets belong to species
+    76, 81 and 88. That is what makes an in-place overwrite HIS and nobody else's."""
+    if not _have():
+        return
+    grid, img = _img(GAME_TASK), _img(EM75)
+    assert HZ.species_sphere_table(grid, 75) == 0x09D58CD0
+    own = HZ.own_set(img, grid, 75)
+    assert own is not None and own.va == 0x09D58CD0 and len(own.spheres) == 42
+    assert own.va <= 0x09D591D0 < own.va + len(own.spheres) * HZ.SPHERE_STRIDE
+    owners = HZ.species_sets(img, grid)
+    assert owners[0x09D58CD0] == 75
+    assert {owners[v] for v in (0x09D59388, 0x09D599A0, 0x09D59FB8)} == {81, 76, 88}
+
+
+def test_every_big_monster_walks_a_set_that_ends_in_a_sentinel():
+    """`walk_set` is the engine's read — records until `bone == -1` — and it
+    resolves for all 17 where the structural search misses five (em01/15/40/58/82:
+    a 1100-unit sphere, a marker with shape 8). The walk is the authority."""
+    if not _have():
+        return
+    grid = _img(GAME_TASK)
+    for i, sp in enumerate(HZ.EM_SPECIES):
+        img = _img(EM_FILES[i])
+        own = HZ.own_set(img, grid, sp)
+        assert own is not None and 3 <= len(own.spheres) <= 60, (sp, own)
+        end = img.off(own.va) + len(own.spheres) * HZ.SPHERE_STRIDE
+        assert HZ._is_sentinel(img.data, end), sp
+        # and the bytes round-trip, markers and all
+        assert own.pack(sentinel=False) == img.data[img.off(own.va):end], sp
+
+
+def test_a_hurtbox_the_hunter_can_hit_passes_both_walkers_flag_gates():
+    """Set 0's part-bearing records are flags 0 or 0x101 and both walkers keep
+    them; the three special records at its tail (0x08000000 / 0x05 / 0x300) are
+    the ones the mask is for."""
+    if not _have():
+        return
+    own = HZ.own_set(_img(EM75), _img(GAME_TASK), 75)
+    hurt = [s for s in own.spheres if s.part_index and not s.bone in HZ.MARKER_BONES]
+    assert hurt and all(s.flags & HZ.WALK_SKIP_MASK == 0 for s in hurt)
+    assert all(s.flags in (0, 0x101) for s in hurt)
+    markers = [s for s in own.spheres if s.bone in HZ.MARKER_BONES]
+    assert len(markers) == 3 and all(s.bone == 0x7D for s in markers)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     if not _have():
