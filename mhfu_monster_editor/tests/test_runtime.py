@@ -261,6 +261,26 @@ def test_the_library_walks_a_declared_chain_and_refuses_to_loop_one_pair():
     assert "HARNESS OK" in run.stdout, run.stdout
 
 
+def test_the_library_fits_lua_hosts_file_buffer():
+    """lua_host reads each memstick script through one scratch buffer
+    (`G_FILEBUF_SZ` in framework/prx/mods/lua_host/mod.cpp) and SKIPS a bigger
+    file with a single boot-log line. On 2026-09-11 mhfu_port.lua crossed the old
+    48 KB and the whole port — the quest swap included — silently did not exist.
+    Read the cap out of the source so the two cannot drift apart."""
+    src = open(os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "mod.cpp"),
+               encoding="utf-8").read()
+    import re
+    m = re.search(r"#define G_FILEBUF_SZ \((\d+) \* 1024\)", src)
+    assert m, "G_FILEBUF_SZ not found"
+    cap = int(m.group(1)) * 1024 - 1
+    scripts = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts")
+    for name in sorted(os.listdir(scripts)):
+        if name.endswith(".lua"):
+            size = os.path.getsize(os.path.join(scripts, name))
+            assert size <= cap, "%s is %d B, over lua_host's %d B buffer: it would be " \
+                "SKIPPED at boot" % (name, size, cap)
+
+
 def test_the_seam_stubs_assemble_branchless_and_in_bounds():
     """`tools/em_vhook_check.py`: the em_vhook v3 stubs the runtime above relies on,
     assembled with the host cc from the same stubs.h the PRX builds, read back by
