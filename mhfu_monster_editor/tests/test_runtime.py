@@ -196,6 +196,191 @@ def test_the_runtime_writer_lands_the_bytes_the_format_module_describes():
         assert "HARNESS OK" in run.stdout, run.stdout
 
 
+
+# --------------------------------------------------------------------------- #
+# the attack side (#33)
+# --------------------------------------------------------------------------- #
+from mhfu_monster_editor import attacks as A                          # noqa: E402
+
+_TABLES = RT.AttackTables(volumes_va=0x09D60768, records_va=0x09D60848, n_sets=56,
+                          n_records=107, capacities={0: 5, 2: 10, 5: 1})
+
+
+def _attack_authored(tmp, *, bad_cap=False):
+    """A copy of the Zinogre manifest authoring set 2 and two record levers — or,
+    for the negative harness case, set 0 with a cap the live table will not have."""
+    path = os.path.join(tmp, "bad.toml" if bad_cap else "z.toml")
+    shutil.copyfile(ZINOGRE, path)
+    # the shipped manifest carries the user's #19 tables; this fixture is the
+    # attack side ALONE, so the harness needs no species row seeded
+    ps = P.PartSession(MF.load(path), n_bones=46)
+    while ps.volumes():
+        ps.remove_volume(0)
+    for i in range(len(ps.states())):
+        ps._drop_grids.add(i)
+    ps.save()
+    m = MF.load(path)
+    s = A.AttackSession(m, n_bones=46)
+    for st in list(s.sets()):
+        s.drop_set(st)
+    for a in list(s.attacks()):
+        s.clear_attack(a.id)
+    if bad_cap:
+        s.add_volume(MF.Hitbox(bone=1, radius=50.0, set=0))
+        s.set_attack(9, power=1)
+    else:
+        s.add_volume(MF.Hitbox(bone=12, radius=170.0, set=2, offset=[0.0, 20.0, 0.0],
+                               label="head"))
+        s.add_volume(MF.Hitbox(bone=125, radius=0.0, set=2, shape="capsule",
+                               to=[0.0, 0.0, 0.0]))
+        s.add_volume(MF.Hitbox(bone=44, radius=100.0, set=2, shape="capsule",
+                               to=[0.0, 0.0, -175.0], label="tail tip"))
+        s.set_attack(6, power=40, label="the charge, softer")
+        s.set_attack(31, volume=5)
+    s.save()
+    return MF.load(path)
+
+
+def test_an_attack_volume_is_the_same_twelve_literals_with_row_and_part_zero():
+    h = MF.Hitbox(bone=44, radius=100.0, set=2, shape="capsule", offset=[1.0, 2.0, 3.0],
+                  to=[0.0, 0.0, -175.0], flags=0x101)
+    row = RT.attack_volume_row(h)
+    assert row == ["44", "1", "0", "0", "0x101", "100.0", "1.0", "2.0", "3.0",
+                   "0.0", "0.0", "-175.0"], row
+    assert len(row) == len(RT.volume_row(MF.Hurtbox(bone=1, radius=1.0)))
+
+
+def test_the_module_carries_the_attack_tables_sets_and_levers():
+    with tempfile.TemporaryDirectory() as d:
+        m = _attack_authored(d)
+        text = RT.lua_hit_module(m, capacity=42, attacks=_TABLES)
+        assert "attack_tables = { volumes = 0x09D60768, records = 0x09D60848, " \
+               "n_sets = 56, n_records = 107 }" in text
+        assert "[2] = { cap = 10, volumes = {" in text
+        assert "{ 12, 0, 0, 0, 0x0, 170.0, 0.0, 20.0, 0.0, 0.0, 0.0, 0.0 },  -- head" in text
+        assert "{ 125, 1, 0, 0, 0x0, 0.0," in text and "-- marker" in text
+        assert "{ id = 6, power = 40, element = nil, volume = nil },  -- the charge" in text
+        assert "{ id = 31, power = nil, element = nil, volume = 5 }," in text
+        assert RT.sets_of(m) == {2: m.hitboxes}
+        luac = shutil.which("luac")
+        if luac:
+            out = os.path.join(d, "m.lua")
+            open(out, "w").write(text)
+            subprocess.run([luac, "-p", out], check=True)
+
+
+def test_over_capacity_per_set_is_written_as_a_fact():
+    with tempfile.TemporaryDirectory() as d:
+        m = _attack_authored(d)
+        text = RT.lua_hit_module(m, attacks=RT.AttackTables(
+            volumes_va=1, records_va=2, n_sets=56, n_records=107, capacities={2: 2}))
+        assert "[2] = { cap = 2, volumes = {  -- 1 MORE than fit" in text
+
+
+def test_hitboxes_without_table_addresses_are_refused_not_shipped_blind():
+    with tempfile.TemporaryDirectory() as d:
+        m = _attack_authored(d)
+        try:
+            RT.lua_hit_module(m, attacks=None)
+        except MF.ManifestError as e:
+            assert "species/em75.json" in str(e), e
+        else:
+            raise AssertionError("shipped attack sets with nowhere to write them")
+        for bad in (MF.Hitbox(bone=1, radius=1.0, set=56),):
+            m2 = MF.load(m.path)
+            m2.hitboxes.append(bad)
+            try:
+                RT.lua_hit_module(m2, attacks=_TABLES)
+            except MF.ManifestError as e:
+                assert "0..55" in str(e), e
+            else:
+                raise AssertionError("a set past the host's table was accepted")
+        m3 = MF.load(m.path)
+        m3.attacks.append(MF.Attack(id=107, power=1))
+        try:
+            RT.lua_hit_module(m3, attacks=_TABLES)
+        except MF.ManifestError as e:
+            assert "107 record(s)" in str(e), e
+        else:
+            raise AssertionError("a record past the host's table was accepted")
+
+
+def test_the_content_id_follows_the_attack_tables_too():
+    with tempfile.TemporaryDirectory() as d:
+        m = _attack_authored(d)
+        a = RT.content_id(m)
+        m.attacks[0] = MF.Attack(id=6, power=41)
+        b = RT.content_id(m)
+        m.hitboxes[0] = MF.Hitbox(bone=13, radius=170.0, set=2, offset=[0.0, 20.0, 0.0])
+        c = RT.content_id(m)
+        assert len({a, b, c}) == 3, (a, b, c)
+
+
+def test_host_attack_tables_come_from_the_intel_when_it_is_built():
+    m = MF.load(ZINOGRE)
+    t = RT.host_attack_tables(m)
+    if t is None:
+        print("SKIP: no species/em75.json with an attacks block")
+        return
+    assert (t.volumes_va, t.records_va, t.n_sets, t.n_records) == (0x09D60768, 0x09D60848,
+                                                                    56, 107)
+    assert t.capacities[2] == 10 and t.capacities[0] == 5
+
+
+def test_the_attack_writer_lands_each_set_in_place_and_refuses_a_cap_mismatch():
+    """The attack half of the seam, offline: `mhfu_port.lua`'s P.hit() run under
+    the fake `mhfu` over the REAL em75 set-pointer table, sets 0 and 2, and the
+    0x18 record array. Set 2 becomes three of ours + sentinel with the original
+    record 4 untouched, set 0 stays byte for byte, record 6 gets only its power,
+    record 31 only its volume, a change under us is re-applied — and an export
+    whose `cap` disagrees with the live count is REFUSED with nothing written.
+    Needs `lua` on the box and the extracts; skips otherwise."""
+    lua = shutil.which("lua")
+    data = os.path.join(_ROOT, "workspace", "extracted", "data_files")
+    ovl = os.path.join(data, "file_06108.bin")
+    if not lua or not os.path.exists(ovl):
+        print("SKIP: no lua or no extracts")
+        return
+    port_lua = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts",
+                            "mhfu_port.lua")
+    sys.path.insert(0, os.path.join(_ROOT, "tools"))
+    from mhfu_model import hitbox as HB, hitzone as HZ
+    img = HZ.Image.parse(open(ovl, "rb").read())
+    prim = HB.primary_table(HB.tables(img))
+    assert prim.volume_table_va == 0x09D60768 and prim.records_va == 0x09D60848
+    tables = RT.AttackTables(volumes_va=prim.volume_table_va, records_va=prim.records_va,
+                             n_sets=len(prim.volumes), n_records=len(prim.attacks),
+                             capacities={v_i: len(v.spheres)
+                                         for v_i, v in enumerate(prim.volumes)})
+    with tempfile.TemporaryDirectory() as d:
+        m = _attack_authored(d)
+        RT.export(m, out=os.path.join(d, "zinogre_hit.lua"), root=_ROOT, embed=False,
+                  attacks=tables)
+        bad = _attack_authored(d, bad_cap=True)
+        bad_tables = RT.AttackTables(volumes_va=tables.volumes_va,
+                                     records_va=tables.records_va, n_sets=tables.n_sets,
+                                     n_records=tables.n_records, capacities={0: 99})
+        open(os.path.join(d, "bad_hit.lua"), "w").write(
+            RT.lua_hit_module(bad, attacks=bad_tables).replace(
+                'mhfu.port.mod("zinogre_hit"', 'mhfu.port.mod("zinogre_hit_bad"'))
+        blob = img.data
+        ptr_off = img.off(prim.volume_table_va)
+        open(os.path.join(d, "atk_ptrs.bin"), "wb").write(
+            blob[ptr_off:ptr_off + 4 * len(prim.volumes)])
+        for idx in (0, 2):
+            v = prim.volumes[idx]
+            off = img.off(v.va)
+            open(os.path.join(d, "atk_set%d.bin" % idx), "wb").write(
+                blob[off:off + (len(v.spheres) + 1) * 0x28])
+        roff = img.off(prim.records_va)
+        open(os.path.join(d, "atk_recs.bin"), "wb").write(
+            blob[roff:roff + len(prim.attacks) * 0x18])
+        run = subprocess.run([lua, os.path.join(os.path.dirname(__file__),
+                                                "lua_attack_harness.lua"), d, port_lua],
+                             capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert "HARNESS OK" in run.stdout, run.stdout
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
