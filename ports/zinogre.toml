@@ -211,6 +211,13 @@ main = 1
 sub = 4
 clip = "lunge_forward"
 latch = 1                    # (1,4) names a single a1, so one dispatch covers the move
+# The chain. The engine's own way out of (1,4) is its run budget (+0x76C), which its
+# translator sets and a Lua act_set does not — forced, the charge stood 38 s with its
+# hitbox spent. `after` is where the runtime hands the charge when it is over or has
+# stood `hold_max` ticks (2 Hz). The engine itself goes to (0,3), the skid; that pair
+# names no clip, so the port's stop rides (1,3) instead — see lunge_stop.
+after = "lunge_stop"
+hold_max = 8
 
 [moves.lunge_stop]
 main = 1

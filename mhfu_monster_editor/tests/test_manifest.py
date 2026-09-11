@@ -91,6 +91,32 @@ def test_cross_references_are_structural():
             raise AssertionError("accepted a dangling reference: " + needle)
 
 
+def test_a_move_declares_its_chain_and_a_dangling_or_self_after_is_refused():
+    """`after` / `hold_max` are one link of the engine's own walk (charge -> skid).
+    `after` naming no move is a typo like a dangling clip; `after = itself` is the
+    loop on one pair the field exists to replace; both are errors, not warnings."""
+    body = MINIMAL + ('\n[clips.c]\nslot = 6\n[clips.s]\nslot = 5\n'
+                      '[moves.lunge]\nmain = 1\nsub = 4\nclip = "c"\n'
+                      'after = "lunge_stop"\nhold_max = 8\n'
+                      '[moves.lunge_stop]\nmain = 1\nsub = 3\nclip = "s"\n')
+    m = MF.loads(body)
+    assert m.moves["lunge"].after == "lunge_stop" and m.moves["lunge"].hold_max == 8
+    assert m.moves["lunge_stop"].after is None and m.moves["lunge_stop"].hold_max is None
+    out = MF.dumps(m)
+    assert 'after = "lunge_stop"' in out and "hold_max = 8" in out
+    assert MF.loads(out).moves["lunge"].after == "lunge_stop"
+    for bad, needle in ((body.replace('after = "lunge_stop"', 'after = "nope"'), "nope"),
+                        (body.replace('after = "lunge_stop"', 'after = "lunge"'), "itself"),
+                        (body.replace("hold_max = 8", "hold_max = 0"), "hold_max"),
+                        (body.replace("hold_max = 8", "then = \"lunge_stop\""), "then")):
+        try:
+            MF.loads(bad)
+        except MF.ManifestError as e:
+            assert needle in str(e), (needle, str(e))
+        else:
+            raise AssertionError("accepted: " + needle)
+
+
 def test_two_clips_cannot_share_a_slot():
     body = MINIMAL + '\n[clips.a]\nslot = 61\n\n[clips.b]\nslot = 61\n'
     try:

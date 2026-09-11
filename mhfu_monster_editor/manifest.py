@@ -53,6 +53,14 @@ Where this differs from the issue's sketch, and why
   `(main,sub)` the census MEASURED as never entered; this is the explicit override that
   downgrades it to a warning, so the decision is in the file rather than in a flag on
   someone's command line.
+* **`[moves]` has `after` / `hold_max` — a move is one link of a chain.** The engine
+  walks behaviour pairs in sequence (the charge `(1,4)` hands to the skid `(0,3)` when
+  its run budget is spent — `species/emNN.json` `next`), and a pair written from Lua
+  is NOT provisioned the way the translator provisions it, so it can park forever with
+  its hitbox spent. ``after`` names the move the runtime hands to when this one is over
+  or has stood `hold_max` ticks; declaring it is what turns "loop one pair" into "walk
+  the sequence". A move whose pair the intel says never ends itself has to declare it.
+  (`after`, not `then` — `then` is a Lua keyword and the script transcribes this table.)
 * **`[[hurtbox]]` does not carry `part` as a first-class field.** The sketch conflated
   two *different* tables in the host overlay: VOLUMES (`0x28` records: bone + radius, no
   part field at all) and WEAKNESS (`0x18` records, keyed by `part_id`). See
@@ -142,6 +150,14 @@ class Move:
     #: 411 of 411 forced moves into such a pair survived exactly one tick, so the
     #: default is to refuse and the flag exists to be argued for in a comment.
     allow_unentered: bool = False
+    #: the move the runtime hands to when this one is over (the engine left the pair)
+    #: or has stood `hold_max` ticks — one link of a declared chain. None = none.
+    #: (`after`, not `then`: `then` is a Lua keyword, and the script's `moves`
+    #: table is this field transcribed by hand.)
+    after: Optional[str] = None
+    #: ticks (2 Hz) after which the runtime hands to `after` even if the pair still
+    #: stands. None = only when the engine leaves the pair.
+    hold_max: Optional[int] = None
 
 
 #: the ten damage-type columns of a hitzone row, in file order.
@@ -546,7 +562,7 @@ _BUILD_KEYS = ("source_skeleton", "skin", "ground_lift", "animated", "bone_offse
 _CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame",
               "labelled_build")
 _MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label",
-              "allow_unentered")
+              "allow_unentered", "after", "hold_max")
 _HURTBOX_KEYS = ("bone", "radius", "part", "hitzone_row", "shape", "offset",
                  "to", "flags", "label")
 _PART_KEYS = ("index", "hitzone_row", "severable", "label")
@@ -636,7 +652,17 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
             clip=_opt(m, "clip", str, w), anim=_opt(m, "anim", int, w),
             latch=_opt(m, "latch", int, w, 1), min_gap=_opt(m, "min_gap", int, w, 2),
             label=_opt(m, "label", str, w, ""),
-            allow_unentered=_opt(m, "allow_unentered", bool, w, False))
+            allow_unentered=_opt(m, "allow_unentered", bool, w, False),
+            after=_opt(m, "after", str, w), hold_max=_opt(m, "hold_max", int, w))
+    for mname, mv in moves.items():
+        if mv.after is not None and mv.after not in moves:
+            raise ManifestError("moves.%s: after = %r names no [moves.%s]"
+                                % (mname, mv.after, mv.after))
+        if mv.after == mname:
+            raise ManifestError("moves.%s: after = itself — that is the loop on one pair "
+                                "this field exists to replace" % mname)
+        if mv.hold_max is not None and mv.hold_max < 1:
+            raise ManifestError("moves.%s: hold_max must be >= 1 tick" % mname)
 
     hurtboxes = []
     for i, h in enumerate(_typed(raw.get("hurtbox", []), list, where + ".hurtbox")):
@@ -881,6 +907,8 @@ def dumps(m: PortManifest) -> str:
         _kv(out, "min_gap", mv.min_gap)
         if mv.allow_unentered:
             _kv(out, "allow_unentered", mv.allow_unentered)
+        _kv(out, "after", mv.after)
+        _kv(out, "hold_max", mv.hold_max)
         _kv(out, "label", mv.label)
 
     for name in sorted(m.parts):

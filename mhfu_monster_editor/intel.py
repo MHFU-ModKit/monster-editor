@@ -118,6 +118,55 @@ class BudgetIntel:
                    post_hook_owns=d.get("post_hook_owns"))
 
 
+@dataclass(frozen=True)
+class Edge:
+    """One hand-off a handler can make when its action ends: the pair(s) it enters,
+    and the GUARDS on the code path that reaches the call (`tools/em_chain.py`).
+
+    ``to`` is usually one pair; two when the translator remaps the id under a flag
+    (main-0 id 1 is `(0,1)` or `(0,2)`). ``guards`` reads like the handler: the
+    charge's budget edge is ``["phase==3", "!collided", "budget spent", "+0x280==0"]``.
+    ``mode`` is `act_set`'s fourth argument (0..4 — 1 goes through a blend).
+    ``via`` is the helper function the call went through, if any.
+    """
+    to: Tuple[Tuple[int, int], ...]
+    guards: Tuple[str, ...] = ()
+    mode: Optional[int] = None
+    site: Optional[int] = None
+    via: Tuple[int, ...] = ()
+    #: the other guard sets that reach the same site (the plainest is `guards`)
+    alts: Tuple[Tuple[str, ...], ...] = ()
+
+    @property
+    def reason(self) -> str:
+        """The guards that are not the phase — what a person would call the cause."""
+        return " & ".join(g for g in self.guards if not g.startswith("phase"))
+
+    @property
+    def phase(self) -> Optional[int]:
+        for g in self.guards:
+            if g.startswith("phase=="):
+                try:
+                    return int(g[7:])
+                except ValueError:
+                    return None
+        return None
+
+    def __str__(self) -> str:
+        tgt = "/".join("(%d,%d)" % t for t in self.to) or "(computed)"
+        return tgt + ("  [%s]" % " & ".join(self.guards) if self.guards else "")
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Edge":
+        return cls(to=tuple((int(a), int(b)) for a, b in d.get("to", [])),
+                   guards=tuple(str(g) for g in d.get("guards", [])),
+                   mode=None if d.get("mode") is None else int(d["mode"]),
+                   site=_addr(d.get("site")),
+                   via=tuple(v for v in (_addr(x) for x in d.get("via", []))
+                             if v is not None),
+                   alts=tuple(tuple(str(g) for g in a) for a in d.get("alts", [])))
+
+
 @dataclass
 class PairIntel:
     """What is known about one `(main, sub)` behaviour pair, from all four analysers.
@@ -164,6 +213,12 @@ class PairIntel:
     attack_sites: int = 0
     #: spawn sites reached whose id is a register, not a literal — counted, not named
     attack_sites_computed: int = 0
+    #: the hand-offs: where the handler sends the monster when it is DONE, static.
+    #: Empty on a handled pair is a finding — the handler never ends the action
+    #: itself, the brain has to — and None means the file predates the chain join.
+    next: Optional[List[Edge]] = None
+    #: the inverse: pairs whose handler can hand to this one
+    prev: List[Tuple[int, int]] = field(default_factory=list)
 
     #: why this pair's static record is odd — e.g. its dispatcher case runs inline.
     #: Kept apart from :attr:`note`, which prefers what the CENSUS said, so the two
@@ -180,6 +235,26 @@ class PairIntel:
     provenance: Dict[str, str] = field(default_factory=dict)
 
     # --- derived ------------------------------------------------------------
+    @property
+    def successors(self) -> List[Tuple[int, int]]:
+        """Every pair this one can hand to, in first-seen order."""
+        out: List[Tuple[int, int]] = []
+        for e in self.next or []:
+            for t in e.to:
+                if t not in out:
+                    out.append(t)
+        return out
+
+    @property
+    def ends_itself(self) -> Optional[bool]:
+        """Does the handler end the action on its own? None = unknown (no chain
+        intel). False on a handled pair = held forever unless something else
+        (the brain, a flinch) moves it — the engine only ever ENTERS such pairs
+        through the translator, which provisions them."""
+        if self.next is None:
+            return None
+        return bool(self.next)
+
     @property
     def measured(self) -> bool:
         """True when a census had something to say about this pair."""
@@ -278,6 +353,9 @@ class PairIntel:
             attack_sites=int(d.get("attack_sites", 0)),
             attack_sites_computed=int(d.get("attack_sites_computed", 0)),
             a1_measured=a1_meas, static_note=str(d.get("note", "")),
+            next=(None if d.get("next") is None
+                  else [Edge.from_dict(e) for e in d["next"]]),
+            prev=[(int(a), int(b)) for a, b in d.get("prev", [])],
             move_per_tick=meas.get("move_per_tick"),
             move_samples=int(meas.get("move_samples", 0)),
             provenance=dict(d.get("provenance", {})),
@@ -814,8 +892,11 @@ class SpeciesIntel:
                  unattributed_effects: Optional[List[dict]] = None,
                  overlay: Optional[dict] = None,
                  parts: Optional["PartIntel"] = None,
-                 attacks: Optional["AttackIntel"] = None) -> None:
+                 attacks: Optional["AttackIntel"] = None,
+                 chain: Optional[dict] = None) -> None:
         self.host_species = int(host_species)
+        #: the `chain` block of the file: enter-action, hubs, the brain's sites
+        self.chain = dict(chain or {})
         self._by_pair: Dict[Tuple[int, int], PairIntel] = {
             (p.main, p.sub): p for p in pairs}
         self.source = source
@@ -942,7 +1023,66 @@ class SpeciesIntel:
                    unattributed_effects=d.get("unattributed_effects"),
                    overlay=d.get("overlay"),
                    parts=PartIntel.from_dict(d.get("parts")),
-                   attacks=AttackIntel.from_dict(d.get("attacks")))
+                   attacks=AttackIntel.from_dict(d.get("attacks")),
+                   chain=d.get("chain"))
+
+    # -- the chain (tools/em_chain.py) ---------------------------------------
+    @property
+    def has_chain(self) -> bool:
+        return bool(self.chain) and any(p.next is not None for p in self)
+
+    @property
+    def hubs(self) -> List[Tuple[int, int]]:
+        """Where most hand-offs land — the alert/idle bank where the brain picks
+        the next action, and the reaction pairs. A graph view draws these as
+        terminals; a chain walk stops at them."""
+        return [(int(a), int(b)) for a, b in self.chain.get("hubs", [])]
+
+    def successors(self, main: int, sub: int) -> List[Edge]:
+        p = self.pair(main, sub)
+        return list(p.next or []) if p is not None else []
+
+    def predecessors(self, main: int, sub: int) -> List[PairIntel]:
+        p = self.pair(main, sub)
+        if p is None:
+            return []
+        return [q for q in (self.pair(*k) for k in p.prev) if q is not None]
+
+    def chain_from(self, main: int, sub: int, *, depth: int = 6) -> List[PairIntel]:
+        """The pairs reachable from `(main, sub)` by hand-offs, stopping at hubs —
+        the sequence the engine walks after entering it, as a set (branches
+        included), in breadth-first order. Hubs are included as the terminals
+        they are but never expanded."""
+        start = self.pair(main, sub)
+        if start is None:
+            return []
+        hubs = set(self.hubs)
+        seen = {(start.main, start.sub)}
+        order = [start]
+        frontier = [start]
+        for _ in range(depth):
+            nxt = []
+            for p in frontier:
+                if (p.main, p.sub) in hubs and p is not start:
+                    continue
+                for t in p.successors:
+                    if t in seen:
+                        continue
+                    q = self.pair(*t)
+                    if q is None:
+                        continue
+                    seen.add(t)
+                    order.append(q)
+                    nxt.append(q)
+            frontier = nxt
+            if not frontier:
+                break
+        return order
+
+    def entries(self) -> List[PairIntel]:
+        """Pairs nothing hands to — the brain's entry points (an attack, a roar)."""
+        return [p for p in self if p.handler is not None and not p.prev
+                and p.next is not None]
 
     def pairs_hitting_with(self, set_index: int,
                            entity_species: Optional[int] = None) -> List[PairIntel]:

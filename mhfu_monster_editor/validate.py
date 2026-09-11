@@ -48,6 +48,8 @@ from .intel import (ActionIntel, MIN_DWELL_TICKS, PairIntel,  # noqa: F401
 
 ERROR = "error"
 WARNING = "warning"
+#: a fact worth showing that asks for nothing — a deliberate choice, named
+INFO = "info"
 
 #: the reader of `species/emNN.json`. Issue #2 shipped a provisional one under this
 #: name and called it "the single class #4 replaces"; #4 replaced it with
@@ -58,7 +60,7 @@ JsonActionIntel = SpeciesIntel
 
 @dataclass
 class Issue:
-    level: str          # ERROR | WARNING
+    level: str          # ERROR | WARNING | INFO
     code: str           # stable, machine-readable
     where: str          # "clips.charge", "hurtbox[0]", "moves.charge"
     message: str
@@ -422,6 +424,19 @@ def _check_pac(m: PortManifest, pac) -> List[Issue]:
     return out
 
 
+def _needs_budget(edge) -> bool:
+    """Does this exit wait on the run budget only the translator sets?"""
+    return any("budget" in g for g in getattr(edge, "guards", ()))
+
+
+def _reliable(edge) -> bool:
+    """An exit that fires by itself once the pair is running: gated only on the
+    phase and the clip cursor (a clip always ends). Collision, a target check or a
+    pending-reaction cell are situational; the budget needs provisioning."""
+    return all(g.startswith(("phase", "cursor", "clip", "!cursor", "!clip"))
+               for g in getattr(edge, "guards", ()))
+
+
 def _relocated(moved: Dict[str, object], name: str) -> str:
     """" — and where that clip went", when the fingerprint is elsewhere in the build."""
     t = moved.get(name)
@@ -440,6 +455,13 @@ def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
     ``MOVE_PAIR_UNOBSERVED``    a census exists and has nothing on this pair.
     ``MOVE_PAIR_NEVER_ENTERED`` a census exists, looked, and measured zero entries.
                                 The only one that is an ERROR.
+    ``MOVE_PAIR_PARKS``         static: every exit of the pair needs the run budget
+                                the TRANSLATOR provisions, and a Lua write skips the
+                                translator — so the move never ends by itself. The
+                                Zinogre's first charge stood 38 s with its hitbox spent
+                                for exactly this. `after =` / `hold_max =` clears it.
+    ``MOVE_AFTER_ENGINE``       informational: what the engine itself hands to, when
+                                the declared `after` differs from it.
     """
     out: List[Issue] = []
     if not m.moves:
@@ -532,6 +554,41 @@ def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
 
         # static findings that are worth saying whatever the census knows
         if has_static and p.handler is not None:
+            nxt = getattr(p, "next", None)
+            declared = getattr(mv, "after", None) is not None or \
+                getattr(mv, "hold_max", None) is not None
+            if nxt is not None and not declared:
+                if not nxt:
+                    out.append(Issue(WARNING, "MOVE_PAIR_PARKS", w,
+                                     "(%d,%d)'s handler never ends the action itself — "
+                                     "the engine leaves it only through the brain or a "
+                                     "flinch. Forced from Lua it stands until something "
+                                     "else moves him. Declare `after =` (and/or "
+                                     "`hold_max =`) so the runtime walks on."
+                                     % (mv.main, mv.sub)))
+                elif any(_needs_budget(e) for e in nxt) and not any(_reliable(e)
+                                                                        for e in nxt):
+                    other = sorted({e.reason for e in nxt if not _needs_budget(e)})
+                    out.append(Issue(WARNING, "MOVE_PAIR_PARKS", w,
+                                     "(%d,%d) ends when its run budget (+0x76C) is spent "
+                                     "— and that budget is set by the engine's translator "
+                                     "on the way in, not by a Lua act_set, so forced the "
+                                     "pair parks in its last phase with its hitbox spent "
+                                     "(measured: 38 s, zero spawns).%s Declare `after =` / "
+                                     "`hold_max =` so the runtime walks on."
+                                     % (mv.main, mv.sub,
+                                        " Its other exit(s) — %s — are situational."
+                                        % ", ".join(other) if other else "")))
+            if nxt and getattr(mv, "after", None) is not None:
+                t = m.moves.get(mv.after)
+                engine = sorted({tt for e in nxt for tt in e.to})
+                if t is not None and (t.main, t.sub) not in engine:
+                    out.append(Issue(INFO, "MOVE_AFTER_ENGINE", w,
+                                     "after = %s (%d,%d); the engine itself hands (%d,%d) "
+                                     "to %s. Fine if deliberate — the port's clip on the "
+                                     "declared pair is what shows."
+                                     % (mv.after, t.main, t.sub, mv.main, mv.sub,
+                                        " / ".join("(%d,%d)" % x for x in engine))))
             if mv.clip is not None and p.ends_on == "budget" and p.budget.gated:
                 seeds = p.budget.phase0_seeds
                 out.append(Issue(WARNING, "MOVE_PAIR_BUDGET_GATED", w,
@@ -553,9 +610,11 @@ def format_report(issues: List[Issue]) -> str:
         return "OK — no issues."
     lines = [str(i) for i in issues]
     n_err = sum(1 for i in issues if i.level == ERROR)
+    n_info = sum(1 for i in issues if i.level == INFO)
     lines.append("")
-    lines.append("%d issue(s): %d error, %d warning"
-                 % (len(issues), n_err, len(issues) - n_err))
+    lines.append("%d issue(s): %d error, %d warning%s"
+                 % (len(issues), n_err, len(issues) - n_err - n_info,
+                    ", %d info" % n_info if n_info else ""))
     return "\n".join(lines)
 
 
@@ -584,7 +643,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("== %s (%s -> host species %d)" % (path, m.name, m.host_species))
         print(format_report(issues))
         print()
-        if any(i.level == ERROR for i in issues) or (a.strict and issues):
+        if any(i.level == ERROR for i in issues) or (
+                a.strict and any(i.level != INFO for i in issues)):
             worst = 1
     return worst
 

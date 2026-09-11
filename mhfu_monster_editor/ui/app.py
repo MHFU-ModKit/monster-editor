@@ -98,6 +98,9 @@ class EditorApp:
         self._host_clip = None
         #: the `(main, sub)` under inspection — a declared move's, or one being tried
         self._pair = None
+        #: the Moves tab: the behaviour pairs as a graph of hand-offs (ui/graph.py)
+        from .graph import MoveGraph
+        self._graph = MoveGraph()
         self._move = None
         self._pair_filter = ""
         self._bind_buf = ""
@@ -928,6 +931,27 @@ class EditorApp:
             imgui.separator()
         self._pair_table(imgui)
 
+    def _moves_panel(self) -> None:
+        """The pairs as a graph: what the engine walks after each one. → ui/graph.py
+
+        A tab beside the Viewport rather than a strip under the Action panel, because
+        a chain with its guards needs the width — and because the graph and the model
+        are looked at in turn, not side by side: pick the pair here, watch it there.
+        """
+        from imgui_bundle import imgui
+
+        m = self.scene.manifest
+        if m is None:
+            imgui.text_wrapped("The graph is the HOST overlay's — which host needs a "
+                               "manifest. Open a ports/*.toml.")
+            return
+        if self.intel is None:
+            imgui.text_wrapped("no species/em%02d.json — build the action intel with:"
+                               % self.browsing_species)
+            imgui.text_disabled("  python tools/em_intel.py --all")
+            return
+        self._graph.draw(imgui, self)
+
     def _species_row(self, imgui, m) -> None:
         """Which overlay's actions you are looking at, and the 17 you could ride.
 
@@ -1100,17 +1124,19 @@ class EditorApp:
         # "selecting a pair made the list of pairs disappear". With a floor the panel
         # scrolls to it instead.
         height = max(self._PAIR_TABLE_MIN, imgui.get_content_region_avail().y)
-        if not imgui.begin_table("##pairs", 4, flags, imgui.ImVec2(0.0, height)):
+        if not imgui.begin_table("##pairs", 5, flags, imgui.ImVec2(0.0, height)):
             return
-        for name, w in (("pair", 0.8), ("ends on", 0.9), ("tests", 1.2), ("fx", 0.4)):
+        for name, w in (("pair", 0.8), ("ends on", 0.9), ("tests", 1.0), ("fx", 0.3),
+                        ("after", 1.1)):
             imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
         imgui.table_setup_scroll_freeze(0, 1)
         imgui.table_headers_row()
         needle = self._pair_filter.strip().lower()
         for p in self.intel:
             gates = p.tested_frames
-            row = "%d,%d %s %s" % (p.main, p.sub, p.ends_on,
-                                   " ".join("%g" % f for f in gates))
+            nxt = " ".join("(%d,%d)" % t for t in p.successors[:4])
+            row = "%d,%d %s %s %s" % (p.main, p.sub, p.ends_on,
+                                      " ".join("%g" % f for f in gates), nxt)
             if needle and needle not in row.lower():
                 continue
             imgui.table_next_row()
@@ -1131,6 +1157,17 @@ class EditorApp:
             imgui.text(", ".join("%g" % f for f in gates[:4]) or "·")
             imgui.table_next_column()
             imgui.text(str(len(p.effects)) if p.effects else "")
+            imgui.table_next_column()
+            # where the handler sends him when the action ends (static). Blank on a
+            # handled pair = it never ends itself; "?" = the file predates the join.
+            if p.next is None:
+                imgui.text_disabled("?")
+            elif not p.next:
+                imgui.text_disabled("holds")
+            else:
+                imgui.text_disabled(nxt + (" +" if len(p.successors) > 4 else ""))
+            if imgui.is_item_hovered() and p.next:
+                imgui.set_tooltip("\n".join(str(e) for e in p.next))
         imgui.end_table()
 
     # ---- clips (issues #7, #8) ---------------------------------------- #
@@ -1589,10 +1626,14 @@ def _docking(app: EditorApp):
     # the 3D view fills its panel; imgui padding would leave a border and, worse,
     # make the FBO and the panel disagree about size by a few pixels every frame.
     viewport.imgui_window_flags = _no_scroll_flags()
+    # the move graph shares the viewport's dock space: a TAB beside it, so the two
+    # views swap with a click and neither is squeezed into an inspector column
+    graph = win("Moves", "MainDockSpace", app._moves_panel)
+    graph.imgui_window_flags = _no_scroll_flags()
 
     d = hello_imgui.DockingParams()
     d.docking_splits = splits
-    d.dockable_windows = [viewport,
+    d.dockable_windows = [viewport, graph,
                           win("Timeline", "Bottom", app._timeline_panel, focus=True),
                           win("Scene", "Left", app._scene_panel),
                           win("View", "Left", app._view_panel),
@@ -1790,6 +1831,7 @@ def _alignment_view(imgui, al, app) -> None:
     imgui.pop_style_color()
     _host_clip_row(imgui, al, app)
     _hits_with_row(imgui, al, app)
+    _then_row(imgui, al, app)
 
     # The findings are collapsed unless something is actually WRONG. They are prose,
     # a dozen of them is normal, and left open they push the pair table off the panel —
@@ -1815,6 +1857,51 @@ def _alignment_view(imgui, al, app) -> None:
                 imgui.text_disabled("handler 0x%08X   a1 %s" % (
                     al.pair.handler, ",".join(str(x) for x in al.pair.a1) or "-"))
             _species_effects(imgui, app)
+
+
+def _then_row(imgui, al, app) -> None:
+    """What the ENGINE does after this pair, beside what the move DECLARES.
+
+    The two are different facts and both are shown: the handler's own hand-off is
+    static intel (`PairIntel.next`), the manifest's `after =` is the modder's choice.
+    A move on a pair that ends itself needs no `after`; a move on a pair that does
+    NOT (`holds`) is what parks with its hitbox spent, and says so here.
+    """
+    if al.pair is None or al.pair.next is None:
+        return
+    p = al.pair
+    if not p.next:
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.70, 0.20, 1.0))
+        imgui.text_wrapped("! (%d,%d) never ends by itself: forced, it stays until "
+                           "something else moves him. A move here needs `after =`."
+                           % (p.main, p.sub))
+        imgui.pop_style_color()
+    else:
+        imgui.text_disabled("engine: after")
+        for e in p.next:
+            imgui.same_line()
+            tgt = "/".join("(%d,%d)" % t for t in e.to) or "?"
+            if imgui.small_button("%s##then%s" % (tgt, e.site)):
+                if e.to:
+                    app.select_pair(*e.to[0])
+                    return
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(str(e))
+            if e.reason:
+                imgui.same_line()
+                imgui.text_disabled(e.reason)
+    m = app.scene.manifest
+    mv = m.moves.get(al.move) if (m is not None and al.move) else None
+    if mv is not None and getattr(mv, "after", None):
+        nxt = m.moves.get(mv.after)
+        imgui.text_disabled("declared after = %s%s" % (
+            mv.after, " (%d,%d)" % (nxt.main, nxt.sub) if nxt else "  (no such move!)"))
+    imgui.same_line()
+    if imgui.small_button("open in Moves tab"):
+        from imgui_bundle import hello_imgui
+        w = hello_imgui.get_runner_params().docking_params.dockable_window_of_name("Moves")
+        if w is not None:
+            w.focus_window_at_next_frame = True
 
 
 def _host_clip_row(imgui, al, app) -> None:

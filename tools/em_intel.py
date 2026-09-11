@@ -8,6 +8,8 @@ format and none of them joined:
     em_phase_map.py <ovl>          what ENDS the action: clip-done / cursor
                                    frames / the +0x414 budget (and who owns it)
     em_effects.py <ovl>            per-handler effect recipes (id @ bone @ frame)
+    em_chain.py <ovl>              what comes NEXT: the pair(s) a handler hands
+                                   to when it ends, and the guard on each edge
     em_state_census.py             MEASURED dwell per pair, and whether it moves
 
 This emits one file keyed by `(main, sub)` that carries all four, and — the point
@@ -64,6 +66,7 @@ import em_moveset as mvs                                            # noqa: E402
 import em_phase_map as pm                                           # noqa: E402
 import em_state_census as cs                                        # noqa: E402
 import em_attacks as atk                                            # noqa: E402
+import em_chain as chn                                              # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent / "mhfu_model"))
 import hitzone as hz                                                # noqa: E402
 import hitbox as hb                                                 # noqa: E402
@@ -536,6 +539,14 @@ def build(path: Path, census: dict | None = None,
     st = static_intel(ov)
     have = census is not None
 
+    chain = chn.chain(ov, species)
+    prev: dict[tuple[int, int], list[list[int]]] = collections.defaultdict(list)
+    for key, rec in chain["pairs"].items():
+        for e in rec["next"]:
+            for t in e["to"]:
+                if list(key) not in prev[tuple(t)]:
+                    prev[tuple(t)].append(list(key))
+
     pairs_out = []
     keys = set(st["pairs"])
     if have:
@@ -551,6 +562,14 @@ def build(path: Path, census: dict | None = None,
                 if f in rec:
                     prov[f] = STATIC
             prov.setdefault("handler", STATIC)
+        if key in chain["pairs"]:
+            # the hand-off: every enter-action site the handler can reach, with the
+            # guards on the path. An EMPTY list on a handled pair is a finding too —
+            # the handler never ends the action itself (the brain has to).
+            rec["next"] = chain["pairs"][key]["next"]
+            rec["prev"] = sorted(prev.get(key, []))
+            prov["next"] = STATIC
+            prov["prev"] = STATIC
         else:
             # the census saw a pair the dispatcher walk did not enumerate
             rec["note"] = ("not in the overlay's (main,sub) jump tables — the "
@@ -603,6 +622,20 @@ def build(path: Path, census: dict | None = None,
                     "one tick.",
         },
         "pairs": pairs_out,
+        "chain": {
+            "source": "tools/em_chain.py",
+            "enter_action": chain["enter_action"],
+            "species_byte": chain["species"],
+            "note": "a handler ends an action by calling enter-action (vt+0x88) "
+                    "with a literal (main, id); the per-main translator turns the "
+                    "id into the pair AND provisions the handler (the charge's run "
+                    "budget +0x76C is set there, not by act_set). `next` is that "
+                    "call, read statically, with the guards on the path; `prev` is "
+                    "its inverse. Pairs with no `next` never end themselves.",
+            "hubs": chain_hubs(chain),
+            "brain": chain["brain"],
+            "translators": chain["translators"],
+        },
         "unattributed_effects": st["unattributed_effects"],
         "parts": parts_intel(ov, species, game_task),
         "attacks": attacks_intel(ov, species, st),
@@ -626,6 +659,26 @@ def build(path: Path, census: dict | None = None,
     return doc
 
 
+def chain_hubs(chain: dict, min_in: int = 8) -> list[list[int]]:
+    """The pairs most hand-offs land in — where the brain thinks again. em75: (0,1)
+    and (0,2) (alert/idle), (2,2) (the +0x280 reaction) and (0,3) (the run's
+    stop). A graph view collapses these into terminals, or every chain is one
+    arrow into the same three boxes.
+
+    ⚠️ Counted per HANDLER, not per pair: em75's 48 main-3 subs share one handler
+    whose union of hand-offs would otherwise vote 48 times for its own siblings."""
+    cnt = collections.Counter()
+    by_handler: dict[str, set] = collections.defaultdict(set)
+    for rec in chain["pairs"].values():
+        for e in rec["next"]:
+            for t in e["to"]:
+                by_handler[rec["handler"]].add(tuple(t))
+    for targets in by_handler.values():
+        for t in targets:
+            cnt[t] += 1
+    return [list(k) for k, n in cnt.most_common() if n >= min_in]
+
+
 def summarise(doc: dict) -> str:
     pairs = doc["pairs"]
     handled = [p for p in pairs if p.get("handler")]
@@ -634,10 +687,15 @@ def summarise(doc: dict) -> str:
     owned = [p for p in budget if p["budget"]["post_hook_owns"]]
     ends = collections.Counter(p.get("ends_on", "-") for p in handled)
     n_un = sum(len(u["sites"]) for u in doc["unattributed_effects"])
+    chained = [p for p in handled if p.get("next")]
+    resolved = [p for p in chained if any(e["to"] for e in p["next"])]
     out = [
         "%s  species %d  %d pair(s), %d with a handler"
         % (doc["overlay"]["name"], doc["host_species"], len(pairs), len(handled)),
         "  ends on: " + ", ".join("%s=%d" % kv for kv in sorted(ends.items())),
+        "  hands off: %d pair(s), %d to a resolved pair; hubs %s  (STATIC)"
+        % (len(chained), len(resolved),
+           " ".join("(%d,%d)" % tuple(h) for h in doc["chain"]["hubs"]) or "-"),
         "  %d pair(s) carry effects (%d site(s) unattributed in %d function(s))"
         % (len(eff), n_un, len(doc["unattributed_effects"])),
         "  %d budget-gated, %d of them ownable by a slot-32 post-hook"

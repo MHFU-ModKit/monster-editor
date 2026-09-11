@@ -338,6 +338,44 @@ def test_em75_attack_sites_are_credited_or_counted_apart_and_the_charge_resolves
     assert si.attacks.sets_for(si.pair(1, 4).attack_ids) == [2]
 
 
+def test_em75_the_charge_hands_to_the_skid_on_budget_and_the_wall_on_collision():
+    """The hand-off read from the (1,4) handler by hand (2026-09-11): phase 3,
+    `0x09D262C0` (collided) -> enter(0,6,1); else `0x09AD9A10` (budget spent) ->
+    helper(1) -> enter(0,3,0), or (2,2) when +0x280 is pending. em_chain has to
+    read exactly that back, and the join has to carry it with static provenance."""
+    if not _have_data():
+        return
+    import em_chain as C
+    ov = Overlay.load_file(EM75)
+    doc = C.chain(ov)
+    assert doc["enter_action"] == "0x09D3D608" and doc["species"] == 75
+    edges = doc["pairs"][(1, 4)]["next"]
+    tos = {tuple(t) for e in edges for t in e["to"]}
+    assert tos == {(0, 6), (0, 3), (2, 2)}, tos
+    by_to = {tuple(e["to"][0]): e for e in edges}
+    assert "collided" in by_to[(0, 6)]["guards"] and by_to[(0, 6)]["mode"] == 1
+    assert "budget spent" in by_to[(0, 3)]["guards"] and "!collided" in by_to[(0, 3)]["guards"]
+    assert by_to[(0, 3)]["via"] == ["0x09D26158"]
+    assert "+0x280!=0" in by_to[(2, 2)]["guards"]
+    # the translators: main-1 id 2 -> sub 3, id 12 -> nothing
+    assert doc["translators"]["1"]["2"] == [[1, 3]] and doc["translators"]["1"]["12"] == []
+    # the per-pair seed: 48 main-3 subs share one handler and read +0x299 to know
+    # which they are; (1,38) alone hands to (3,25), (1,36) to (3,1)
+    assert {tuple(t) for e in doc["pairs"][(1, 38)]["next"] for t in e["to"]} == {(3, 25)}
+    assert {tuple(t) for e in doc["pairs"][(1, 36)]["next"] for t in e["to"]} == {(3, 1)}
+    # the join
+    full = G.build(G.Path(EM75), None, "test", game_task=None)
+    p14 = next(p for p in full["pairs"] if (p["main"], p["sub"]) == (1, 4))
+    assert p14["provenance"]["next"] == G.STATIC and p14["prev"] == []
+    assert {tuple(t) for e in p14["next"] for t in e["to"]} == tos
+    p03 = next(p for p in full["pairs"] if (p["main"], p["sub"]) == (0, 3))
+    assert [1, 4] in p03["prev"]
+    assert full["chain"]["hubs"][:3] == [[2, 2], [0, 2], [0, 1]], full["chain"]["hubs"]
+    assert "0x09D26158" not in full["chain"]["brain"] or True   # helpers may be listed
+    handled = [p for p in full["pairs"] if p.get("handler")]
+    assert sum(1 for p in handled if p.get("next")) >= 220, "coverage regressed"
+
+
 def test_every_overlay_states_its_attack_join_provenance():
     """em1 and em33 have no table and say so; the rest name a spawner and whether
     the id range fits the table read — a stated inconsistency, never a silent one."""

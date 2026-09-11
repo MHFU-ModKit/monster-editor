@@ -540,6 +540,63 @@ def test_species_intel_reverse_joins_pairs_to_a_set():
     assert si.pairs_hitting_with(1) == []
 
 
+_CHAIN_DOC = {
+    "host_species": 75, "main_states": [],
+    "chain": {"hubs": [[0, 1], [0, 2]], "enter_action": "0x09D3D608"},
+    "pairs": [
+        {"main": 1, "sub": 4, "handler": "0x1", "measured": None,
+         "next": [{"site": "0x10", "kind": "enter", "main": 0, "id": 3, "mode": 0,
+                   "via": ["0x09D26158"], "to": [[0, 3]],
+                   "guards": ["phase==3", "!collided", "budget spent"], "alts": []},
+                  {"site": "0x11", "kind": "enter", "main": 0, "id": 6, "mode": 1,
+                   "via": [], "to": [[0, 6]], "guards": ["phase==3", "collided"]}],
+         "prev": [], "provenance": {"next": "static"}},
+        {"main": 0, "sub": 3, "handler": "0x2", "measured": None,
+         "next": [{"site": "0x20", "kind": "enter", "main": 0, "id": 1, "mode": 0,
+                   "via": [], "to": [[0, 1], [0, 2]], "guards": ["phase==1"]}],
+         "prev": [[1, 4]]},
+        {"main": 0, "sub": 6, "handler": "0x3", "measured": None, "next": [],
+         "prev": [[1, 4]]},
+        {"main": 0, "sub": 1, "handler": "0x4", "measured": None, "next": [], "prev": [[0, 3]]},
+        {"main": 0, "sub": 2, "handler": "0x5", "measured": None, "next": [], "prev": [[0, 3]]},
+        {"main": 9, "sub": 9, "handler": "0x6", "measured": None},
+    ]}
+
+
+def test_edges_read_back_with_their_reason_phase_and_route():
+    si = I.SpeciesIntel.from_dict(_CHAIN_DOC)
+    assert si.has_chain and si.hubs == [(0, 1), (0, 2)]
+    p = si.pair(1, 4)
+    assert p.successors == [(0, 3), (0, 6)] and p.ends_itself is True
+    e = p.next[0]
+    assert e.to == ((0, 3),) and e.phase == 3 and e.reason == "!collided & budget spent"
+    assert e.via == (0x09D26158,) and e.mode == 0 and e.site == 0x10
+    assert str(e) == "(0,3)  [phase==3 & !collided & budget spent]"
+    # a handled pair with an EMPTY next never ends itself; one without the field
+    # (an old file) says unknown, not False
+    assert si.pair(0, 6).ends_itself is False
+    assert si.pair(9, 9).ends_itself is None and si.pair(9, 9).next is None
+    assert [(q.main, q.sub) for q in si.predecessors(0, 3)] == [(1, 4)]
+    assert si.successors(0, 3)[0].to == ((0, 1), (0, 2))
+
+
+def test_chain_from_walks_to_the_hubs_and_stops_there():
+    si = I.SpeciesIntel.from_dict(_CHAIN_DOC)
+    walk = [(q.main, q.sub) for q in si.chain_from(1, 4)]
+    assert walk == [(1, 4), (0, 3), (0, 6), (0, 1), (0, 2)], walk
+    # a hub as the start is expanded; as a terminal it is not
+    assert [(q.main, q.sub) for q in si.chain_from(0, 1)] == [(0, 1)]
+    assert [(q.main, q.sub) for q in si.entries()] == [(1, 4)]
+    assert si.chain_from(7, 7) == []
+
+
+def test_a_file_without_the_chain_block_has_no_chain():
+    si = I.SpeciesIntel.from_dict({"host_species": 75, "main_states": [],
+                                   "pairs": [{"main": 1, "sub": 4, "measured": None}]})
+    assert not si.has_chain and si.hubs == [] and si.successors(1, 4) == []
+    assert si.chain_from(1, 4) == [si.pair(1, 4)]
+
+
 def test_em75_the_charge_pair_hits_with_set_two_as_measured_live():
     """(1,4) is the Tigrex charge measured at -72 HP; the live replacement of
     set 2 moved the hit 645 -> 152 -> 1381 units. The static join has to land

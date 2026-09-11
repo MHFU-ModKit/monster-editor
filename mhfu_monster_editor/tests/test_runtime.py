@@ -241,6 +241,26 @@ def test_the_runtime_writer_lands_the_bytes_the_format_module_describes():
 
 
 
+def test_the_library_walks_a_declared_chain_and_refuses_to_loop_one_pair():
+    """`mhfu_port.lua`'s move chain under the fake `mhfu`: a re-entry of the running
+    pair is refused (forced through with {force=true}), `after` is walked when the
+    engine leaves the pair or `hold_max` runs out, a move with neither is logged
+    PARKED once, a declared pair the engine enters itself is painted by the hook
+    once per entry, and an `after` the engine already reached is adopted. Needs
+    `lua`; skips otherwise."""
+    lua = shutil.which("lua")
+    if not lua:
+        print("SKIP: no lua")
+        return
+    port_lua = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts",
+                            "mhfu_port.lua")
+    run = subprocess.run([lua, os.path.join(os.path.dirname(__file__),
+                                            "lua_chain_harness.lua"), port_lua],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "HARNESS OK" in run.stdout, run.stdout
+
+
 # --------------------------------------------------------------------------- #
 # the attack side (#33)
 # --------------------------------------------------------------------------- #

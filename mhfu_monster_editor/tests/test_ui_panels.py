@@ -186,6 +186,9 @@ class FakeImgui:
     def get_mouse_drag_delta(self, *a):
         return _Vec(0.0, 0.0)
 
+    def get_mouse_pos(self):
+        return _Vec(-1.0, -1.0)
+
     def is_item_hovered(self, *a):
         return False
 

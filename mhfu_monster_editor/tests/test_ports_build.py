@@ -130,10 +130,12 @@ def test_the_shipped_manifests_validate_against_their_own_builds():
             # the two we expect: no census on this machine (#4), and the shipped
             # labels predate #8 so none of them records the build it was written
             # against — plus, since the Zinogre carries authored hit tables (#19,
-            # 2026-09-11), the two advisories authoring them always earns.
-            # Anything ELSE is a real finding.
+            # #33, 2026-09-11), the advisories authoring them always earns, and
+            # with no intel passed here the attack side is unchecked, which it
+            # says. Anything ELSE is a real finding.
             assert all(i.code in ("INTEL_ABSENT", "LABEL_UNKEYED", "HITZONE_SHARED",
-                                  "PARTS_UNNAMED") for i in issues), \
+                                  "PARTS_UNNAMED", "HITBOX_SHARED", "HITBOX_UNCHECKED")
+                       for i in issues), \
                 "%s: %s" % (m.name, [str(i) for i in issues])
 
 
