@@ -55,7 +55,7 @@ def test_moves_scope_roots_the_bound_pairs_and_puts_the_hubs_last():
     assert lay.nodes[(0, 1)].hub and not lay.nodes[(0, 3)].hub
     # one arrow per (from, to); the charge's three exits all present, with reasons
     pairs = {(a.src, a.dst): a for a in lay.arrows}
-    assert pairs[((1, 4), (0, 3))].label == "!collided & budget spent"
+    assert pairs[((1, 4), (0, 3))].label == "!collided & run budget spent"
     assert pairs[((1, 4), (0, 6))].label == "collided"
     assert ((0, 3), (0, 1)) in pairs and ((0, 3), (0, 2)) in pairs
     # a hub is a terminal: nothing leaves it
@@ -90,7 +90,7 @@ def test_the_info_lines_read_the_hand_offs_as_text():
     lay = G.build(_si(), MOVES, None, "moves")
     lines = G._info_lines(_si(), (1, 4), lay, MOVES)
     assert lines[0].startswith("(1,4)  lunge -> clip c  (after = lunge_stop)")
-    assert any("-> (0,3)" in t and "budget spent" in t for t in lines), lines
+    assert any("-> (0,3)" in t and "run budget spent" in t for t in lines), lines
     assert any("-> (0,6)" in t and "collided" in t for t in lines)
     assert any(t.startswith("entered from: the brain") for t in lines)
     hub = G._info_lines(_si(), (0, 1), lay, MOVES)

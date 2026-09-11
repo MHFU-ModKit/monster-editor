@@ -590,7 +590,7 @@ def _info_lines(intel, pair: Pair, lay: Layout, moves: dict) -> List[str]:
         lines.append("hands to:")
         for e in p.next[:10]:
             tgt = "/".join("(%d,%d)" % t for t in e.to) or "(computed)"
-            lines.append("  -> %-12s %s" % (tgt, " & ".join(e.guards) or "always"))
+            lines.append("  -> %-12s %s" % (tgt, e.describe() or "always"))
         if len(p.next) > 10:
             lines.append("  ... %d more" % (len(p.next) - 10))
     elif p.next is not None:

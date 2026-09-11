@@ -40,6 +40,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import re
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,6 +119,59 @@ class BudgetIntel:
                    post_hook_owns=d.get("post_hook_owns"))
 
 
+#: entity cells a handler's exit branches on, by name — `docs/agent_memory_map.md`.
+#: Only the PINNED ones: an unpinned cell stays `+0x6DB`, which is a fact ("a flag at
+#: +0x6DB") where "combat flag" would be a guess dressed as one.
+_CELL_NAMES = {
+    0x280: "reaction pending",      # cleared on every main-0 entry; non-zero -> (2,2)
+    0x414: "frame budget",          # the per-action countdown, 27 of em75's pairs
+    0x637: "run budget armed",      # set by the charge translator with +0x76C
+    0x29A: "section",
+    0x1D7: "phase3",
+    0x1E8: "species",
+    0xBE: "clip busy",              # slot 0's clip-state busy flag (+0x80+0x3E)
+    0xBC: "clip playing",           # bit 0 of the root clip-state flags
+}
+
+
+def describe_guard(g: str) -> str:
+    """A guard as a person reads it: `+0x280!=0` -> `reaction pending`, `+0x324==1002`
+    -> `playing a1 2`, `+0x414<=0` -> `frame budget spent`. Anything not pinned comes
+    back unchanged."""
+    # the run budget (+0x76C, `0x09AD9A10`) is a different counter from the frame
+    # budget at +0x414; the file calls it "budget spent" — say which
+    if g == "budget spent":
+        return "run budget spent"
+    if g == "!budget spent":
+        return "run budget left"
+    m = re.match(r"^(!?)\+0x([0-9A-Fa-f]+)(==|!=|<=|>=|<|>)(-?\d+)$", g)
+    if not m:
+        return g
+    neg, off, op, val = m.group(1), int(m.group(2), 16), m.group(3), int(m.group(4))
+    if off == 0x324 and op in ("==", "!=") and 1000 <= val < 1200:
+        return "%splaying a1 %d" % ("not " if op == "!=" else "", val - 1000)
+    if off == 0x414:
+        if op == "<=" and val == 0:
+            return "frame budget spent"
+        if op == ">" and val == 0:
+            return "frame budget left"
+        return "frame budget%s%d" % (op, val)
+    name = _CELL_NAMES.get(off)
+    if name is None:
+        return g
+    if off in (0x280, 0x637, 0xBE, 0xBC):
+        off_form = {"reaction pending": "no reaction pending",
+                    "run budget armed": "run budget unarmed",
+                    "clip busy": "clip done",
+                    "clip playing": "clip ended"}[name]
+        if (op == "==" and val == 0) or (op == "!=" and val == 1):
+            return off_form
+        if (op == "!=" and val == 0) or (op == "==" and val == 1):
+            return name
+        return "%s%s%d" % (name, op, val)
+    return "%s%s%d" % (name, op, val)
+
+
 @dataclass(frozen=True)
 class Edge:
     """One hand-off a handler can make when its action ends: the pair(s) it enters,
@@ -139,8 +193,19 @@ class Edge:
 
     @property
     def reason(self) -> str:
-        """The guards that are not the phase — what a person would call the cause."""
+        """The guards that are not the phase — what a person would call the cause,
+        with the pinned cells named (`reaction pending`, `playing a1 2`)."""
+        return " & ".join(describe_guard(g) for g in self.guards
+                          if not g.startswith("phase"))
+
+    @property
+    def raw_reason(self) -> str:
+        """The same guards as the file spells them."""
         return " & ".join(g for g in self.guards if not g.startswith("phase"))
+
+    def describe(self) -> str:
+        """Every guard, named where pinned: `phase==3 & !collided & budget spent`."""
+        return " & ".join(describe_guard(g) for g in self.guards)
 
     @property
     def phase(self) -> Optional[int]:
@@ -154,7 +219,7 @@ class Edge:
 
     def __str__(self) -> str:
         tgt = "/".join("(%d,%d)" % t for t in self.to) or "(computed)"
-        return tgt + ("  [%s]" % " & ".join(self.guards) if self.guards else "")
+        return tgt + ("  [%s]" % self.describe() if self.guards else "")
 
     @classmethod
     def from_dict(cls, d: dict) -> "Edge":

@@ -569,15 +569,30 @@ def test_edges_read_back_with_their_reason_phase_and_route():
     p = si.pair(1, 4)
     assert p.successors == [(0, 3), (0, 6)] and p.ends_itself is True
     e = p.next[0]
-    assert e.to == ((0, 3),) and e.phase == 3 and e.reason == "!collided & budget spent"
+    assert e.to == ((0, 3),) and e.phase == 3 and e.raw_reason == "!collided & budget spent"
     assert e.via == (0x09D26158,) and e.mode == 0 and e.site == 0x10
-    assert str(e) == "(0,3)  [phase==3 & !collided & budget spent]"
     # a handled pair with an EMPTY next never ends itself; one without the field
     # (an old file) says unknown, not False
     assert si.pair(0, 6).ends_itself is False
     assert si.pair(9, 9).ends_itself is None and si.pair(9, 9).next is None
     assert [(q.main, q.sub) for q in si.predecessors(0, 3)] == [(1, 4)]
     assert si.successors(0, 3)[0].to == ((0, 1), (0, 2))
+
+
+def test_pinned_cells_are_named_and_unpinned_ones_stay_hex():
+    d = I.describe_guard
+    assert d("+0x280!=0") == "reaction pending" and d("+0x280==0") == "no reaction pending"
+    assert d("+0x324==1002") == "playing a1 2" and d("+0x324!=1017") == "not playing a1 17"
+    assert d("+0x414<=0") == "frame budget spent" and d("budget spent") == "run budget spent"
+    assert d("+0xBE==0") == "clip done" and d("+0x637==1") == "run budget armed"
+    assert d("+0x29A==99") == "section==99"
+    assert d("+0x6DB!=0") == "+0x6DB!=0"          # not pinned: stays a fact
+    assert d("phase==3") == "phase==3" and d("!collided") == "!collided"
+    si = I.SpeciesIntel.from_dict(_CHAIN_DOC)
+    e = si.pair(1, 4).next[0]
+    assert e.reason == "!collided & run budget spent"
+    assert e.raw_reason == "!collided & budget spent"
+    assert str(e) == "(0,3)  [phase==3 & !collided & run budget spent]"
 
 
 def test_chain_from_walks_to_the_hubs_and_stops_there():
