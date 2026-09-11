@@ -172,8 +172,14 @@ def _build(intel, moves: dict, selected: Optional[Pair], scope: str, depth: int,
                     layer_of[t] = d
                     order.append(t)
                     nxt.append(t)
-                elif t not in roots and layer_of[t] < d and t not in hubs:
-                    layer_of[t] = d              # longest path keeps arrows forward
+                elif layer_of[t] < d and t not in hubs:
+                    # longest path keeps arrows forward — for a ROOT too: a bound
+                    # move that is another root's successor (lunge_stop on the
+                    # charge's own skid) belongs where the chain reaches it, not
+                    # in column 0 with a vertical arrow into it
+                    layer_of[t] = d
+                    if t not in nxt:
+                        nxt.append(t)
         frontier = nxt
         if not frontier:
             break

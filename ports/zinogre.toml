@@ -154,11 +154,11 @@ label = "dash forward a long distance"
 labelled_build = "zinogre_v10.bin@09091d56"
 impact_frame = 28
 
-[clips.dash_forward_short]
+[clips.dash_forward_stop]
 slot = 21
 frames = 66
 loop = false
-label = "short forward dash"
+label = "short forward dash or stop"
 labelled_build = "zinogre_v10.bin@09091d56"
 impact_frame = 27
 
@@ -214,17 +214,21 @@ latch = 1                    # (1,4) names a single a1, so one dispatch covers t
 # The chain. The engine's own way out of (1,4) is its run budget (+0x76C), which its
 # translator sets and a Lua act_set does not — forced, the charge stood 38 s with its
 # hitbox spent. `after` is where the runtime hands the charge when it is over or has
-# stood `hold_max` ticks (2 Hz). The engine itself goes to (0,3), the skid; that pair
-# names no clip, so the port's stop rides (1,3) instead — see lunge_stop.
+# stood `hold_max` ticks (2 Hz). lunge_stop is (0,3), the engine's own skid, so the
+# declared chain IS the native one: (1,4) -> (0,3) -> (0,1)/(0,2).
 after = "lunge_stop"
 hold_max = 8
 
 [moves.lunge_stop]
-main = 1
+main = 0
 sub = 3
-clip = "stop_walk_forward"
+clip = "dash_forward_stop"
 latch = 1
-label = "the charge's own stop/recover (1,3) — its a1 is 2, which on this PAC is the howl; declared so the skid gets a stop clip instead"
+# (0,3) names no clip of its own (`a1 []`), so without a declared move the skid keeps
+# whatever was playing. Its phase 0 seeds the +0x414 frame budget (60 frames) itself,
+# so entered from Lua it still ends by itself and hands to (0,1)/(0,2). The earlier
+# (1,3) stand-in — a main-1 stop whose a1 2 is the howl on this PAC — is gone.
+label = "the engine's own skid after a charge, with the port's dash stop painted on it"
 
 # ⚠️ THE IMPACT IS 22 FRAMES LATE, AND THAT IS ACCEPTED, NOT MISSED.
 # The handler tests frames 0 and 40; lunge_forward's contact is at frame 62, so the
