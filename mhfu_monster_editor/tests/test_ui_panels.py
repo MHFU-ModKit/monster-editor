@@ -65,8 +65,45 @@ class _Io:
     display_framebuffer_scale = _Vec(1.0, 1.0)
 
 
+def _num(*vs):
+    for v in vs:
+        assert isinstance(v, (int, float)) and not isinstance(v, bool), v
+
+
+def _int(*vs):
+    for v in vs:
+        assert isinstance(v, int) and not isinstance(v, bool), v
+
+
 class _DrawList:
-    """`add_text`, `add_rect_filled`, `add_line`, ... — all no-ops."""
+    """The draw-list calls the panels make, with the imgui-bundle binding's OWN
+    argument order — `add_rect` is `(rounding, thickness, flags)`, not ImGui's C++
+    `(rounding, flags, thickness)`, and a float in the flags slot is a TypeError at
+    runtime that a permissive stub would wave through (it did, 2026-09-11). Anything
+    else is a no-op."""
+    def add_rect(self, p_min, p_max, col, rounding=0.0, thickness=1.0, flags=0):
+        _num(rounding, thickness)
+        _int(col, flags)
+
+    def add_rect_filled(self, p_min, p_max, col, rounding=0.0, flags=0):
+        _num(rounding)
+        _int(col, flags)
+
+    def add_bezier_cubic(self, p1, p2, p3, p4, col, thickness, num_segments=0):
+        _num(thickness)
+        _int(col, num_segments)
+
+    def add_text(self, pos, col, text, text_end=None):
+        _int(col)
+        assert isinstance(text, str), text
+
+    def add_triangle_filled(self, p1, p2, p3, col):
+        _int(col)
+
+    def add_line(self, p1, p2, col, thickness=1.0):
+        _num(thickness)
+        _int(col)
+
     def __getattr__(self, name):
         return lambda *a, **k: None
 

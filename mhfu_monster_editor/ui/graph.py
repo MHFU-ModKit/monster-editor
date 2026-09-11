@@ -398,7 +398,8 @@ class MoveGraph:
             edge = _col(imgui, 0.85, 0.85, 0.85, 1.0)
         r = 6.0 * self.zoom
         draw.add_rect_filled(imgui.ImVec2(x0, y0), imgui.ImVec2(x1, y1), fill, r)
-        draw.add_rect(imgui.ImVec2(x0, y0), imgui.ImVec2(x1, y1), edge, r, 0,
+        # this binding's order is (rounding, thickness, flags) — not ImGui's C++ one
+        draw.add_rect(imgui.ImVec2(x0, y0), imgui.ImVec2(x1, y1), edge, r,
                       2.0 if (sel or hov) else 1.0)
         if self.zoom < 0.5:
             draw.add_text(imgui.ImVec2(x0 + 4, y0 + 3),
