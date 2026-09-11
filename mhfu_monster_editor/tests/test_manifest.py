@@ -117,6 +117,59 @@ def test_a_move_declares_its_chain_and_a_dangling_or_self_after_is_refused():
             raise AssertionError("accepted: " + needle)
 
 
+def test_a_move_claims_host_pairs_and_a_rule_names_its_trigger():
+    """The native seams (em_vhook v3): `claim` on a move is the set of host
+    enter-actions it is substituted for, a `[[rule]]` is a 30 Hz trigger. Both
+    round-trip through dumps; a claim shared by two moves, a rule playing an
+    undeclared move, a rule waiting in the pair it plays, a bad distance window,
+    and more than four rules are all refused at load."""
+    body = MINIMAL + ('\n[clips.c]\nslot = 6\n[clips.s]\nslot = 21\n'
+                      '[moves.lunge]\nmain = 1\nsub = 4\nclip = "c"\n'
+                      'after = "lunge_stop"\nclaim = { main = 1 }\n'
+                      '[moves.lunge_stop]\nmain = 0\nsub = 3\nclip = "s"\n'
+                      '[[rule]]\nfrom = "lunge"\nmin_frames = 15\ndist = [250, 1e9]\n'
+                      'receding = true\nplay = "lunge_stop"\ncooldown = 30\n')
+    m = MF.loads(body)
+    c = m.moves["lunge"].claim
+    assert c is not None and c.mains == [1] and c.sub is None and c.mask == 0x02
+    assert m.moves["lunge_stop"].claim is None
+    assert len(m.rules) == 1
+    r = m.rules[0]
+    assert (r.from_move, r.play, r.min_frames, r.receding, r.closing, r.cooldown,
+            r.count) == ("lunge", "lunge_stop", 15, True, False, 30, None)
+    assert r.dist == (250.0, 1.0e9)
+    out = MF.dumps(m)
+    assert "claim = { main = [1] }" in out and "[[rule]]" in out and 'from = "lunge"' in out
+    back = MF.loads(out)
+    assert back.moves["lunge"].claim == c and back.rules == m.rules
+    # the richer spellings
+    m2 = MF.loads(body.replace("claim = { main = 1 }", "claim = { main = [0, 1], sub = 7 }")
+                  .replace('from = "lunge"', "from_main = [0, 2]"))
+    assert m2.moves["lunge"].claim.mains == [0, 1] and m2.moves["lunge"].claim.sub == 7
+    assert m2.rules[0].from_move is None and m2.rules[0].from_main == [0, 2]
+    four = body + '[[rule]]\nfrom = "lunge"\nplay = "lunge_stop"\n' * 3
+    assert len(MF.loads(four).rules) == 4
+    for bad, needle in (
+            (body.replace('[moves.lunge_stop]\nmain = 0\nsub = 3\nclip = "s"\n',
+                          '[moves.lunge_stop]\nmain = 0\nsub = 3\nclip = "s"\n'
+                          'claim = { main = 1 }\n'), "both claim main 1"),
+            (body.replace('play = "lunge_stop"', 'play = "nope"'), "nope"),
+            (body.replace('play = "lunge_stop"', 'play = "lunge"'), "restart the pair"),
+            (body.replace("dist = [250, 1e9]", "dist = [500, 250]"), "lo < hi"),
+            (body.replace("claim = { main = 1 }", "claim = { main = 9 }"), "main 9"),
+            (body.replace("claim = { main = 1 }", "claim = { sub = 1 }"), "needs main"),
+            (body.replace('from = "lunge"\n', ""), "needs `from`"),
+            (body.replace("receding = true", "receding = true\nclosing = true"), "both"),
+            (four + '[[rule]]\nfrom = "lunge"\nplay = "lunge_stop"\n', "holds 4"),
+            (body.replace("cooldown = 30", "count = 0"), "count")):
+        try:
+            MF.loads(bad)
+        except MF.ManifestError as e:
+            assert needle in str(e), (needle, str(e))
+        else:
+            raise AssertionError("accepted: " + needle)
+
+
 def test_two_clips_cannot_share_a_slot():
     body = MINIMAL + '\n[clips.a]\nslot = 61\n\n[clips.b]\nslot = 61\n'
     try:

@@ -261,6 +261,42 @@ def test_the_library_walks_a_declared_chain_and_refuses_to_loop_one_pair():
     assert "HARNESS OK" in run.stdout, run.stdout
 
 
+def test_the_seam_stubs_assemble_branchless_and_in_bounds():
+    """`tools/em_vhook_check.py`: the em_vhook v3 stubs the runtime above relies on,
+    assembled with the host cc from the same stubs.h the PRX builds, read back by
+    an independent decoder — no branch, frame-free slot 29, one call in slot 32,
+    targets and config offsets in range. Needs a C compiler; skips otherwise."""
+    if not shutil.which("cc"):
+        print("SKIP: no cc")
+        return
+    run = subprocess.run([sys.executable, os.path.join(_ROOT, "tools", "em_vhook_check.py")],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "OK:" in run.stdout, run.stdout
+
+
+def test_the_library_enters_pairs_through_the_native_seam_when_it_is_live():
+    """`mhfu_port.lua` over a fake em_vhook v3 seam (`lua_native_harness.lua`): the
+    first live tick installs the moves' claims as substitutions and the port's
+    rules, slot by slot with the rest cleared; `play()` goes through
+    `mhfu.em_request` and is confirmed when the cells show the pair; the
+    translator's alternative main is tracked rather than read as "ended"; a
+    request the engine declines is reported with the enter-action ring and does
+    NOT walk `after`; `{raw=true}` still writes the cells; a redefine re-arms.
+    Needs `lua`; skips otherwise."""
+    lua = shutil.which("lua")
+    if not lua:
+        print("SKIP: no lua")
+        return
+    port_lua = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts",
+                            "mhfu_port.lua")
+    run = subprocess.run([lua, os.path.join(os.path.dirname(__file__),
+                                            "lua_native_harness.lua"), port_lua],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "HARNESS OK" in run.stdout, run.stdout
+
+
 # --------------------------------------------------------------------------- #
 # the attack side (#33)
 # --------------------------------------------------------------------------- #

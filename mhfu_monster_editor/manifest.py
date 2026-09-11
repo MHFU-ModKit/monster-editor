@@ -61,6 +61,15 @@ Where this differs from the issue's sketch, and why
   or has stood `hold_max` ticks; declaring it is what turns "loop one pair" into "walk
   the sequence". A move whose pair the intel says never ends itself has to declare it.
   (`after`, not `then` — `then` is a Lua keyword and the script transcribes this table.)
+* **`[moves]` has `claim`, and there are `[[rule]]` blocks — the native seams (em_vhook
+  v3, issues #15/#16).** With the seam live the runtime enters a pair through the
+  engine's OWN enter-action (provisioned: the charge gets its run budget and ends
+  itself), so `after`/`hold_max` become the fallback. `claim = { main = 1 }` (or
+  `{ main = [0, 1], sub = 7 }`) makes every enter-action the HOST brain issues for a
+  pair in that set become this move — the host decides WHEN, the port decides WHAT.
+  A `[[rule]]` is a trigger the 30 Hz stub evaluates every frame with no Lua in the
+  loop: `from = "lunge"` (or `from_main = [0, 1]`), `min_frames`, `dist = [lo, hi]`,
+  `receding` / `closing`, `play = "lunge_stop"`, `cooldown`, `count`. Four of each.
 * **`[[hurtbox]]` does not carry `part` as a first-class field.** The sketch conflated
   two *different* tables in the host overlay: VOLUMES (`0x28` records: bone + radius, no
   part field at all) and WEAKNESS (`0x18` records, keyed by `part_id`). See
@@ -81,7 +90,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 SCHEMA = 1
 
@@ -158,6 +167,48 @@ class Move:
     #: ticks (2 Hz) after which the runtime hands to `after` even if the pair still
     #: stands. None = only when the engine leaves the pair.
     hold_max: Optional[int] = None
+    #: the host enter-actions this move is SUBSTITUTED for (the slot-32 seam):
+    #: `{"main": [1]}` = every main-1 attack the host brain picks, `{"main": [1],
+    #: "sub": 7}` = one of them. None = the host's own choices stand.
+    claim: Optional["Claim"] = None
+
+
+@dataclass
+class Claim:
+    """Which host enter-actions a move takes over: any `main` in the set, and either
+    every sub of it or exactly `sub`."""
+    mains: List[int]
+    sub: Optional[int] = None
+
+    @property
+    def mask(self) -> int:
+        m = 0
+        for k in self.mains:
+            m |= 1 << k
+        return m
+
+
+@dataclass
+class Rule:
+    """A native brain rule (the slot-29 seam, issue #16): evaluated every frame.
+
+    Fires `play` when the live pair is in the `from` set (`from_move`, a move name,
+    or `from_main`, a set of main states), has stood `min_frames`, the player is
+    inside `dist`, and the gap is growing (`receding`) / shrinking (`closing`) if
+    asked — then `cooldown` frames pass before it may fire again, `count` times.
+    """
+    play: str
+    from_move: Optional[str] = None
+    from_main: List[int] = field(default_factory=list)
+    min_frames: int = 0
+    dist: Tuple[float, float] = (0.0, 1.0e9)
+    receding: bool = False
+    closing: bool = False
+    mode: int = 0
+    cooldown: int = 0
+    #: None = standing (the runtime passes EM_UNLIMITED)
+    count: Optional[int] = None
+    label: str = ""
 
 
 #: the ten damage-type columns of a hitzone row, in file order.
@@ -412,6 +463,7 @@ class PortManifest:
     hitboxes: List[Hitbox] = field(default_factory=list)
     attacks: List[Attack] = field(default_factory=list)
     effects: List[Effect] = field(default_factory=list)
+    rules: List[Rule] = field(default_factory=list)
     schema: int = SCHEMA
     #: where it was loaded from, when it was. Not part of identity — two manifests
     #: with the same content are equal however they were read.
@@ -538,6 +590,26 @@ def _opt(d: dict, key: str, typ, where: str, default=None):
     return _typed(d[key], typ, "%s.%s" % (where, key))
 
 
+def _claim(v, where: str) -> Optional["Claim"]:
+    if v is None:
+        return None
+    w = where + ".claim"
+    if isinstance(v, int) and not isinstance(v, bool):
+        v = {"main": v}
+    v = _typed(v, dict, w)
+    _reject_unknown(v, _CLAIM_KEYS, w)
+    mains = v.get("main")
+    if isinstance(mains, int) and not isinstance(mains, bool):
+        mains = [mains]
+    if not isinstance(mains, list) or not mains:
+        raise ManifestError("%s: needs main = <state> or [states]" % w)
+    mains = [_typed(x, int, "%s.main[%d]" % (w, i)) for i, x in enumerate(mains)]
+    for k in mains:
+        if not 0 <= k <= 7:
+            raise ManifestError("%s: main %d is not a main state (0..7)" % (w, k))
+    return Claim(mains=sorted(set(mains)), sub=_opt(v, "sub", int, w))
+
+
 def _int_list(d: dict, key: str, where: str, default=None):
     if key not in d:
         return default
@@ -562,7 +634,10 @@ _BUILD_KEYS = ("source_skeleton", "skin", "ground_lift", "animated", "bone_offse
 _CLIP_KEYS = ("slot", "frames", "loop", "label", "impact_frame",
               "labelled_build")
 _MOVE_KEYS = ("main", "sub", "clip", "anim", "latch", "min_gap", "label",
-              "allow_unentered", "after", "hold_max")
+              "allow_unentered", "after", "hold_max", "claim")
+_CLAIM_KEYS = ("main", "sub")
+_RULE_KEYS = ("play", "from", "from_main", "min_frames", "dist", "receding", "closing",
+              "mode", "cooldown", "count", "label")
 _HURTBOX_KEYS = ("bone", "radius", "part", "hitzone_row", "shape", "offset",
                  "to", "flags", "label")
 _PART_KEYS = ("index", "hitzone_row", "severable", "label")
@@ -571,7 +646,7 @@ _HITBOX_KEYS = ("bone", "radius", "set", "shape", "offset", "to", "flags", "labe
 _ATTACK_KEYS = ("id", "power", "element", "volume", "label")
 _EFFECT_KEYS = ("move", "frame", "id", "bone", "label")
 _TOP_KEYS = ("schema", "port", "source", "build", "clips", "moves", "hurtbox",
-             "parts", "hitzone", "hitbox", "attack", "effect")
+             "parts", "hitzone", "hitbox", "attack", "effect", "rule")
 
 
 def loads(text: str, *, path: Optional[os.PathLike | str] = None) -> PortManifest:
@@ -653,7 +728,8 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
             latch=_opt(m, "latch", int, w, 1), min_gap=_opt(m, "min_gap", int, w, 2),
             label=_opt(m, "label", str, w, ""),
             allow_unentered=_opt(m, "allow_unentered", bool, w, False),
-            after=_opt(m, "after", str, w), hold_max=_opt(m, "hold_max", int, w))
+            after=_opt(m, "after", str, w), hold_max=_opt(m, "hold_max", int, w),
+            claim=_claim(m.get("claim"), w))
     for mname, mv in moves.items():
         if mv.after is not None and mv.after not in moves:
             raise ManifestError("moves.%s: after = %r names no [moves.%s]"
@@ -768,6 +844,39 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
             id=_need(e, "id", int, w), bone=_need(e, "bone", int, w),
             label=_opt(e, "label", str, w, "")))
 
+    rules = []
+    for i, r in enumerate(_typed(raw.get("rule", []), list, where + ".rule")):
+        w = "rule[%d]" % i
+        r = _typed(r, dict, w)
+        _reject_unknown(r, _RULE_KEYS, w)
+        dist = r.get("dist", [0.0, 1.0e9])
+        if not (isinstance(dist, list) and len(dist) == 2
+                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in dist)):
+            raise ManifestError("%s: dist must be [lo, hi] in units" % w)
+        if dist[0] < 0 or dist[1] <= dist[0]:
+            raise ManifestError("%s: dist = [%r, %r] — need 0 <= lo < hi" % (w, dist[0], dist[1]))
+        fm = _int_list(r, "from_main", w, []) or []
+        for k in fm:
+            if not 0 <= k <= 7:
+                raise ManifestError("%s: from_main %d is not a main state (0..7)" % (w, k))
+        count = _opt(r, "count", int, w)
+        if count is not None and count < 1:
+            raise ManifestError("%s: count must be >= 1 (omit it for a standing rule)" % w)
+        rules.append(Rule(
+            play=_need(r, "play", str, w), from_move=_opt(r, "from", str, w),
+            from_main=fm, min_frames=_opt(r, "min_frames", int, w, 0),
+            dist=(float(dist[0]), float(dist[1])),
+            receding=_opt(r, "receding", bool, w, False),
+            closing=_opt(r, "closing", bool, w, False),
+            mode=_opt(r, "mode", int, w, 0), cooldown=_opt(r, "cooldown", int, w, 0),
+            count=count, label=_opt(r, "label", str, w, "")))
+        if rules[-1].from_move is None and not fm:
+            raise ManifestError("%s: needs `from` (a move) or `from_main` (main states)" % w)
+        if rules[-1].receding and rules[-1].closing:
+            raise ManifestError("%s: receding and closing cannot both be required" % w)
+    if len(rules) > 4:
+        raise ManifestError("rule: %d declared, the seam holds 4" % len(rules))
+
     m = PortManifest(
         name=_need(port, "name", str, "port"),
         host_species=_need(port, "host_species", int, "port"),
@@ -779,7 +888,7 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
         replace=_int_list(port, "replace", "port", []) or [],
         clips=clips, moves=moves, hurtboxes=hurtboxes, parts=parts,
         hitzones=hitzones, hitboxes=hitboxes, attacks=attacks, effects=effects,
-        schema=schema, path=Path(path) if path else None)
+        rules=rules, schema=schema, path=Path(path) if path else None)
 
     # cross-references are structural: a move pointing at a clip that is not declared
     # is a typo, not a policy question, and it silently becomes `mv.clip == nil` in Lua.
@@ -794,6 +903,27 @@ def from_dict(raw: dict, *, path: Optional[os.PathLike | str] = None) -> PortMan
         if ef.move not in m.moves:
             raise ManifestError("effect[%d]: move %r is not declared in [moves]"
                                 % (i, ef.move))
+    for i, r in enumerate(m.rules):
+        if r.play not in m.moves:
+            raise ManifestError("rule[%d]: play = %r is not declared in [moves]" % (i, r.play))
+        if r.from_move is not None and r.from_move not in m.moves:
+            raise ManifestError("rule[%d]: from = %r is not declared in [moves]"
+                                % (i, r.from_move))
+        if r.from_move == r.play:
+            raise ManifestError("rule[%d]: from and play are both %r — the rule would "
+                                "restart the pair it waits in" % (i, r.play))
+    claimed: Dict[Tuple[int, Optional[int]], str] = {}
+    for mv in m.moves.values():
+        if mv.claim is None:
+            continue
+        for k in mv.claim.mains:
+            key = (k, mv.claim.sub)
+            if key in claimed:
+                raise ManifestError("moves.%s and moves.%s both claim main %d%s — the "
+                                    "first slot wins silently at runtime"
+                                    % (claimed[key], mv.name, k,
+                                       "" if mv.claim.sub is None else " sub %d" % mv.claim.sub))
+            claimed[key] = mv.name
     seen: Dict[int, str] = {}
     for c in m.clips.values():
         if c.slot in seen:
@@ -909,6 +1039,11 @@ def dumps(m: PortManifest) -> str:
             _kv(out, "allow_unentered", mv.allow_unentered)
         _kv(out, "after", mv.after)
         _kv(out, "hold_max", mv.hold_max)
+        if mv.claim is not None:
+            inner = "main = %s" % _atom(mv.claim.mains)
+            if mv.claim.sub is not None:
+                inner += ", sub = %d" % mv.claim.sub
+            out.append("claim = { %s }" % inner)
         _kv(out, "label", mv.label)
 
     for name in sorted(m.parts):
@@ -946,6 +1081,26 @@ def dumps(m: PortManifest) -> str:
         _kv(out, "id", e.id)
         _kv(out, "bone", e.bone)
         _kv(out, "label", e.label)
+
+    for r in m.rules:
+        out += ["", "[[rule]]"]
+        _kv(out, "from", r.from_move)
+        _kv(out, "from_main", r.from_main)
+        if r.min_frames:
+            _kv(out, "min_frames", r.min_frames)
+        if r.dist != (0.0, 1.0e9):
+            _kv(out, "dist", [r.dist[0], r.dist[1]])
+        if r.receding:
+            _kv(out, "receding", True)
+        if r.closing:
+            _kv(out, "closing", True)
+        _kv(out, "play", r.play)
+        if r.mode:
+            _kv(out, "mode", r.mode)
+        if r.cooldown:
+            _kv(out, "cooldown", r.cooldown)
+        _kv(out, "count", r.count)
+        _kv(out, "label", r.label)
 
     return "\n".join(out).rstrip("\n") + "\n"
 

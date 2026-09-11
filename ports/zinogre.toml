@@ -218,6 +218,12 @@ latch = 1                    # (1,4) names a single a1, so one dispatch covers t
 # declared chain IS the native one: (1,4) -> (0,3) -> (0,1)/(0,2).
 after = "lunge_stop"
 hold_max = 8
+# 🟢 With the native seam live (em_vhook v3, issues #15/#16) the runtime enters this
+# pair through the engine's OWN enter-action, so it IS provisioned and ends itself —
+# `after`/`hold_max` become the fallback. `claim` puts the port on the host's clock:
+# every main-1 attack the Tigrex brain picks is entered as the lunge instead (the
+# slot-32 substitution), and the hook paints lunge_forward on it.
+claim = { main = 1 }
 
 [moves.lunge_stop]
 main = 0
@@ -249,6 +255,20 @@ label = "the engine's own skid after a charge, with the port's dash stop painted
 # `cursor`, so the clip's length does not end the action; the handler does. Both are
 # cold-boot questions, not static ones.
 # ⚠️ No census covers (1,4): `entered` is UNKNOWN, not zero.
+
+# THE NATIVE "PAST YOU" RULE — evaluated every frame by the slot-29 stub, no Lua in
+# the loop (issue #16). In (1,4) for >= 15 frames (the hitbox spawns at clip frame 40
+# at speed 2.4, ~17 frames in), the gap to the hunter GROWING and >= 250 units ->
+# lunge_stop. Fires once per charge (the pair changes), then a 1 s cooldown. The
+# 2 Hz `closing < 0` shortcut in zinogre_lunge.lua only runs without the seam.
+[[rule]]
+from = "lunge"
+min_frames = 15
+dist = [250, 1e9]
+receding = true
+play = "lunge_stop"
+cooldown = 30
+label = "past you -> skid"
 
 [[hurtbox]]
 bone = 35
