@@ -63,8 +63,10 @@ import em_effects as fx                                             # noqa: E402
 import em_moveset as mvs                                            # noqa: E402
 import em_phase_map as pm                                           # noqa: E402
 import em_state_census as cs                                        # noqa: E402
+import em_attacks as atk                                            # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent / "mhfu_model"))
 import hitzone as hz                                                # noqa: E402
+import hitbox as hb                                                 # noqa: E402
 
 SCHEMA = "mhfu.species_intel/1"
 OUT_ROOT = Path("species")
@@ -185,6 +187,13 @@ def static_intel(ov: Overlay) -> dict:
     by_fn: dict[int, list[dict]] = collections.defaultdict(list)
     for s in sites:
         by_fn[s["fn"]].append(s)
+    # attack spawns, the same way (#33): the literal id each handler hands the
+    # species' node constructor, credited through the same call graph
+    atk_sites = atk.sites(ov)
+    atk_by_fn: dict[int, list[dict]] = collections.defaultdict(list)
+    for s in atk_sites:
+        atk_by_fn[s["fn"]].append(s)
+    atk_credited: set[int] = set()
     _pro, calls = call_graph(ov)
 
     gate_cache: dict[int, dict] = {}
@@ -245,6 +254,23 @@ def static_intel(ov: Overlay) -> dict:
         eff.sort(key=lambda e: (e["id"], e["bone"] if e["bone"] is not None else -1,
                                 e["frame"] if e["frame"] is not None else -1))
         rec["effects"] = eff
+        # the attacks this pair's handler can spawn — HANDLER literals, before any
+        # species id offset (`hitbox.id_offset`). Sorted unique; a computed id is
+        # counted, not invented.
+        aids: set[int] = set()
+        a_sites = 0
+        a_computed = 0
+        for f in reachable(calls, h, EFFECT_CALL_DEPTH):
+            for s in atk_by_fn.get(f, ()):
+                a_sites += 1
+                atk_credited.add(s["site"])
+                if s["aid"] is None:
+                    a_computed += 1
+                else:
+                    aids.add(s["aid"])
+        rec["attack_ids"] = sorted(aids)
+        rec["attack_sites"] = a_sites
+        rec["attack_sites_computed"] = a_computed
         pairs[(m, sub)] = rec
 
     unattributed = collections.defaultdict(list)
@@ -266,6 +292,9 @@ def static_intel(ov: Overlay) -> dict:
             for f, v in sorted(unattributed.items())],
         effect_sites=len(sites),
         effect_sites_computed=computed_sites,
+        attack_sites=len(atk_sites),
+        attack_sites_uncredited=sum(1 for s in atk_sites
+                                    if s["site"] not in atk_credited),
     )
 
 
@@ -407,6 +436,99 @@ def parts_intel(ov: Overlay, species: int, game_task: Path | None) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# the attack system — where he hits YOU (issue #33)
+# --------------------------------------------------------------------------- #
+def _attack_sphere(s: hz.Sphere) -> dict:
+    """Same shape as `_sphere` minus the two fields an attack volume does not use.
+    The bone doubles as a coordinate space: 125/126/127 are the node's own."""
+    d = dict(bone=s.bone, shape=hz.CAPSULE if s.is_capsule else hz.SPHERE,
+             radius=round(s.radius, 4), a=[round(v, 4) for v in s.a])
+    if s.is_capsule:
+        d["b"] = [round(v, 4) for v in s.b]
+    if s.flags:
+        d["flags"] = "0x%X" % s.flags
+    # kept so the round trip stays byte-identical even where the engine ignores them
+    if s.hitzone_row or s.part:
+        d["row_part"] = [s.hitzone_row, s.part]
+    return d
+
+
+def _attack_record(a: hb.Attack) -> dict:
+    return dict(id=a.index, va="0x%08X" % a.va, power=a.power,
+                element="0x%02X" % a.element, volume=a.volume, kind=a.kind,
+                flags="0x%02X" % a.flags, angle=a.angle, tag="0x%02X" % a.tag,
+                u16_0c=a.u16_0c, value_14=a.value_14, raw=a.raw.hex())
+
+
+def attacks_intel(ov: Overlay, species: int, st: dict) -> dict:
+    """The mirror image of `parts_intel`: the species' attack records and the
+    volume sets they point at, plus WHICH game_task spawner its handlers call.
+
+    STATIC — bytes in the ISO — but the join has two provenances and the block
+    keeps them apart: the em75 spawner→table binding was walked live (#33); the
+    other 16 are the id range fitting the biggest table (`em_attacks.consistency`).
+    The runtime seam — each set overwritten IN PLACE through the overlay's own
+    pointer table, sentinel-terminated — was proven by RAM poke on a native Tigrex
+    (645 → 152 → 1381 units); the generated-Lua path is `mhfu_port.lua` P.hit().
+    """
+    img = hz.Image.parse(Path(ov.path).read_bytes())
+    tables = hb.tables(img)
+    prim = hb.primary_table(tables)
+    sp = atk.spawner_of(ov)
+    fit = atk.consistency(sp, prim)
+    if not tables:
+        return {"present": False,
+                "reason": "this overlay never calls the table setter 0x%08X — no "
+                          "attack table (em1/em33)" % hb.SETTER_VA,
+                "spawner": None if sp is None else "0x%08X" % sp.fn}
+    offsets = hb.ID_OFFSETS.get(species, {species: 0})
+
+    def table_doc(t: hb.SpeciesTables) -> dict:
+        return {
+            "handle": "0x%08X" % t.handle_va,
+            "records": "0x%08X" % t.records_va,
+            "n_records": len(t.attacks),
+            "volume_table": None if t.volume_table_va is None
+            else "0x%08X" % t.volume_table_va,
+            "n_sets": len(t.volumes),
+            "primary": t is prim,
+            # a table whose every set sits on 125/126/127 has no joint to draw on
+            "rigged": any(hb.is_rigged(v.spheres) for v in t.volumes),
+            "sets": [{"index": i, "va": "0x%08X" % v.va, "count": len(v.spheres),
+                      "bones": v.bones, "rigged": hb.is_rigged(v.spheres),
+                      "spheres": [_attack_sphere(s) for s in v.spheres]}
+                     for i, v in enumerate(t.volumes)],
+            "attacks": [_attack_record(a) for a in t.attacks],
+        }
+
+    return {
+        "present": True,
+        "source": "tools/mhfu_model/hitbox.py + tools/em_attacks.py",
+        "note": "static: bytes in the ISO. The in-place set overwrite is proven by "
+                "RAM poke on a native Tigrex (#33); the generated-Lua runtime path "
+                "has not been cold-booted yet.",
+        "setter": "0x%08X" % hb.SETTER_VA,
+        "spawner": None if sp is None else "0x%08X" % sp.fn,
+        "spawner_sites": 0 if sp is None else len(sp.sites),
+        "spawner_literal_sites": 0 if sp is None else sp.n_literal,
+        "join": fit,
+        "join_provenance": ("measured — walked live from the handler to the HP "
+                            "write, 2026-09-11" if fit == "measured" else
+                            "inferred — the overlay's own game_task node "
+                            "constructor, its literal ids against the biggest "
+                            "table; see em_attacks.consistency"),
+        "extra_spawners": [{"fn": "0x%08X" % ex.fn, "sites": len(ex.sites),
+                            "ids": ex.literal_ids}
+                           for ex in atk.extras(ov, sp)],
+        "id_offsets": {str(k): v for k, v in sorted(offsets.items())},
+        "field_provenance": dict(hb.FIELD_PROVENANCE),
+        "attack_sites": st.get("attack_sites", 0),
+        "attack_sites_uncredited": st.get("attack_sites_uncredited", 0),
+        "tables": [table_doc(t) for t in tables],
+    }
+
+
 def build(path: Path, census: dict | None = None,
           census_reason: str = "", game_task: Path | None = None) -> dict:
     ov = Overlay.load_file(path)
@@ -483,6 +605,7 @@ def build(path: Path, census: dict | None = None,
         "pairs": pairs_out,
         "unattributed_effects": st["unattributed_effects"],
         "parts": parts_intel(ov, species, game_task),
+        "attacks": attacks_intel(ov, species, st),
     }
     if have:
         doc["census"].update(log=census["log"], since=census["since"],
@@ -527,6 +650,18 @@ def summarise(doc: dict) -> str:
                % (len(hb), sum(s["count"] for s in hb),
                   "%d state(s)" % len(g["states"]) if g.get("present")
                   else "ABSENT (%s)" % g.get("reason", "?")))
+    at = doc.get("attacks") or {}
+    if at.get("present"):
+        prim = next((t for t in at["tables"] if t["primary"]), None)
+        out.append("  attacks: %d table(s); moveset %s records / %s set(s); spawner "
+                   "%s (%s), %d pair(s) name an attack"
+                   % (len(at["tables"]),
+                      "-" if prim is None else prim["n_records"],
+                      "-" if prim is None else prim["n_sets"],
+                      at.get("spawner") or "-", at.get("join"),
+                      sum(1 for p in pairs if p.get("attack_ids"))))
+    else:
+        out.append("  attacks: ABSENT (%s)" % at.get("reason", "?"))
     c = doc["census"]
     if c["present"]:
         out.append("  census: %d transitions, %d pair(s) observed  (MEASURED)"

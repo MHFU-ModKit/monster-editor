@@ -155,6 +155,15 @@ class PairIntel:
     windows: int = 0
     budget: BudgetIntel = field(default_factory=BudgetIntel)
     effects: List[EffectRecipe] = field(default_factory=list)
+    #: the ATTACK ids this pair's handler hands the species' spawner — HANDLER
+    #: literals, before any species id offset (`AttackIntel.id_offset`). The
+    #: hitbox a move actually hits with is `AttackIntel.attack(id).volume` (#33).
+    #: Empty = the handler spawns no attack the static scan can see, which is most
+    #: pairs: a turn, a roar, a walk.
+    attack_ids: List[int] = field(default_factory=list)
+    attack_sites: int = 0
+    #: spawn sites reached whose id is a register, not a literal — counted, not named
+    attack_sites_computed: int = 0
 
     #: why this pair's static record is odd — e.g. its dispatcher case runs inline.
     #: Kept apart from :attr:`note`, which prefers what the CENSUS said, so the two
@@ -265,6 +274,9 @@ class PairIntel:
             windows=int(d.get("windows", 0)),
             budget=BudgetIntel.from_dict(d.get("budget")),
             effects=[EffectRecipe.from_dict(e) for e in d.get("effects", [])],
+            attack_ids=[int(x) for x in d.get("attack_ids", [])],
+            attack_sites=int(d.get("attack_sites", 0)),
+            attack_sites_computed=int(d.get("attack_sites_computed", 0)),
             a1_measured=a1_meas, static_note=str(d.get("note", "")),
             move_per_tick=meas.get("move_per_tick"),
             move_samples=int(meas.get("move_samples", 0)),
@@ -531,6 +543,258 @@ class PartIntel:
 
 
 # --------------------------------------------------------------------------- #
+# the attack system — where he hits YOU (issue #33)
+# --------------------------------------------------------------------------- #
+#: bones that are a coordinate space, not a joint (`hitbox.py`): 125 a joiner with
+#: no geometry, 126 a capsule between the NODE's own two points, 127 a sphere at the
+#: node's own position — the attacker's.
+ATTACK_BONE_JOINER = 0x7D
+ATTACK_BONE_NODE_CAPSULE = 0x7E
+ATTACK_BONE_NODE_SPHERE = 0x7F
+ATTACK_MARKER_BONES = (ATTACK_BONE_JOINER, ATTACK_BONE_NODE_CAPSULE,
+                       ATTACK_BONE_NODE_SPHERE)
+
+
+@dataclass
+class AttackSet:
+    """One attack volume set: the spheres a spawned node walks, in table order.
+
+    The SAME `0x28` record as a hurtbox with `part`/`hitzone_row` unused, so the
+    spheres are :class:`HitSphere`s. `index` is the volume-set index an attack
+    record's `+0x0A` names, and the runtime writes the set IN PLACE at `va` —
+    `capacity` is its record count.
+    """
+    index: int
+    va: int
+    spheres: List[HitSphere] = field(default_factory=list)
+    #: any record on a real joint (bone < 125)? A set that is all 126/127 hangs on
+    #: the node's own position — a projectile's — and has nothing to re-rig.
+    rigged: bool = True
+
+    @property
+    def capacity(self) -> int:
+        return len(self.spheres)
+
+    @property
+    def bones(self) -> List[int]:
+        return sorted({s.bone for s in self.spheres
+                       if s.bone not in ATTACK_MARKER_BONES})
+
+    def describe(self) -> str:
+        return ", ".join(
+            "bone%d%s r=%g" % (s.bone, "/cap" if s.is_capsule else "", s.radius)
+            + (" @%s" % (tuple(round(v) for v in s.a),) if any(s.a) else "")
+            for s in self.spheres)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttackSet":
+        sp = [HitSphere.from_dict(x) for x in d.get("spheres", [])]
+        return cls(index=int(d.get("index", 0)), va=_addr(d.get("va")) or 0,
+                   spheres=sp,
+                   rigged=bool(d.get("rigged",
+                                     any(s.bone not in ATTACK_MARKER_BONES
+                                         for s in sp))))
+
+
+@dataclass(frozen=True)
+class AttackRecord:
+    """One `0x18` attack record: what an attack id does when its volume touches you.
+
+    Three fields are MEASURED levers (`power`, `element`, `volume`); the rest are
+    located, not decoded — `FIELD_PROVENANCE` in `hitbox.py` says which, and a UI
+    must not render a shape-only label like a measured one.
+    """
+    id: int
+    va: int
+    power: int
+    element: int
+    volume: int
+    kind: int = 0
+    flags: int = 0
+    angle: int = 0
+    tag: int = 0
+    u16_0c: int = 0
+    value_14: int = 0
+    raw: bytes = b""
+
+    @property
+    def is_blank(self) -> bool:
+        """Record 0 is all zero in every overlay; a blank is not an attack."""
+        return not self.raw or self.raw == bytes(len(self.raw))
+
+    def describe(self) -> str:
+        return "power %d, element 0x%02X, set %d" % (self.power, self.element,
+                                                    self.volume)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttackRecord":
+        return cls(id=int(d["id"]), va=_addr(d.get("va")) or 0,
+                   power=int(d.get("power", 0)),
+                   element=_addr(d.get("element")) or 0,
+                   volume=int(d.get("volume", 0)), kind=int(d.get("kind", 0)),
+                   flags=_addr(d.get("flags")) or 0, angle=int(d.get("angle", 0)),
+                   tag=_addr(d.get("tag")) or 0, u16_0c=int(d.get("u16_0c", 0)),
+                   value_14=int(d.get("value_14", 0)),
+                   raw=bytes.fromhex(d["raw"]) if d.get("raw") else b"")
+
+
+@dataclass
+class AttackTable:
+    """One (handle, records, volume sets) triple — one per setter call site.
+
+    An overlay can hold several and they are NOT one kind of thing: em75's primary
+    is the 107-record moveset; its four extras are un-rigged, projectile-shaped.
+    `primary` is the one the handlers' literals index.
+    """
+    handle_va: int
+    records_va: int
+    volume_table_va: Optional[int]
+    primary: bool = False
+    rigged: bool = True
+    sets: List[AttackSet] = field(default_factory=list)
+    attacks: List[AttackRecord] = field(default_factory=list)
+
+    def set(self, index: int) -> Optional[AttackSet]:
+        for st in self.sets:
+            if st.index == int(index):
+                return st
+        return None
+
+    def attack(self, id: int) -> Optional[AttackRecord]:
+        """By RECORD id — the table index the engine uses — not list position."""
+        for a in self.attacks:
+            if a.id == int(id):
+                return a
+        return None
+
+    def volume_for(self, id: int) -> Optional[AttackSet]:
+        """The set that attack's node would point at — the join the engine makes."""
+        a = self.attack(id)
+        return None if a is None else self.set(a.volume)
+
+    def attacks_using(self, set_index: int) -> List[AttackRecord]:
+        return [a for a in self.attacks if not a.is_blank and a.volume == set_index]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttackTable":
+        return cls(handle_va=_addr(d.get("handle")) or 0,
+                   records_va=_addr(d.get("records")) or 0,
+                   volume_table_va=_addr(d.get("volume_table")),
+                   primary=bool(d.get("primary")), rigged=bool(d.get("rigged", True)),
+                   sets=[AttackSet.from_dict(x) for x in d.get("sets", [])],
+                   attacks=[AttackRecord.from_dict(x) for x in d.get("attacks", [])])
+
+
+@dataclass
+class AttackIntel:
+    """What the host species knows about HITTING: its attack records, the volume
+    sets they point at, and which game_task spawner its handlers call (#33).
+
+    Two provenances, kept apart: em75's spawner→table binding was walked live to
+    the HP write; the other 16 are inferred from the id range fitting the biggest
+    table, and :attr:`join` says which (`measured` / `consistent` /
+    `ids_exceed_table` / `no_spawner` / `no_table`).
+
+    🔴 The tables are SPECIES data in the overlay, shared by every entity of that
+    species on the map — a port REPLACING its host owns them; beside a native one
+    it re-arms the native too. Same caveat as the damage grid.
+    """
+    present: bool = False
+    reason: str = ""
+    spawner: Optional[int] = None
+    join: str = ""
+    join_provenance: str = ""
+    #: `{entity_species: offset}` — the record an entity uses is
+    #: `handler literal + offset`. Only em75's is known beyond its own species.
+    id_offsets: Dict[int, int] = field(default_factory=dict)
+    field_provenance: Dict[str, str] = field(default_factory=dict)
+    tables: List[AttackTable] = field(default_factory=list)
+    extra_spawners: List[dict] = field(default_factory=list)
+    attack_sites: int = 0
+    attack_sites_uncredited: int = 0
+    note: str = ""
+
+    @property
+    def primary(self) -> Optional[AttackTable]:
+        for t in self.tables:
+            if t.primary:
+                return t
+        return self.tables[0] if self.tables else None
+
+    @property
+    def sets(self) -> List[AttackSet]:
+        """The moveset table's volume sets — the ones a handler's id reaches."""
+        t = self.primary
+        return [] if t is None else list(t.sets)
+
+    @property
+    def attacks(self) -> List[AttackRecord]:
+        t = self.primary
+        return [] if t is None else [a for a in t.attacks if not a.is_blank]
+
+    def set(self, index: int) -> Optional[AttackSet]:
+        t = self.primary
+        return None if t is None else t.set(index)
+
+    def attack(self, id: int) -> Optional[AttackRecord]:
+        t = self.primary
+        return None if t is None else t.attack(id)
+
+    def capacity(self, set_index: int) -> Optional[int]:
+        """How many records fit IN PLACE at runtime over set ``set_index``."""
+        st = self.set(set_index)
+        return None if st is None else st.capacity
+
+    def id_offset(self, entity_species: int) -> Optional[int]:
+        """The offset an entity of ``entity_species`` adds to a handler's literal.
+        None = not known for that species — never assume 0 for a species the
+        overlay was not read for."""
+        return self.id_offsets.get(int(entity_species))
+
+    def records_for(self, literal_ids: Iterable[int],
+                    entity_species: Optional[int] = None) -> List[AttackRecord]:
+        """The attack records a handler's literals reach for an entity of
+        ``entity_species`` (default: offset 0 — the overlay's own species)."""
+        off = 0 if entity_species is None else self.id_offset(entity_species)
+        if off is None:
+            return []
+        out = []
+        for i in literal_ids:
+            a = self.attack(int(i) + off)
+            if a is not None and not a.is_blank:
+                out.append(a)
+        return out
+
+    def sets_for(self, literal_ids: Iterable[int],
+                 entity_species: Optional[int] = None) -> List[int]:
+        """Volume-set indices those attacks hit with — the join a move needs."""
+        return sorted({a.volume for a in self.records_for(literal_ids, entity_species)})
+
+    def attacks_using(self, set_index: int) -> List[AttackRecord]:
+        t = self.primary
+        return [] if t is None else t.attacks_using(set_index)
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> "AttackIntel":
+        if not d or not d.get("present"):
+            return cls(present=False,
+                       reason=(d or {}).get("reason", "no attacks block — regenerate "
+                                                      "with tools/em_intel.py"),
+                       spawner=_addr((d or {}).get("spawner")))
+        return cls(
+            present=True, spawner=_addr(d.get("spawner")),
+            join=str(d.get("join", "")),
+            join_provenance=str(d.get("join_provenance", "")),
+            id_offsets={int(k): int(v) for k, v in (d.get("id_offsets") or {}).items()},
+            field_provenance=dict(d.get("field_provenance") or {}),
+            tables=[AttackTable.from_dict(t) for t in d.get("tables", [])],
+            extra_spawners=list(d.get("extra_spawners") or []),
+            attack_sites=int(d.get("attack_sites", 0)),
+            attack_sites_uncredited=int(d.get("attack_sites_uncredited", 0)),
+            note=str(d.get("note", "")))
+
+
+# --------------------------------------------------------------------------- #
 class SpeciesIntel:
     """`species/emNN.json`, joined from all four offline analysers.
 
@@ -549,7 +813,8 @@ class SpeciesIntel:
                  main_states: Optional[List[dict]] = None,
                  unattributed_effects: Optional[List[dict]] = None,
                  overlay: Optional[dict] = None,
-                 parts: Optional["PartIntel"] = None) -> None:
+                 parts: Optional["PartIntel"] = None,
+                 attacks: Optional["AttackIntel"] = None) -> None:
         self.host_species = int(host_species)
         self._by_pair: Dict[Tuple[int, int], PairIntel] = {
             (p.main, p.sub): p for p in pairs}
@@ -560,6 +825,8 @@ class SpeciesIntel:
         self.overlay = dict(overlay or {})
         #: the part system — never None, so a caller never has to guard it
         self.parts: PartIntel = parts if parts is not None else PartIntel()
+        #: the attack system (#33) — likewise never None
+        self.attacks: AttackIntel = attacks if attacks is not None else AttackIntel()
         self.census_reason = census_reason
         self.census_transitions = int(census_transitions)
         if has_census is None:
@@ -674,7 +941,18 @@ class SpeciesIntel:
                    main_states=d.get("main_states"),
                    unattributed_effects=d.get("unattributed_effects"),
                    overlay=d.get("overlay"),
-                   parts=PartIntel.from_dict(d.get("parts")))
+                   parts=PartIntel.from_dict(d.get("parts")),
+                   attacks=AttackIntel.from_dict(d.get("attacks")))
+
+    def pairs_hitting_with(self, set_index: int,
+                           entity_species: Optional[int] = None) -> List[PairIntel]:
+        """Every pair whose handler spawns an attack that hits with volume set
+        ``set_index`` — the reverse join a hitbox editor lists a set by."""
+        at = self.attacks
+        if not at.present:
+            return []
+        return [p for p in self if p.attack_ids
+                and set_index in at.sets_for(p.attack_ids, entity_species)]
 
     @classmethod
     def from_path(cls, path: os.PathLike | str) -> "SpeciesIntel":

@@ -90,7 +90,10 @@ import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import hitzone as hz
+try:
+    from . import hitzone as hz
+except ImportError:                      # run as a script: python tools/mhfu_model/hitbox.py
+    import hitzone as hz                 # type: ignore
 
 Image = hz.Image
 Sphere = hz.Sphere
@@ -114,6 +117,40 @@ ATTACK_STRIDE = 0x18
 
 #: bone ids that are markers rather than joints — `0x09C42650` branches on each.
 MARKER_BONES = hz.MARKER_BONES
+
+#: bones that are a COORDINATE SPACE rather than a joint, and what each means for a
+#: picture: 125 is a joiner the walker hands to `0x09C386A0` (no geometry of its
+#: own), 126 is a capsule between the NODE's own two points, 127 a sphere at the
+#: node's own position — i.e. at the attacker (or the bone the initialiser seeded
+#: `node+0x40` from). An editor draws 126/127 at the actor's origin and 125 nowhere.
+BONE_JOINER = 0x7D
+BONE_NODE_CAPSULE = 0x7E
+BONE_NODE_SPHERE = 0x7F
+
+#: the id offset each overlay's initialiser adds to the handler's literal, keyed
+#: `{overlay_species: {entity_species: offset}}`. em75's `0x09D4B318` reads the
+#: entity's species byte and adds +33 for 76 and +70 for 88 — ONE 107-record table
+#: sliced three ways (read off the disassembly, 2026-09-11). No other overlay has
+#: been read for this; `id_offset` returns 0 for an overlay's own species and None
+#: where nothing is known, never a guess.
+ID_OFFSETS: Dict[int, Dict[int, int]] = {75: {75: 0, 76: 33, 88: 70}}
+
+
+def id_offset(overlay_species: int, entity_species: int) -> Optional[int]:
+    """`record index = handler literal + this`. 0 for the overlay's own species."""
+    if entity_species == overlay_species:
+        return 0
+    return ID_OFFSETS.get(overlay_species, {}).get(entity_species)
+
+
+def is_rigged(spheres: Sequence[Sphere]) -> bool:
+    """Does any record of this set sit on a real joint (bone < 125)?
+
+    em75's four extra tables are all one capsule on bone 126 — un-rigged, i.e.
+    projectile-shaped. A set like that has no joint to draw on and nothing a port's
+    rig could re-align, which is what a hitbox editor has to know before listing it.
+    """
+    return any(s.bone not in MARKER_BONES for s in spheres)
 
 FIELD_PROVENANCE: Dict[str, str] = {
     "power": "measured — edited live, the HP delta followed it",
@@ -339,6 +376,20 @@ class SpeciesTables:
             return None
         i = self.attacks[attack_id].volume
         return self.volumes[i] if 0 <= i < len(self.volumes) else None
+
+
+def primary_table(tables: Sequence["SpeciesTables"]) -> Optional["SpeciesTables"]:
+    """The MOVESET table of an overlay: the one with the most attack records.
+
+    em75 has five tables and the first holds 107 records to the others' 1/5/1/4;
+    em54's extras are full movesets too, so "the first" would be wrong there and
+    "the biggest" is the honest rule. The handlers' literals index THIS one (the
+    species initialiser passes its handle); the extras belong to whatever the
+    overlay spawns beside itself.
+    """
+    if not tables:
+        return None
+    return max(tables, key=lambda t: (len(t.attacks), -t.records_va))
 
 
 def _plausible_attack(buf: bytes, off: int, n_volumes: int) -> bool:

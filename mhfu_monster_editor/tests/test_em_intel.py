@@ -313,6 +313,49 @@ def test_all_seventeen_overlays_build():
             assert doc["overlay"]["region"] == "MHFU EU (ULES01213)"
 
 
+
+def test_em75_attack_sites_are_credited_or_counted_apart_and_the_charge_resolves():
+    """Same discipline as the effects: every literal attack-spawn site is either
+    reached from a pair handler or counted as uncredited; none is invented. And the
+    one pair walked live, (1,4), names attack 6 — set 2, the set the RAM poke moved."""
+    if not _have_data():
+        return
+    doc = G.build(G.Path(EM75), None, "test", game_task=None)
+    at = doc["attacks"]
+    assert at["present"] and at["spawner"] == "0x09B661E8" and at["join"] == "measured"
+    credited = sum(p.get("attack_sites", 0) for p in doc["pairs"])
+    assert at["attack_sites"] == 84, at["attack_sites"]
+    assert credited > 0 and at["attack_sites_uncredited"] < 84
+    p14 = next(p for p in doc["pairs"] if (p["main"], p["sub"]) == (1, 4))
+    assert p14["attack_ids"] == [6, 31], p14["attack_ids"]
+    prim = next(t for t in at["tables"] if t["primary"])
+    assert prim["n_records"] == 107 and prim["n_sets"] == 56
+    assert prim["attacks"][6]["power"] == 64 and prim["attacks"][6]["volume"] == 2
+    assert prim["sets"][2]["count"] == 10
+    assert at["id_offsets"] == {"75": 0, "76": 33, "88": 70}
+    # the reader agrees with the writer
+    si = I.SpeciesIntel.from_dict(doc)
+    assert si.attacks.sets_for(si.pair(1, 4).attack_ids) == [2]
+
+
+def test_every_overlay_states_its_attack_join_provenance():
+    """em1 and em33 have no table and say so; the rest name a spawner and whether
+    the id range fits the table read — a stated inconsistency, never a silent one."""
+    if not _have_data():
+        return
+    paths = fx.em_overlays()
+    seen = {}
+    for p in paths:
+        doc = G.build(p, None, "test", game_task=None)
+        at = doc["attacks"]
+        seen[doc["host_species"]] = at.get("join") if at["present"] else "absent"
+    assert seen[1] == "absent" and seen[33] == "absent", seen
+    assert seen[75] == "measured"
+    for sp in (7, 14, 17, 21, 40, 58, 83):
+        assert seen[sp] == "consistent", (sp, seen[sp])
+    for sp in (2, 15, 20, 55, 59, 82):
+        assert seen[sp] == "ids_exceed_table", (sp, seen[sp])
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     if not _have_data():

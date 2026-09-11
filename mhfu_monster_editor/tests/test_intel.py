@@ -433,6 +433,134 @@ def test_every_part_maps_to_bones_on_the_rig():
         assert si.parts.bones_of_part(part), "part %d has no bones" % part
 
 
+
+# --------------------------------------------------------------------------- #
+# the attack side (#33) — the reader, and the em75 anchors that were measured
+# --------------------------------------------------------------------------- #
+_ATTACKS = {
+    "present": True, "spawner": "0x09B661E8", "join": "measured",
+    "id_offsets": {"75": 0, "76": 33, "88": 70},
+    "field_provenance": {"power": "measured", "kind": "shape only"},
+    "tables": [
+        {"handle": "0x09D61250", "records": "0x09D60848", "volume_table": "0x09D60768",
+         "primary": True, "rigged": True,
+         "sets": [
+             {"index": 0, "va": "0x1000", "count": 1, "rigged": True,
+              "spheres": [{"bone": 35, "radius": 180.0, "a": [0, 0, 0]}]},
+             {"index": 1, "va": "0x1030", "count": 2, "rigged": False,
+              "spheres": [{"bone": 126, "shape": "capsule", "radius": 150.0,
+                           "a": [0, 0, 0], "b": [0, 0, 1]}]},
+             {"index": 2, "va": "0x1090", "count": 3,
+              "spheres": [{"bone": 10, "radius": 150.0}, {"bone": 125, "shape": "capsule",
+                                                          "radius": 0.0, "row_part": [1, 0]},
+                          {"bone": 43, "radius": 120.0}]}],
+         "attacks": [
+             {"id": 0, "va": "0x2000", "power": 0, "element": "0x00", "volume": 0,
+              "raw": "00" * 24},
+             {"id": 1, "va": "0x2018", "power": 30, "element": "0x21", "volume": 0,
+              "raw": "001e" + "00" * 22},
+             {"id": 6, "va": "0x2090", "power": 64, "element": "0x21", "volume": 2,
+              "kind": 2, "tag": "0x28", "value_14": 25, "raw": "0063" + "00" * 22},
+             {"id": 31, "va": "0x2300", "power": 30, "element": "0x01", "volume": 2,
+              "raw": "001e" + "00" * 22}]},
+        {"handle": "0x3000", "records": "0x3010", "volume_table": "0x3008",
+         "primary": False, "rigged": False, "sets": [], "attacks": []}],
+}
+
+
+def test_attack_intel_reads_the_join_and_keeps_record_zero_out():
+    at = I.AttackIntel.from_dict(_ATTACKS)
+    assert at.present and at.spawner == 0x09B661E8 and at.join == "measured"
+    assert at.primary is at.tables[0] and len(at.tables) == 2
+    assert [a.id for a in at.attacks] == [1, 6, 31], "record 0 is blank, not an attack"
+    a6 = at.attack(6)
+    assert a6.power == 64 and a6.element == 0x21 and a6.volume == 2 and a6.value_14 == 25
+    assert at.attack(0).is_blank and at.attack(99) is None
+
+
+def test_attack_sets_resolve_and_the_marker_bones_are_a_coordinate_space():
+    at = I.AttackIntel.from_dict(_ATTACKS)
+    s2 = at.set(2)
+    assert s2.capacity == 3 and s2.bones == [10, 43], "125 is a joiner, not a joint"
+    assert s2.rigged, "a set with real joints is rigged even with a marker in it"
+    assert not at.set(1).rigged, "one capsule on bone 126 hangs on the node, not a rig"
+    assert at.set(1).spheres[0].is_capsule
+    assert at.capacity(2) == 3 and at.capacity(7) is None
+    # row_part is carried for the round trip; a HitSphere reads it as nothing special
+    assert s2.spheres[1].bone == I.ATTACK_BONE_JOINER
+
+
+def test_the_move_to_set_join_goes_through_the_records():
+    at = I.AttackIntel.from_dict(_ATTACKS)
+    assert at.sets_for([6, 31]) == [2]
+    assert [a.id for a in at.records_for([6, 31])] == [6, 31]
+    assert [a.id for a in at.attacks_using(2)] == [6, 31]
+    assert at.attacks_using(0) and at.attacks_using(0)[0].id == 1
+    assert at.sets_for([0]) == [], "a blank record hits with nothing"
+
+
+def test_a_species_the_overlay_was_not_read_for_gets_no_offset_not_zero():
+    at = I.AttackIntel.from_dict(_ATTACKS)
+    assert at.id_offset(75) == 0 and at.id_offset(76) == 33 and at.id_offset(88) == 70
+    assert at.id_offset(81) is None
+    assert at.records_for([6], entity_species=81) == [], "no offset -> no records"
+    # species 76 slices the same table +33: literal 1 -> record 34 (absent here)
+    assert at.records_for([1], entity_species=76) == []
+    assert at.records_for([1], entity_species=75)[0].id == 1
+
+
+def test_an_absent_attacks_block_is_present_false_with_the_reason():
+    at = I.AttackIntel.from_dict(None)
+    assert not at.present and at.reason and at.primary is None
+    assert at.sets == [] and at.attacks == [] and at.capacity(0) is None
+    at2 = I.AttackIntel.from_dict({"present": False, "reason": "never calls the setter",
+                                   "spawner": None})
+    assert at2.reason == "never calls the setter"
+
+
+def test_pair_intel_carries_the_handler_literals():
+    p = I.PairIntel.from_dict({"main": 1, "sub": 4, "handler": "0x09D28738",
+                               "attack_ids": [6, 31], "attack_sites": 7,
+                               "attack_sites_computed": 0, "measured": None})
+    assert p.attack_ids == [6, 31] and p.attack_sites == 7
+    q = I.PairIntel.from_dict({"main": 0, "sub": 1, "measured": None})
+    assert q.attack_ids == [] and q.attack_sites == 0
+
+
+def test_species_intel_reverse_joins_pairs_to_a_set():
+    si = I.SpeciesIntel.from_dict({
+        "host_species": 75, "main_states": [], "attacks": _ATTACKS,
+        "pairs": [{"main": 1, "sub": 4, "handler": "0x1", "attack_ids": [6, 31],
+                   "measured": None},
+                  {"main": 3, "sub": 9, "handler": "0x2", "attack_ids": [1],
+                   "measured": None},
+                  {"main": 0, "sub": 0, "handler": "0x3", "measured": None}]})
+    assert [(p.main, p.sub) for p in si.pairs_hitting_with(2)] == [(1, 4)]
+    assert [(p.main, p.sub) for p in si.pairs_hitting_with(0)] == [(3, 9)]
+    assert si.pairs_hitting_with(1) == []
+
+
+def test_em75_the_charge_pair_hits_with_set_two_as_measured_live():
+    """(1,4) is the Tigrex charge measured at -72 HP; the live replacement of
+    set 2 moved the hit 645 -> 152 -> 1381 units. The static join has to land
+    on exactly that set or the whole editor would be pointing at the wrong table."""
+    si = I.find_intel(75)
+    if si is None or not si.attacks.present:
+        return
+    at = si.attacks
+    assert at.join == "measured" and at.spawner == 0x09B661E8
+    p = si.pair(1, 4)
+    assert p is not None and 6 in p.attack_ids, p.attack_ids
+    assert at.sets_for(p.attack_ids) == [2]
+    assert at.attack(6).power == 64 and at.attack(6).volume == 2
+    s2 = at.set(2)
+    assert s2.capacity == 10 and s2.bones == [2, 4, 10, 18, 34, 41, 42, 43]
+    assert at.id_offsets == {75: 0, 76: 33, 88: 70}
+    # the four extras are the un-rigged projectile tables
+    assert sum(1 for t in at.tables if not t.primary) == 4
+    assert all(not t.rigged for t in at.tables if not t.primary and t.sets
+               and len(t.attacks) > 1)
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0
