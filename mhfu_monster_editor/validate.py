@@ -462,6 +462,15 @@ def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
                                 for exactly this. `after =` / `hold_max =` clears it.
     ``MOVE_AFTER_ENGINE``       informational: what the engine itself hands to, when
                                 the declared `after` differs from it.
+    ``MOVE_BUDGET_ROOT_MOTION`` static: the pair's own end is its run budget, and that
+                                budget is drained by the playing CLIP's root motion
+                                (`0x09AD9A10` -> `0x09ACD460` -> `0x08863B70` on clip
+                                block 0). Painted with a ported clip whose root does not
+                                travel, the pair never ends even when the engine
+                                provisioned it (take 3, 2026-09-12: every uncut charge
+                                ran into hold_max; the host brain's own stood 40 s).
+                                Cleared by a `[[rule]]` from this move with only
+                                `min_frames` — the budget by time.
     """
     out: List[Issue] = []
     if not m.moves:
@@ -579,6 +588,22 @@ def _check_intel(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]:
                                      % (mv.main, mv.sub,
                                         " Its other exit(s) — %s — are situational."
                                         % ", ".join(other) if other else "")))
+            if nxt and mv.clip is not None and any(_needs_budget(e) for e in nxt) \
+                    and not any(_reliable(e) for e in nxt):
+                timed = [r for r in getattr(m, "rules", [])
+                         if r.from_move == mv.name and r.min_frames > 0
+                         and not r.receding and not r.closing
+                         and r.dist == (0.0, 1.0e9)]
+                if not timed:
+                    out.append(Issue(WARNING, "MOVE_BUDGET_ROOT_MOTION", w,
+                                     "(%d,%d)'s run budget (+0x76C) is spent by the "
+                                     "playing CLIP's root motion, and clip %r is the "
+                                     "port's: if its root does not travel the pair never "
+                                     "ends, provisioned or not (measured: the host's own "
+                                     "charges stood 40 s with the hitbox spent). Declare "
+                                     "a [[rule]] from this move with only `min_frames` — "
+                                     "the budget by time — or give the clip root motion."
+                                     % (mv.main, mv.sub, mv.clip)))
             if nxt and getattr(mv, "after", None) is not None:
                 t = m.moves.get(mv.after)
                 engine = sorted({tt for e in nxt for tt in e.to})

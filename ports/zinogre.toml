@@ -217,7 +217,9 @@ latch = 1                    # (1,4) names a single a1, so one dispatch covers t
 # stood `hold_max` ticks (2 Hz). lunge_stop is (0,3), the engine's own skid, so the
 # declared chain IS the native one: (1,4) -> (0,3) -> (0,1)/(0,2).
 after = "lunge_stop"
-hold_max = 8
+# 12 ticks (6 s), PAST the ~4 s a provisioned charge takes to spend its run budget: this
+# is the safety net under the engine's own end, and at 8 it pre-empted that end (take 3).
+hold_max = 12
 # 🟢 With the native seam live (em_vhook v3, issues #15/#16) the runtime enters this
 # pair through the engine's OWN enter-action, so it IS provisioned and ends itself —
 # `after`/`hold_max` become the fallback. `claim` puts the port on the host's clock:
@@ -273,6 +275,20 @@ receding = true
 play = "lunge_stop"
 cooldown = 30
 label = "just past you -> skid"
+
+# THE RUN BUDGET BY TIME. (1,4)'s own end is its run budget (+0x76C), and that budget
+# is drained by the playing CLIP's root motion (0x09AD9A10 -> 0x09ACD460 ->
+# 0x08863B70 on clip block 0): the Tigrex charge clip spends 1000 units in ~2 s, the
+# port's lunge_forward — travel on the hip, root still — spends ~0, so a provisioned
+# charge with this clip on it never ends by itself (take 3: every uncut charge ran
+# into hold_max; the host brain's own charges stood 40 s). This rule is the budget the
+# clip cannot drain; validate says MOVE_BUDGET_ROOT_MOTION on a move without one.
+[[rule]]
+from = "lunge"
+min_frames = 75
+play = "lunge_stop"
+cooldown = 30
+label = "run budget by time"
 
 [[hurtbox]]
 bone = 35

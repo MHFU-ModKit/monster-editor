@@ -140,6 +140,40 @@ def test_intel_for_the_wrong_host_species_is_refused():
     assert "MOVE_PAIR_UNOBSERVED" not in _codes(iss), "it must stop, not guess"
 
 
+def test_a_budget_ended_pair_with_a_port_clip_wants_a_time_rule():
+    """(1,4)'s only non-situational exit waits on the run budget, and the budget is
+    drained by the CLIP's root motion. With the port's clip painted on it and no
+    `[[rule]]` from the move carrying only `min_frames`, the pair never ends even
+    when the engine provisioned it (take 3, 2026-09-12). The rule clears it; a
+    rule with a distance window or receding/closing does not — that one is
+    situational too."""
+    from mhfu_monster_editor import intel as I
+    doc = {"host_species": 75, "main_states": [],
+           "chain": {"hubs": [[0, 1]], "enter_action": "0x09D3D608"},
+           "pairs": [
+               {"main": 1, "sub": 4, "handler": "0x1", "measured": None,
+                "next": [{"site": "0x10", "kind": "enter", "main": 0, "id": 3, "mode": 0,
+                          "via": [], "to": [[0, 3]],
+                          "guards": ["phase==3", "!collided", "budget spent"]},
+                         {"site": "0x11", "kind": "enter", "main": 0, "id": 6, "mode": 1,
+                          "via": [], "to": [[0, 6]], "guards": ["phase==3", "collided"]}],
+                "prev": [], "provenance": {"next": "static"}},
+               {"main": 0, "sub": 3, "handler": "0x2", "measured": None, "next": [],
+                "prev": [[1, 4]]}]}
+    si = I.SpeciesIntel.from_dict(doc)
+    moves = ('\n[clips.c]\nslot = 61\n[clips.s]\nslot = 3\n'
+             '[moves.lunge]\nmain = 1\nsub = 4\nclip = "c"\nafter = "stop"\n'
+             '[moves.stop]\nmain = 0\nsub = 3\nclip = "s"\n')
+    iss = _issues(BASE + moves, intel=si)
+    assert "MOVE_BUDGET_ROOT_MOTION" in _codes(iss), iss
+    timed = moves + '[[rule]]\nfrom = "lunge"\nmin_frames = 75\nplay = "stop"\n'
+    assert "MOVE_BUDGET_ROOT_MOTION" not in _codes(_issues(BASE + timed, intel=si))
+    windowed = moves + ('[[rule]]\nfrom = "lunge"\nmin_frames = 15\nreceding = true\n'
+                        'dist = [250, 1000]\nplay = "stop"\n')
+    assert "MOVE_BUDGET_ROOT_MOTION" in _codes(_issues(BASE + windowed, intel=si)), \
+        "a situational rule is not a budget"
+
+
 # --------------------------------------------------------------------------- #
 # trap 3 — a hurtbox bone out of range for the shipped skeleton
 # --------------------------------------------------------------------------- #
