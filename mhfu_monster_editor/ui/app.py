@@ -2418,13 +2418,19 @@ def _export_buttons(imgui, app, m) -> None:
             try:
                 path = app._hit_export or _export()
                 app._hit_export = path
-                dst = RT.deploy(path)
-                app.status = ("deployed %s -> %s. Cold boot; a running game "
-                              "hot-reloads it" % (path.name, dst))
+                dep = RT.deploy(path)
+                app.status = ("deployed %s -> %s. A running game hot-reloads it; "
+                              "a cold one loads it at boot"
+                              % (dep.describe() if dep else path.name,
+                                 RT.MEMSTICK_MODS) if dep else
+                              "no memstick mods dir at %s" % RT.MEMSTICK_MODS)
             except Exception as e:                              # noqa: BLE001
                 app.status = "%s: %s" % (type(e).__name__, e)
         if imgui.is_item_hovered():
-            imgui.set_tooltip(plain("copy the module to %s" % RT.MEMSTICK_MODS))
+            imgui.set_tooltip(plain("copy the module to %s — and mhfu_port.lua with it "
+                                    "if the memstick's is behind: a stale library "
+                                    "silently ignores fields it does not know"
+                                    % RT.MEMSTICK_MODS))
     staged = (app.part_session is not None and app.part_session.pending) or (
         app._attacks is not None and app._attacks.pending)
     if staged:
@@ -2915,9 +2921,10 @@ def _attack_actions(imgui, app, host, m) -> None:
     imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.95, 0.75, 0.35, 1.0))
     imgui.text_wrapped(plain("🔴 the sets are SPECIES data in the overlay: with the port "
                              "REPLACING its host they are his alone; beside a native "
-                             "em%02d they re-arm the native too. The in-place write was "
-                             "proven by RAM poke; the generated P.hit() path has not "
-                             "been cold-booted yet." % (app.host_species or 0)))
+                             "em%02d they re-arm the native too. Proven live 2026-09-11: the "
+                             "in-place write by RAM poke, the P.hit() path in a running "
+                             "quest. ⚠ deploy syncs mhfu_port.lua too — a stale library "
+                             "silently drops these tables." % (app.host_species or 0)))
     imgui.pop_style_color()
 
     _export_buttons(imgui, app, m)

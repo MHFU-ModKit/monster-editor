@@ -33,9 +33,17 @@ def _authored(tmp):
     """A copy of the Zinogre manifest with two volumes and one maxed grid state."""
     path = os.path.join(tmp, "z.toml")
     shutil.copyfile(ZINOGRE, path)
+    # the shipped manifest carries the user's own tables on BOTH sides (it does
+    # since 2026-09-11); the fixture is the hurtbox side alone — exactly two
+    # volumes and one state, no attack side, so `export` needs no attack tables
+    from mhfu_monster_editor import attacks as _A
+    a = _A.AttackSession(MF.load(path), n_bones=46)
+    for st in list(a.sets()):
+        a.drop_set(st)
+    for rec in list(a.attacks()):
+        a.clear_attack(rec.id)
+    a.save()
     s = P.PartSession(MF.load(path), n_bones=46)
-    # the shipped manifest may carry the user's own tables (it does since
-    # 2026-09-11); the fixture starts from exactly two volumes and one state
     while s.volumes():
         s.remove_volume(0)
     s.add_volume(MF.Hurtbox(bone=2, radius=600.0, part=1, hitzone_row=0,
@@ -137,8 +145,15 @@ def test_export_accepts_a_manifest_loaded_by_a_relative_path():
     try:
         rel = MF.load(os.path.join("ports", "zinogre.toml"))
         assert not os.path.isabs(str(rel.path))
+        # the shipped manifest authors an attack side since 2026-09-11, which the
+        # export refuses to place without the host's table addresses
+        atk = RT.host_attack_tables(rel)
+        if (rel.hitboxes or rel.attacks) and atk is None:
+            print("SKIP: no species/em75.json attacks block")
+            return
         with tempfile.TemporaryDirectory() as d:
-            path = RT.export(rel, out=os.path.join(d, "z_hit.lua"), embed=False)
+            path = RT.export(rel, out=os.path.join(d, "z_hit.lua"), embed=False,
+                             attacks=atk)
             text = open(path, encoding="utf-8").read()
     finally:
         os.chdir(cwd)
@@ -153,9 +168,38 @@ def test_deploy_copies_beside_the_other_mods_or_says_there_is_no_memstick():
         mods = os.path.join(d, "mods")
         assert RT.deploy(src, mods_dir=RT.Path(mods)) is None
         os.mkdir(mods)
-        dst = RT.deploy(src, mods_dir=RT.Path(mods))
-        assert dst is not None and os.path.exists(dst)
-        assert open(dst, "rb").read() == open(src, "rb").read()
+        dep = RT.deploy(src, mods_dir=RT.Path(mods))
+        assert dep is not None and os.path.exists(dep.module)
+        assert open(dep.module, "rb").read() == open(src, "rb").read()
+        # no library beside a module exported into a temp dir: the repo's own is
+        # the fallback, and an empty mods dir is behind it by definition
+        assert dep.library is not None and "stale" in dep.describe()
+        assert RT.deploy(src, mods_dir=RT.Path(mods)).library is None, \
+            "identical copies are not re-copied"
+
+
+def test_deploy_brings_the_library_along_when_the_memsticks_is_behind():
+    """The failure that hid the hitbox editor's first run: the module on the
+    memstick carried `attack_sets`, the memstick's mhfu_port.lua was the version
+    from before #33 and dropped them, and the log still said HIT TABLES APPLIED."""
+    lib = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts",
+                       "mhfu_port.lua")
+    with tempfile.TemporaryDirectory() as d:
+        m = _authored(d)
+        src = RT.export(m, out=os.path.join(d, "zinogre_hit.lua"), root=_ROOT, embed=False)
+        mods = os.path.join(d, "mods")
+        os.mkdir(mods)
+        stale = os.path.join(mods, "mhfu_port.lua")
+        open(stale, "w").write("-- the version from before\n")
+        dep = RT.deploy(src, mods_dir=RT.Path(mods), library=RT.Path(lib))
+        assert dep.library is not None and "stale" in dep.describe()
+        assert open(stale, "rb").read() == open(lib, "rb").read()
+        again = RT.deploy(src, mods_dir=RT.Path(mods), library=RT.Path(lib))
+        assert again.library is None, "identical copies are not re-copied"
+        # the default: the library beside a module that lives in the scripts dir
+        assert RT.sync_library(RT.Path(mods), source=RT.Path(lib)) is None
+        os.remove(stale)
+        assert RT.sync_library(RT.Path(mods), source=RT.Path(lib)) is not None
 
 
 

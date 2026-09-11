@@ -267,8 +267,8 @@ def _check_attacks(m: PortManifest, intel: Optional[ActionIntel]) -> List[Issue]
                      "the port REPLACING the host they are his alone; beside a native "
                      "em%02d they re-arm the native too. Shipped by "
                      "mhfu_monster_editor.runtime -> P.hit() in place through the "
-                     "overlay's set-pointer table (set replacement proven by RAM poke "
-                     "2026-09-11; the generated path is not cold-boot validated yet)."
+                     "overlay's set-pointer table (set replacement proven by RAM poke and the "
+                     "generated path validated live in a running quest, both 2026-09-11)."
                      % m.host_species))
     return out
 

@@ -27,8 +27,8 @@ Where they land, and why it is in place (2026-09-11):
   `species/emNN.json`; the runtime measures each set's live count on first contact
   and REFUSES a set whose count is not the exported `cap` — the table is then not
   what the export assumed, and nothing is written. The set replacement was proven
-  by RAM poke on a native Tigrex (645 -> 152 -> 1381 units); this generated path
-  has not been cold-booted yet.
+  by RAM poke on a native Tigrex (645 -> 152 -> 1381 units), and this generated
+  path was validated LIVE 2026-09-11: applied by hot reload into a running quest (the same apply path a boot takes), `HIT TABLES APPLIED … 1 attack set(s)/10 volume(s)`, the Zinogre's lunge connected through the authored r=600 sphere and the power lever took the hit from carting to single digits.
 
 The file is REGENERATED, never edited: it carries the manifest path and a content
 hash so a stale copy on the memstick is recognisable in `framework.log`.
@@ -59,6 +59,12 @@ MEMSTICK_MODS = Path.home() / ".config" / "ppsspp" / "PSP" / "PLUGINS" / "mhfu_f
 #: `tools/embed_lua.py` keeps the committed `.lua.h` in step so the Docker build
 #: (no python) never has to regenerate it
 EMBED_TOOL = Path("tools") / "embed_lua.py"
+#: the library the generated module calls into. 🔴 A stale copy on the memstick
+#: silently IGNORES fields it does not know: on 2026-09-11 a deployed module
+#: carried `attack_sets`, the memstick's pre-#33 mhfu_port.lua dropped them, and
+#: `HIT TABLES APPLIED` was still logged for the two tables it did know — which
+#: read as "the hitbox editor does nothing". `deploy` keeps the library in step.
+LIBRARY = "mhfu_port.lua"
 
 SHAPE_ID = {"sphere": 0, "capsule": 1}
 
@@ -302,14 +308,50 @@ def export(m: PortManifest, *, out: Optional[Path] = None, root: Optional[Path] 
     return path
 
 
-def deploy(path: Path, mods_dir: Path = MEMSTICK_MODS) -> Optional[Path]:
-    """Copy a generated module onto the memstick. None if there is no memstick
-    here. A running game hot-reloads it; a cold one picks it up at boot."""
+@dataclass
+class Deployment:
+    """What `deploy` put on the memstick: the module, and the library if it was
+    behind (None = already in step, or no repo copy to sync from)."""
+    module: Path
+    library: Optional[Path] = None
+
+    def describe(self) -> str:
+        return "%s%s" % (self.module.name,
+                         "" if self.library is None
+                         else " + %s (the memstick's was stale)" % self.library.name)
+
+
+def sync_library(mods_dir: Path = MEMSTICK_MODS, *,
+                 source: Optional[Path] = None) -> Optional[Path]:
+    """Copy the repo's `mhfu_port.lua` onto the memstick when the two differ.
+    Returns the destination when it copied; None when identical, or when there is
+    no memstick or no source to copy from."""
+    src = Path(source) if source is not None else Path.cwd() / SCRIPTS_DIR / LIBRARY
+    if not mods_dir.is_dir() or not src.is_file():
+        return None
+    dst = mods_dir / LIBRARY
+    if dst.is_file() and dst.read_bytes() == src.read_bytes():
+        return None
+    shutil.copyfile(src, dst)
+    return dst
+
+
+def deploy(path: Path, mods_dir: Path = MEMSTICK_MODS, *,
+           library: Optional[Path] = None) -> Optional[Deployment]:
+    """Copy a generated module onto the memstick — AND the library it calls into,
+    if the memstick's is behind. None if there is no memstick here. A running game
+    hot-reloads both; a cold one picks them up at boot.
+
+    ``library`` is the repo's `mhfu_port.lua`; by default the one beside ``path``
+    when it was exported into the repo's scripts dir, else the cwd's."""
     if not mods_dir.is_dir():
         return None
-    dst = mods_dir / Path(path).name
+    path = Path(path)
+    dst = mods_dir / path.name
     shutil.copyfile(path, dst)
-    return dst
+    src = library if library is not None else (
+        path.parent / LIBRARY if (path.parent / LIBRARY).is_file() else None)
+    return Deployment(module=dst, library=sync_library(mods_dir, source=src))
 
 
 def _under(p: Path, root: Path) -> bool:
@@ -386,8 +428,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("⚠️ set %d: %d volume(s) but the host's holds %d — the runtime "
                       "will truncate" % (st, len(vols), c))
     if a.deploy:
-        dst = deploy(path)
-        print("deployed -> %s" % dst if dst else
+        dep = deploy(path)
+        print("deployed -> %s" % dep.describe() if dep else
               "no memstick mods dir at %s — not deployed" % MEMSTICK_MODS)
     return 0
 
