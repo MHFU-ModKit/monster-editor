@@ -25,7 +25,7 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
 TIGREX = _ROOT / "workspace" / "extracted" / "data_files" / "file_06185.bin"
-FRAMES = 10
+FRAMES = 16
 
 
 def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None,
@@ -148,11 +148,55 @@ def run_smoke(pac: Path, frames: int = FRAMES, out: Path = None,
                 app.select_volume(0)
                 app._only_selected_part = True
                 app.sync_hitboxes()
+        # the Hitboxes panel (#33): the attack sets on the rig, the levers, the
+        # port branch with a staged session. It is the third tab of the right dock,
+        # so it has to be brought to the front or its gui never runs.
+        elif f == 9:
+            # hello_imgui's own way to front a docked tab, not imgui.set_window_focus
+            # from inside another window's frame
+            dp = hello_imgui.get_runner_params().docking_params
+            w = dp.dockable_window_of_name("Hitboxes")
+            if w is not None:
+                w.focus_window_at_next_frame = True
+            app.show_attacks = True
+            app.sync_attacks()
+        elif f == 10:
+            # the lunge — (1,4), the Tigrex charge — so the pair-filtered branches run
+            if app.intel is not None and app.intel.pair(1, 4) is not None:
+                app.select_pair(1, 4)
+            app.sync_attacks()
+        elif f == 11:
+            app.select_set(2)
+        elif f == 12:
+            sess = app.attack_session
+            host = app.host_attacks()
+            if sess is not None and host is not None and host.set(2) is not None:
+                sess.adopt_set(2, host.set(2).spheres, source="smoke")
+                app.attacks_source = "port"
+                app.sync_attacks()
+        elif f == 13:
+            sess = app.attack_session
+            if sess is not None and sess.volumes():
+                app.select_attack_volume(0)
+                sess.edit_volume(0, shape="capsule", to=[0.0, 0.0, 100.0])
+                sess.scale_volume(0, 2.0)
+                sess.set_attack(6, power=40)
+                app.sync_attacks()
+        elif f == 14:
+            sess = app.attack_session
+            if sess is not None and sess.volumes():
+                sess.keep_only(0)
+                app.select_attack_volume(0)
+                app.sync_attacks()
 
     _counted = counted
+    # ⚠️ guarded like the panels: an exception in a driver step would otherwise be
+    # swallowed by the C++ runner, the frame counter would stop advancing, and the
+    # window would sit open forever — which reads as a hang, not as the bug it is.
+    _exercise = guard("exercise", exercise)
 
     def counted():                                            # noqa: F811
-        exercise()
+        _exercise()
         _counted()
 
     app._viewport_panel = counted

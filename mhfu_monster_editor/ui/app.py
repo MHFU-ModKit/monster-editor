@@ -117,6 +117,18 @@ class EditorApp:
         self._grid_state = 0
         #: the last runtime module the Parts panel exported, for the deploy button
         self._hit_export = None
+        #: the attack system (#33): the sets a move hits with, on the port's rig
+        self.show_attacks = False
+        #: "host" = the host overlay's own sets, "port" = this manifest's [[hitbox]]
+        self.attacks_source = "host"
+        self.selected_set: Optional[int] = None
+        #: ONE attack volume singled out — an index into `AttackSession.volumes()`
+        self.selected_attack_volume: Optional[int] = None
+        #: list only the sets the selected pair/move hits with, or every set
+        self._sets_of_move_only = True
+        self._attacks = None
+        self._attack_orphans = ()
+        self._attack_label_buf = ""
         #: `clips.Coverage` + `LabelTrack`s + the build id, computed once. → #8
         self._vocab = None
         #: `clips.LabelSession` — manifest edits typed here, not yet on disk
@@ -438,6 +450,157 @@ class EditorApp:
         if vp is not None and vp.hitboxes is not None:
             vp.hitboxes.set_selected_volume(index if self.parts_source == "port"
                                             else None)
+
+    # ---- the attack system (issue #33) -------------------------------- #
+    @property
+    def attack_session(self):
+        """Staged [[hitbox]] / [[attack]] edits — `attacks.AttackSession`, testable
+        without a window like the other two sessions."""
+        if self._attacks is None and self.scene.manifest is not None:
+            from ..attacks import AttackSession
+            self._attacks = AttackSession(self.scene.manifest, self.scene.rig.n_bones)
+            host = self.host_attacks()
+            if host is not None:
+                self._attacks.capacities = {st.index: st.capacity for st in host.sets}
+        return self._attacks
+
+    def host_attacks(self):
+        """The HOST species' attack intel, or None. The host and not
+        `browsing_species`, for the reason `host_parts` gives: these are the sets the
+        port will actually hit with."""
+        sp = self.host_species
+        if sp is None:
+            return None
+        from ..intel import find_intel
+        if sp not in self._intel_cache:
+            self._intel_cache[sp] = find_intel(sp)
+        si = self._intel_cache[sp]
+        at = getattr(si, "attacks", None)
+        return at if (at is not None and at.present) else None
+
+    def host_intel(self):
+        """The HOST's `SpeciesIntel` — not the overlay the Action panel may be
+        browsing. A pair from another overlay has no attack ids in this table."""
+        sp = self.host_species
+        if sp is None:
+            return None
+        from ..intel import find_intel
+        if sp not in self._intel_cache:
+            self._intel_cache[sp] = find_intel(sp)
+        return self._intel_cache[sp]
+
+    def host_pair(self):
+        """The selected pair's intel, when it is the host's; None while browsing."""
+        if self._pair is None or not self.browsing_the_host:
+            return None
+        si = self.host_intel()
+        return None if si is None else si.pair(*self._pair)
+
+    def pair_sets(self) -> list:
+        """The volume sets the selected pair's handler hits with (empty = none
+        known, no pair selected, or the pair is another overlay's)."""
+        host = self.host_attacks()
+        p = self.host_pair()
+        if host is None or p is None or not p.attack_ids:
+            return []
+        return host.sets_for(p.attack_ids, self.host_species)
+
+    def sync_attacks(self) -> None:
+        """Push the chosen source's attack volumes into the viewport, filtered to
+        the selected set (or the selected move's sets) so 56 sets are not a fog."""
+        vp = self.viewport
+        if vp is None or vp.scene is None:
+            return
+        if not self.show_attacks:
+            vp.clear_attacks()
+            self._attack_orphans = ()
+            return
+        host = self.host_attacks()
+        from ..render.hitboxes import attack_volumes_from
+        if self.attacks_source == "port":
+            sess = self.attack_session
+            vols = sess.volumes() if sess is not None else list(
+                getattr(self.scene.manifest, "hitboxes", []) or [])
+        else:
+            vols = attack_volumes_from(host.sets) if host is not None else []
+        ov = vp.set_attacks(vols)
+        self._attack_orphans = () if ov is None else ov.orphans
+        if ov is not None:
+            ov.set_visible_groups(self.visible_sets())
+            ov.set_selected_group(self.selected_set)
+            ov.set_selected_volume(self.selected_attack_volume
+                                   if self.attacks_source == "port" else None)
+        # the HOST actor beside the port draws the HOST's own sets, whatever the
+        # port has authored — the right joint next to the wrong one
+        vp.set_reference_attacks([] if host is None else attack_volumes_from(host.sets))
+        vp.sync_attack_focus()
+
+    def visible_sets(self):
+        """Which sets the overlay shows: the selected one; else the selected
+        move's; else, on the port, everything authored; on the host, nothing —
+        a whole overlay's sets at once is 200 volumes of fog."""
+        if self.selected_set is not None:
+            return [self.selected_set]
+        ps = self.pair_sets()
+        if ps and self._sets_of_move_only:
+            return ps
+        return None if self.attacks_source == "port" else []
+
+    def select_set(self, index: Optional[int]) -> None:
+        self.selected_set = index
+        self.selected_attack_volume = None
+        vp = self.viewport
+        if vp is not None and vp.attacks is not None:
+            vp.attacks.set_visible_groups(self.visible_sets())
+            vp.attacks.set_selected_group(index)
+            vp.attacks.set_selected_volume(None)
+            vp.sync_attack_focus()
+
+    def select_attack_volume(self, index: Optional[int]) -> None:
+        self.selected_attack_volume = index
+        vp = self.viewport
+        if vp is not None and vp.attacks is not None:
+            vp.attacks.set_selected_volume(index if self.attacks_source == "port"
+                                           else None)
+
+    def _hitboxes_panel(self) -> None:
+        """Where he hits YOU — the attack sets on the live pose, and the levers."""
+        from imgui_bundle import imgui
+
+        vp = self.viewport
+        if vp is None or vp.scene is None:
+            imgui.text_disabled("no scene yet")
+            return
+        host = self.host_attacks()
+        m = self.scene.manifest
+
+        changed = False
+        for key, label in (("host", "host em%02d" % (self.host_species or 0)),
+                           ("port", "this port")):
+            if imgui.radio_button(label + "##atk", self.attacks_source == key):
+                self.attacks_source, changed = key, True
+                self.selected_attack_volume = None
+            imgui.same_line()
+        imgui.new_line()
+        ch, self.show_attacks = imgui.checkbox("show##atk", self.show_attacks)
+        imgui.same_line()
+        _, vp.hitboxes_xray = imgui.checkbox("x-ray##atk", vp.hitboxes_xray)
+        if ch or changed or vp.attacks is None and self.show_attacks:
+            self.sync_attacks()
+
+        if host is None:
+            imgui.text_disabled("no attacks block in species/em%02d.json — build it "
+                                "with tools/em_intel.py --all" % (self.host_species or 0))
+            return
+        _attack_provenance(imgui, self, host)
+        _sets_table(imgui, self, host)
+        imgui.separator()
+        if self.attacks_source == "port":
+            _attack_volume_editor(imgui, self, host)
+            imgui.separator()
+        _attack_levers(imgui, self, host)
+        imgui.separator()
+        _attack_actions(imgui, self, host, m)
 
     def _parts_panel(self) -> None:
         """Where he can be hit, and for how much — the two tables, on the live pose."""
@@ -1298,11 +1461,20 @@ class EditorApp:
             # a shown volume under the cursor wins over a joint: with the gizmos
             # on, the click is "this sphere", and the joint is still one key away
             picked = None
-            if self.show_parts and self.parts_source == "port" \
-                    and vp.hitboxes is not None:
+            picked_attack = None
+            if self.show_attacks and self.attacks_source == "port" \
+                    and vp.attacks is not None:
+                v = vp.attacks.pick(mvp, size, m.x - pos.x, m.y - pos.y)
+                picked_attack = None if v is None else vp.attacks.index_of(v)
+            if picked_attack is None and self.show_parts \
+                    and self.parts_source == "port" and vp.hitboxes is not None:
                 v = vp.hitboxes.pick(mvp, size, m.x - pos.x, m.y - pos.y)
                 picked = None if v is None else vp.hitboxes.index_of(v)
-            if picked is not None:
+            if picked_attack is not None:
+                self.select_attack_volume(
+                    None if self.selected_attack_volume == picked_attack
+                    else picked_attack)
+            elif picked is not None:
                 self.select_volume(None if self.selected_volume == picked else picked)
             else:
                 hit = sk.pick(mvp, size, m.x - pos.x, m.y - pos.y)
@@ -1427,6 +1599,7 @@ def _docking(app: EditorApp):
                           win("Joints", "Left", app._joints_panel),
                           win("Clips", "Right", app._clips_panel),
                           win("Parts", "Right", app._parts_panel),
+                          win("Hitboxes", "Right", app._hitboxes_panel),
                           win("Action", "BottomRight", app._action_panel)]
     return d
 
@@ -1616,6 +1789,7 @@ def _alignment_view(imgui, al, app) -> None:
     imgui.text_wrapped(plain(al.headline))
     imgui.pop_style_color()
     _host_clip_row(imgui, al, app)
+    _hits_with_row(imgui, al, app)
 
     # The findings are collapsed unless something is actually WRONG. They are prose,
     # a dozen of them is normal, and left open they push the pair table off the panel —
@@ -2214,27 +2388,35 @@ def _export_buttons(imgui, app, m) -> None:
 
     if app.manifest_path is None:
         return
-    authored = bool(m.hurtboxes or m.hitzones)
+    authored = bool(m.hurtboxes or m.hitzones or m.hitboxes or m.attacks)
     if not authored:
-        imgui.text_disabled("nothing to export yet — save volumes or a grid first")
+        imgui.text_disabled("nothing to export yet — save volumes, a grid, a hitbox "
+                            "set or an attack record first")
         return
+
+    def _export():
+        return RT.export(m, capacity=RT.host_capacity(m),
+                         attacks=RT.host_attack_tables(m))
+
     if imgui.button("export runtime table"):
         try:
-            path = RT.export(m, capacity=RT.host_capacity(m))
+            path = _export()
             app._hit_export = path
             app.status = "wrote %s (id %s)" % (path.name, RT.content_id(m))
         except Exception as e:                                  # noqa: BLE001
             app.status = "%s: %s" % (type(e).__name__, e)
     if imgui.is_item_hovered():
         imgui.set_tooltip(plain(
-            "framework/prx/mods/lua_host/scripts/%s_hit.lua — the SAVED [[hurtbox]] "
-            "and [[hitzone]] as the P.hit() call mhfu_port.lua writes into the game "
-            "(in place, over the host set; the grid over the species blocks)." % m.name))
+            "framework/prx/mods/lua_host/scripts/%s_hit.lua — the SAVED [[hurtbox]], "
+            "[[hitzone]], [[hitbox]] and [[attack]] as the ONE P.hit() call "
+            "mhfu_port.lua writes into the game: hurtboxes in place over the host set, "
+            "the grid over the species blocks, each attack set in place through the "
+            "overlay's pointer table, the levers by byte." % m.name))
     if RT.MEMSTICK_MODS.is_dir():
         imgui.same_line()
         if imgui.button("deploy to memstick"):
             try:
-                path = app._hit_export or RT.export(m, capacity=RT.host_capacity(m))
+                path = app._hit_export or _export()
                 app._hit_export = path
                 dst = RT.deploy(path)
                 app.status = ("deployed %s -> %s. Cold boot; a running game "
@@ -2243,9 +2425,566 @@ def _export_buttons(imgui, app, m) -> None:
                 app.status = "%s: %s" % (type(e).__name__, e)
         if imgui.is_item_hovered():
             imgui.set_tooltip(plain("copy the module to %s" % RT.MEMSTICK_MODS))
-    if app.selected_volume is not None and app.part_session is not None \
-            and app.part_session.pending:
+    staged = (app.part_session is not None and app.part_session.pending) or (
+        app._attacks is not None and app._attacks.pending)
+    if staged:
         imgui.text_disabled("(exports the SAVED file — save first)")
+
+
+# --------------------------------------------------------------------------- #
+# the attack system (issue #33) — where he hits YOU
+# --------------------------------------------------------------------------- #
+def _set_swatch(imgui, set_index: int) -> None:
+    """The gizmo's own colour for a set, so the table and the viewport agree."""
+    from ..render.hitboxes import set_color
+
+    r, g, b = set_color(set_index)
+    imgui.color_button("##ss%d" % set_index, imgui.ImVec4(r, g, b, 1.0),
+                       imgui.ColorEditFlags_.no_tooltip.value, imgui.ImVec2(12, 12))
+
+
+def _attack_provenance(imgui, app, host) -> None:
+    """One line saying where the join came from — em75's was walked live, the rest
+    are an id range fitting a table, and a UI must not draw the two alike."""
+    sp = "0x%08X" % host.spawner if host.spawner else "?"
+    if host.join == "measured":
+        imgui.text_disabled("spawner %s -> the %d-record table: MEASURED live (#33)"
+                            % (sp, len(host.primary.attacks) if host.primary else 0))
+    else:
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.95, 0.75, 0.35, 1.0))
+        imgui.text_wrapped(plain("spawner %s -> table: INFERRED (%s). Only em75's join "
+                                 "was walked to the HP write; here the id range was "
+                                 "matched to the biggest table." % (sp, host.join)))
+        imgui.pop_style_color()
+    if imgui.is_item_hovered() and host.join_provenance:
+        imgui.set_tooltip(plain(host.join_provenance))
+    off = host.id_offset(app.host_species) if app.host_species is not None else None
+    if off is None:
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.35, 0.35, 1.0))
+        imgui.text_wrapped(plain("⚠ species %s shares this overlay but its id offset is "
+                                 "unknown — a move's attack ids cannot be resolved to "
+                                 "records" % app.host_species))
+        imgui.pop_style_color()
+    elif off:
+        imgui.text_disabled("species %d uses record = handler id + %d" % (app.host_species, off))
+
+
+def _moves_hitting(app, host, set_index: int):
+    """`(declared move names, other pair count)` whose handler hits with this set."""
+    si = app.host_intel()
+    if si is None:
+        return [], 0
+    pairs = si.pairs_hitting_with(set_index, app.host_species)
+    m = app.scene.manifest
+    by_pair = {}
+    if m is not None:
+        for name, mv in m.moves.items():
+            by_pair.setdefault((mv.main, mv.sub), []).append(name)
+    names, others = [], 0
+    for p in pairs:
+        n = by_pair.get((p.main, p.sub))
+        if n:
+            names += n
+        else:
+            others += 1
+    return names, others
+
+
+def _sets_table(imgui, app, host) -> None:
+    """One row per volume set: colour, index, the attacks that use it, the moves
+    that spawn those, how many volumes (host / port), the bones, rigged or not."""
+    from ..manifest import HITBOX_MARKER_BONES
+
+    sess = app.attack_session if app.attacks_source == "port" else None
+    pair_sets = app.pair_sets()
+    if pair_sets:
+        _, app._sets_of_move_only = imgui.checkbox(
+            "only the sets (%d,%d) hits with: %s" % (app._pair[0], app._pair[1],
+                                                     ", ".join(str(x) for x in pair_sets)),
+            app._sets_of_move_only)
+    elif app._pair is not None:
+        imgui.text_disabled("(%d,%d) spawns no attack the static scan can see — a turn, "
+                            "a roar, a walk; or a computed id" % app._pair)
+    listed = sorted(pair_sets) if pair_sets and app._sets_of_move_only else [
+        st.index for st in host.sets]
+    if app.attacks_source == "port":
+        authored = app.attack_session.sets() if app.attack_session is not None else []
+        listed = sorted(set(listed) | set(authored)) if not (
+            pair_sets and app._sets_of_move_only) else listed
+    if app._attack_orphans:
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.35, 0.35, 1.0))
+        imgui.text_wrapped(plain(
+            "⚠ %d volume(s) name a bone this rig does not have (%s) and are drawn "
+            "NOWHERE. Bone indices belong to the rig that ships them."
+            % (len(app._attack_orphans),
+               ", ".join(str(o.bone) for o in app._attack_orphans[:6]))))
+        imgui.pop_style_color()
+    imgui.text_disabled("%d set(s) listed of %d; %d attack record(s)"
+                        % (len(listed), len(host.sets), len(host.attacks)))
+
+    flags = (imgui.TableFlags_.borders_inner_h.value
+             | imgui.TableFlags_.row_bg.value
+             | imgui.TableFlags_.scroll_y.value
+             | imgui.TableFlags_.sizing_stretch_prop.value)
+    if not imgui.begin_table("##sets", 6, flags, imgui.ImVec2(0.0, 160.0)):
+        return
+    for name, w in (("", 0.2), ("set", 0.3), ("attacks", 0.9), ("moves", 0.9),
+                    ("vols", 0.45), ("bones", 0.9)):
+        imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
+    imgui.table_setup_scroll_freeze(0, 1)
+    imgui.table_headers_row()
+    for idx in listed:
+        st = host.set(idx)
+        imgui.table_next_row()
+        imgui.table_next_column()
+        _set_swatch(imgui, idx)
+        imgui.table_next_column()
+        sel = app.selected_set == idx
+        if imgui.selectable("%d##s%d" % (idx, idx), sel,
+                            imgui.SelectableFlags_.span_all_columns.value)[0]:
+            app.select_set(None if sel else idx)
+        if st is not None and not st.rigged and imgui.is_item_hovered():
+            imgui.set_tooltip(plain("un-rigged: every record hangs on bone 126/127, the "
+                                    "NODE's own position — projectile-shaped. Nothing "
+                                    "here to re-align to a joint."))
+        imgui.table_next_column()
+        atks = host.attacks_using(idx)
+        imgui.text(", ".join("%d(p%d)" % (a.id, a.power) for a in atks[:4])
+                   + (" +%d" % (len(atks) - 4) if len(atks) > 4 else "") if atks else "·")
+        if atks and imgui.is_item_hovered():
+            imgui.set_tooltip(plain("\n".join("attack %d: %s" % (a.id, a.describe())
+                                              for a in atks)))
+        imgui.table_next_column()
+        names, others = _moves_hitting(app, host, idx)
+        txt = ", ".join(names[:3]) + (" +%d" % (len(names) - 3) if len(names) > 3 else "")
+        if others:
+            txt += (" " if txt else "") + "(%d pair%s)" % (others, "" if others == 1 else "s")
+        imgui.text(txt or "·")
+        imgui.table_next_column()
+        n_host = 0 if st is None else st.capacity
+        if sess is not None:
+            n_port = len(sess.volumes_of(idx))
+            over = sess.over_capacity(idx)
+            if over:
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.35, 0.35, 1.0))
+            imgui.text("%d/%d" % (n_port, n_host) if n_port else "·/%d" % n_host)
+            if over:
+                imgui.pop_style_color()
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(plain("%d more than fit in place — the runtime "
+                                            "truncates" % over))
+        else:
+            imgui.text(str(n_host))
+        imgui.table_next_column()
+        if sess is not None and sess.volumes_of(idx):
+            bones = sorted({h.bone for _, h in sess.volumes_of(idx)
+                            if h.bone not in HITBOX_MARKER_BONES})
+        else:
+            bones = [] if st is None else st.bones
+        imgui.text(_bone_span(bones) if bones else ("node" if st is not None
+                                                     and not st.rigged else "·"))
+        if bones and imgui.is_item_hovered():
+            imgui.set_tooltip(", ".join(str(b) for b in bones))
+    imgui.end_table()
+
+
+def _attack_volume_editor(imgui, app, host) -> None:
+    """The port's attack volumes — the selected set's, or all — one row each, and
+    the selected one's fields. The hurtbox editor with `set` where `part` was."""
+    sess = app.attack_session
+    if sess is None:
+        imgui.text_disabled("no manifest, so no hitboxes to edit")
+        return
+    from ..manifest import Hitbox, ManifestError
+
+    vols = sess.volumes()
+    st = app.selected_set
+    if st is not None and not sess.volumes_of(st):
+        hs = host.set(st)
+        imgui.text_disabled("set %d: nothing authored — the host's %d record(s) stand"
+                            % (st, 0 if hs is None else hs.capacity))
+        if hs is not None and hs.spheres and imgui.button("adopt the host's set %d" % st):
+            got = sess.adopt_set(st, hs.spheres, source="em%02d set %d"
+                                 % (app.host_species or 0, st))
+            app.sync_attacks()
+            app.status = got.describe()
+        if hs is not None and hs.spheres and imgui.is_item_hovered():
+            imgui.set_tooltip(plain(
+                "⚠ the bone indices are the HOST's. This port ships its own rig, so a "
+                "copied sphere lands on whatever joint sits at that index — a starting "
+                "point you can SEE, not a correct answer."))
+        imgui.same_line()
+        if imgui.button("add a sphere to set %d" % st):
+            i = sess.add_volume(Hitbox(bone=1, radius=150.0, set=st,
+                                       offset=[0.0, 0.0, 0.0]))
+            app.select_attack_volume(i)
+            app.sync_attacks()
+        return
+    if not vols:
+        imgui.text_disabled("no [[hitbox]] authored — select a set above to adopt "
+                            "the host's or add a sphere")
+        return
+
+    rows = sess.volumes_of(st) if st is not None else list(enumerate(vols))
+    over = sess.over_capacity(st) if st is not None else sum(
+        sess.over_capacity_all().values())
+    head = ("set %d: %d volume(s)" % (st, len(rows)) if st is not None
+            else "%d volume(s) over %d set(s)" % (len(vols), len(sess.sets())))
+    cap = sess.capacities.get(st) if st is not None else None
+    if cap is not None:
+        head += ", %d fit in place" % cap
+    imgui.text_disabled(head)
+    if over:
+        imgui.same_line()
+        imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.35, 0.35, 1.0))
+        imgui.text(plain("⚠ %d over — the runtime truncates" % over))
+        imgui.pop_style_color()
+
+    flags = (imgui.TableFlags_.borders_inner_h.value
+             | imgui.TableFlags_.row_bg.value
+             | imgui.TableFlags_.scroll_y.value
+             | imgui.TableFlags_.sizing_stretch_prop.value)
+    if imgui.begin_table("##avols", 6, flags, imgui.ImVec2(0.0, 140.0)):
+        for name, w in (("#", 0.3), ("set", 0.35), ("bone", 0.4), ("shape", 0.55),
+                        ("r", 0.5), ("offset", 1.2)):
+            imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
+        imgui.table_setup_scroll_freeze(0, 1)
+        imgui.table_headers_row()
+        for i, v in rows:
+            imgui.table_next_row()
+            imgui.table_next_column()
+            sel = app.selected_attack_volume == i
+            if imgui.selectable("%d##av%d" % (i, i), sel,
+                                imgui.SelectableFlags_.span_all_columns.value)[0]:
+                app.select_attack_volume(None if sel else i)
+            if sess.volume_changed(i) and imgui.is_item_hovered():
+                imgui.set_tooltip("changed — not saved yet")
+            imgui.table_next_column()
+            _set_swatch(imgui, v.set)
+            imgui.same_line()
+            imgui.text(str(v.set))
+            imgui.table_next_column()
+            if v.is_node_space:
+                imgui.text_disabled("node")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(plain("bone %d: at the NODE's own position — the "
+                                            "attacker's origin for a body attack, a "
+                                            "projectile's for a thrown one. Drawn at "
+                                            "the origin." % v.bone))
+            elif v.is_marker:
+                imgui.text_disabled("0x7D")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(plain("a JOINER the walker hands to 0x09C386A0; "
+                                            "no geometry of its own. Drawn nowhere."))
+            else:
+                imgui.text(str(v.bone))
+            imgui.table_next_column()
+            imgui.text(v.shape[:4])
+            imgui.table_next_column()
+            imgui.text("%g" % v.radius)
+            imgui.table_next_column()
+            o = v.offset or (0.0, 0.0, 0.0)
+            imgui.text("%g %g %g" % tuple(o))
+        imgui.end_table()
+
+    i = app.selected_attack_volume
+    if i is None or not 0 <= i < len(vols):
+        imgui.text_disabled("select a volume (here, or click its gizmo) to edit it")
+        if st is not None:
+            if imgui.button("add a sphere to set %d" % st):
+                j = sess.add_volume(Hitbox(bone=1, radius=150.0, set=st,
+                                           offset=[0.0, 0.0, 0.0]))
+                app.select_attack_volume(j)
+                app.sync_attacks()
+            imgui.same_line()
+            hs = host.set(st)
+            if hs is not None and hs.spheres and imgui.button("re-adopt the host's set %d" % st):
+                got = sess.adopt_set(st, hs.spheres, source="em%02d set %d"
+                                     % (app.host_species or 0, st))
+                app.sync_attacks()
+                app.status = got.describe()
+        return
+    v = vols[i]
+
+    def stage(**fields):
+        try:
+            sess.edit_volume(i, **fields)
+            app.sync_attacks()
+            app.status = "hitbox %d: %s (unsaved)" % (
+                i, ", ".join("%s=%s" % kv for kv in fields.items()))
+        except ManifestError as e:
+            app.status = str(e)
+
+    imgui.text("hitbox %d%s" % (i, " — " + v.label if v.label else ""))
+    imgui.set_next_item_width(70)
+    ch, bone = imgui.input_int("bone##ab", int(v.bone), 1, 5)
+    if ch:
+        stage(bone=max(0, bone))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain("an index into THIS port's rig (%d joints); 126/127 = the "
+                                "node's own position. Click a joint in the viewport to "
+                                "read its number." % app.scene.rig.n_bones))
+    imgui.same_line()
+    imgui.set_next_item_width(60)
+    ch, sv = imgui.input_int("set##as", int(v.set), 1, 1)
+    if ch:
+        stage(set=max(0, min(len(host.sets) - 1, sv)))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain("which of the host's %d volume sets this record ships "
+                                "in — the attack record's +0x0A picks the set"
+                                % len(host.sets)))
+    imgui.same_line()
+    imgui.set_next_item_width(90)
+    ch, si_ = imgui.combo("##ashape", _SHAPES.index(v.shape), list(_SHAPES))
+    if ch:
+        stage(shape=_SHAPES[si_], to=(list(v.to) if v.to else [0.0, 0.0, 200.0])
+              if _SHAPES[si_] == "capsule" else v.to)
+
+    imgui.set_next_item_width(140)
+    ch, r = imgui.drag_float("radius##arad", float(v.radius), 1.0, 0.0, 5000.0, "%.1f")
+    if ch:
+        stage(radius=max(0.0, r))
+    imgui.same_line()
+    if imgui.button("x2##a"):
+        stage(radius=v.radius * 2.0)
+    imgui.same_line()
+    if imgui.button("x3##a"):
+        stage(radius=v.radius * 3.0)
+    imgui.same_line()
+    if imgui.button("x0.5##a"):
+        stage(radius=v.radius * 0.5)
+
+    imgui.set_next_item_width(230)
+    ch, off = imgui.input_float3("offset##aoff", list(v.offset or (0.0, 0.0, 0.0)), "%.1f")
+    if ch:
+        stage(offset=[float(x) for x in off])
+    if v.is_capsule:
+        imgui.set_next_item_width(230)
+        ch, to = imgui.input_float3("to##ato", list(v.to or (0.0, 0.0, 0.0)), "%.1f")
+        if ch:
+            stage(to=[float(x) for x in to])
+    imgui.set_next_item_width(-120)
+    ch, app._attack_label_buf = imgui.input_text("##alabel", v.label or "", 48)
+    if ch:
+        stage(label=app._attack_label_buf)
+    imgui.same_line()
+    imgui.text_disabled("flags 0x%X" % v.flags)
+
+    if imgui.button("keep only this in set %d" % v.set):
+        n = sess.keep_only(i)
+        app.select_attack_volume(sess.volumes_of(v.set)[0][0])
+        app.sync_attacks()
+        app.status = ("kept hitbox %d, dropped %d from set %d — one sphere: the "
+                      "attack lands there or nowhere (unsaved)" % (i, n, v.set))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(plain("the #33 experiment, per attack: with ONE volume left in "
+                                "the set, where the blow lands is the whole answer. The "
+                                "other sets are other attacks and stay."))
+    imgui.same_line()
+    if imgui.button("delete##a"):
+        sess.remove_volume(i)
+        app.select_attack_volume(None)
+        app.sync_attacks()
+        app.status = "deleted hitbox %d (unsaved)" % i
+    imgui.same_line()
+    if imgui.button("duplicate##a"):
+        j = sess.add_volume(v)
+        app.select_attack_volume(j)
+        app.sync_attacks()
+        app.status = "hitbox %d duplicated as %d (unsaved)" % (i, j)
+
+
+def _attack_levers(imgui, app, host) -> None:
+    """The records that use the selected set (or the selected pair's): power,
+    element, volume — the three MEASURED levers, editable on the port; the host's
+    byte shown where the port says nothing."""
+    from ..manifest import ManifestError
+
+    hp = app.host_pair()
+    if app.selected_set is not None:
+        recs = host.attacks_using(app.selected_set)
+        title = "attack records using set %d" % app.selected_set
+    elif hp is not None:
+        recs = host.records_for(hp.attack_ids, app.host_species)
+        title = "attack records (%d,%d) spawns" % app._pair
+    else:
+        imgui.text_disabled("select a set or a pair to see its attack records")
+        return
+    if not recs:
+        imgui.text_disabled(title + ": none")
+        return
+    imgui.text_disabled(title + " — power / element gate / set. Only these three are "
+                        "decoded (#33).")
+    sess = app.attack_session if app.attacks_source == "port" else None
+    flags = (imgui.TableFlags_.borders_inner_h.value
+             | imgui.TableFlags_.row_bg.value
+             | imgui.TableFlags_.sizing_stretch_prop.value)
+    if not imgui.begin_table("##levers", 5, flags):
+        return
+    for name, w in (("id", 0.3), ("power", 0.6), ("element", 0.6), ("set", 0.6),
+                    ("", 0.5)):
+        imgui.table_setup_column(name, imgui.TableColumnFlags_.width_stretch.value, w)
+    imgui.table_headers_row()
+    for a in recs:
+        mine = None if sess is None else sess.attack(a.id)
+        imgui.table_next_row()
+        imgui.table_next_column()
+        imgui.text(str(a.id))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(plain("record 0x%08X: kind %d, angle %d, tag 0x%02X — "
+                                    "located, not decoded" % (a.va, a.kind, a.angle, a.tag)))
+        if sess is None:
+            imgui.table_next_column()
+            imgui.text(str(a.power))
+            imgui.table_next_column()
+            imgui.text("0x%02X" % a.element)
+            imgui.table_next_column()
+            imgui.text(str(a.volume))
+            imgui.table_next_column()
+            continue
+
+        def lever(key, cur_host, fmt_hex=False):
+            val = getattr(mine, key) if mine is not None else None
+            imgui.set_next_item_width(-1)
+            shown = cur_host if val is None else val
+            if fmt_hex:
+                ch, txt = imgui.input_text("##%s%d" % (key, a.id), "0x%02X" % shown, 8)
+                if ch:
+                    try:
+                        nv = int(txt, 0)
+                    except ValueError:
+                        return
+                else:
+                    return
+            else:
+                ch, nv = imgui.input_int("##%s%d" % (key, a.id), int(shown), 1, 10)
+                if not ch:
+                    return
+            try:
+                nv = max(0, min(255, int(nv)))
+                sess.set_attack(a.id, **{key: None if nv == cur_host else nv})
+                app.status = "attack %d %s = %d%s (unsaved)" % (
+                    a.id, key, nv, " = the host's, so the block says nothing"
+                    if nv == cur_host else "")
+            except ManifestError as e:
+                app.status = str(e)
+
+        imgui.table_next_column()
+        lever("power", a.power)
+        imgui.table_next_column()
+        lever("element", a.element, fmt_hex=True)
+        imgui.table_next_column()
+        lever("volume", a.volume)
+        imgui.table_next_column()
+        if mine is not None and not mine.is_empty:
+            if imgui.small_button("host##r%d" % a.id):
+                sess.clear_attack(a.id)
+                app.status = "attack %d: back to the host's bytes (unsaved)" % a.id
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("drop the port's block; the host's record stands")
+        else:
+            imgui.text_disabled("host")
+    imgui.end_table()
+
+
+def _attack_actions(imgui, app, host, m) -> None:
+    """Adopt the move's sets, export, save, discard — and the shared-data caveat."""
+    sess = app.attack_session
+    if sess is None or m is None:
+        imgui.text_disabled("this scene has no manifest, so there is nothing to write "
+                            "hitboxes into")
+        return
+    ps = app.pair_sets()
+    if ps and imgui.button("adopt the sets (%d,%d) hits with" % app._pair):
+        n = 0
+        for st in ps:
+            hs = host.set(st)
+            if hs is not None and hs.spheres:
+                sess.adopt_set(st, hs.spheres, source="em%02d set %d"
+                               % (app.host_species or 0, st))
+                n += 1
+        app.attacks_source = "port"
+        app.sync_attacks()
+        app.status = ("adopted %d set(s) from em%02d — the HOST's bone indices, on "
+                      "this rig: a starting point you can see, not a correct answer "
+                      "(unsaved)" % (n, app.host_species or 0))
+    if ps and imgui.is_item_hovered():
+        imgui.set_tooltip(plain("copy the host's records for every set this pair's "
+                                "handler spawns, so you can move them onto the right "
+                                "joints of THIS rig"))
+    imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.95, 0.75, 0.35, 1.0))
+    imgui.text_wrapped(plain("🔴 the sets are SPECIES data in the overlay: with the port "
+                             "REPLACING its host they are his alone; beside a native "
+                             "em%02d they re-arm the native too. The in-place write was "
+                             "proven by RAM poke; the generated P.hit() path has not "
+                             "been cold-booted yet." % (app.host_species or 0)))
+    imgui.pop_style_color()
+
+    _export_buttons(imgui, app, m)
+
+    pending = sess.pending
+    if not pending:
+        imgui.text_disabled("nothing staged")
+        return
+    if imgui.button("save %d to %s##atk" % (pending, app.manifest_path.name
+                                            if app.manifest_path else "the manifest")):
+        try:
+            app.status = sess.save() or "nothing to save"
+            from ..manifest import load as _load
+            app.scene.attach_manifest(_load(app.manifest_path))
+            app._attacks = None
+            app._parts = None
+            app.sync_attacks()
+        except Exception as e:                                  # noqa: BLE001
+            app.status = "%s: %s" % (type(e).__name__, e)
+    imgui.same_line()
+    if imgui.button("discard##atk"):
+        sess.discard()
+        app.sync_attacks()
+        app.status = "discarded the staged hitbox edits"
+
+
+def _hits_with_row(imgui, al, app) -> None:
+    """The action inspector's new row (#33): what this action actually hits with —
+    the attack records its handler spawns and the volume sets they point at, with a
+    button into the Hitboxes panel."""
+    host = app.host_attacks()
+    p = al.pair
+    if host is None or p is None or not app.browsing_the_host:
+        return
+    if not p.attack_ids:
+        imgui.text_disabled("hits with: nothing the static scan can see%s"
+                            % (" (%d computed id%s)" % (p.attack_sites_computed,
+                                                        "" if p.attack_sites_computed == 1
+                                                        else "s")
+                               if p.attack_sites_computed else ""))
+        return
+    recs = host.records_for(p.attack_ids, app.host_species)
+    if not recs:
+        imgui.text_disabled("hits with: attack id(s) %s — unresolvable for species %s "
+                            "(no id offset known)"
+                            % (",".join(str(x) for x in p.attack_ids), app.host_species))
+        return
+    sets = sorted({a.volume for a in recs})
+    imgui.text("hits with:")
+    imgui.same_line()
+    imgui.text_wrapped("; ".join(
+        "attack %d (power %d, elem 0x%02X) -> set %d%s"
+        % (a.id, a.power, a.element, a.volume,
+           "" if host.set(a.volume) is None else " [%s]"
+           % (host.set(a.volume).describe()[:60]
+              + ("…" if len(host.set(a.volume).describe()) > 60 else "")))
+        for a in recs))
+    for st in sets:
+        if imgui.small_button("edit set %d in Hitboxes" % st):
+            app.show_attacks = True
+            app.attacks_source = "port" if (
+                app.attack_session is not None and app.attack_session.volumes_of(st)
+            ) else "host"
+            app.select_set(st)
+            app.sync_attacks()
+        imgui.same_line()
+    imgui.new_line()
 
 
 def _joint_note(sk, j: int, verts: int) -> str:
