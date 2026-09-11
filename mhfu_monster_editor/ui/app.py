@@ -1201,8 +1201,14 @@ class EditorApp:
                 x = at(mk)
                 col = imgui.get_color_u32(imgui.ImVec4(*_MARKER_COLOR[mk.kind]))
                 if mk.unreachable:
+                    # ⚠️ KEYWORDS, not positional. ImGui's C++ AddRect takes
+                    # (rounding, flags, thickness) and imgui_bundle's binding takes
+                    # (rounding, thickness, flags) — passing the C++ order hands a
+                    # float to `flags: int` and raises at the first UNREACHABLE
+                    # marker drawn, which is the moment an impact frame is set.
                     draw.add_rect(imgui.ImVec2(x - 2, pos.y + 3),
-                                  imgui.ImVec2(x + 2, pos.y + h - 3), col, 0.0, 0, 1.5)
+                                  imgui.ImVec2(x + 2, pos.y + h - 3), col,
+                                  thickness=1.5)
                 else:
                     draw.add_line(imgui.ImVec2(x, pos.y + 1),
                                   imgui.ImVec2(x, pos.y + h - 1), col, 2.0)

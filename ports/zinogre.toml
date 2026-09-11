@@ -56,44 +56,178 @@ reweight_undriven = false
 # ent+0x80+0x1C names the clip with no ambiguity. `frames`/`loop` are checked against
 # the built PAC by mhfu_monster_editor.validate.
 
-[clips.clip_02]
+[clips.welcome_howl]
 slot = 2
 frames = 252
 loop = false
-label = "unlabelled; 253f, travels 0 units"
+label = "the howling he does when he notices you"
+labelled_build = "zinogre_v10.bin@09091d56"
 
-[clips.clip_04]
+[clips.start_walk_forward]
 slot = 4
 frames = 264
 loop = true
-label = "unlabelled; 265f, travels 1202 units — a locomotion loop"
+label = "starts to slowly walk forward"
+labelled_build = "zinogre_v10.bin@09091d56"
 
-[clips.clip_10]
+[clips.standing_charge_up]
 slot = 10
 frames = 408
 loop = true
-label = "unlabelled; 409f, travels 0 units. The longest clip in either pack, so `end = 408` is his fingerprint"
+label = "standing in place and charging up i think"
+labelled_build = "zinogre_v10.bin@09091d56"
 
-[clips.clip_12]
+[clips.howl_eat_from_ground]
 slot = 12
 frames = 380
 loop = true
-label = "unlabelled; 381f, travels 77 units"
+label = "howling and ripping some flesh out of something on the ground"
+labelled_build = "zinogre_v10.bin@09091d56"
 
-[clips.clip_18]
+[clips.crouch_charge_up]
 slot = 18
 frames = 242
 loop = false
-label = "unlabelled; 243f, travels 0 units"
+label = "i think charging up again but crouched"
+labelled_build = "zinogre_v10.bin@09091d56"
 
-[clips.clip_19]
+[clips.step_forward_houwl]
 slot = 19
 frames = 344
 loop = false
-label = "unlabelled; 345f, travels 221 units net / 336 peak"
+label = "houwling loudly after stepping forward"
+labelled_build = "zinogre_v10.bin@09091d56"
 
-# MOVES — deliberately empty. A move is an ALIGNMENT between a host behaviour pair and
-# one of the clips above, and aligning an unlabelled vocabulary is guessing. The pairs
-# themselves come from the HOST species' census (tools/em_state_census.py), so the
-# Brute's shortlist in ports/brute_tigrex.toml applies here unchanged once the clips
-# have names.
+[clips.stop_walk_forward]
+slot = 5
+frames = 132
+loop = false
+label = "stops to walk forward"
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.lunge_forward]
+slot = 6
+frames = 100
+loop = true
+impact_frame = 62
+labelled_build = "zinogre_v10.bin@09091d56"
+label = "fast running forward, briefly hitting with horns"
+
+[clips.turn_right]
+slot = 8
+frames = 100
+loop = false
+label = "turning right in standing position"
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.turn_left]
+slot = 9
+frames = 100
+loop = false
+label = "turning left in standing position"
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.fall_asleep]
+slot = 14
+frames = 340
+loop = false
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.jump_high_forward]
+slot = 15
+frames = 68
+loop = false
+labelled_build = "zinogre_v10.bin@09091d56"
+impact_frame = 62
+
+[clips.landing_after_forward_jump]
+slot = 17
+frames = 64
+loop = false
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.dash_forward]
+slot = 20
+frames = 82
+loop = false
+label = "dash forward a long distance"
+labelled_build = "zinogre_v10.bin@09091d56"
+impact_frame = 28
+
+[clips.dash_forward_short]
+slot = 21
+frames = 66
+loop = false
+label = "short forward dash"
+labelled_build = "zinogre_v10.bin@09091d56"
+impact_frame = 27
+
+[clips.look_left_walk]
+slot = 40
+frames = 206
+loop = false
+label = "short walk forwards looking left"
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.look_right_walk]
+slot = 41
+frames = 206
+loop = false
+labelled_build = "zinogre_v10.bin@09091d56"
+label = "short walk forwards looking right"
+
+[clips.horn_hit_left_right_downwards]
+slot = 42
+frames = 92
+loop = false
+label = "hit with horns from upper left to down right"
+labelled_build = "zinogre_v10.bin@09091d56"
+impact_frame = 20
+
+[clips.jump_out_of_map]
+slot = 61
+frames = 64
+loop = false
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.jumping_out_of_map]
+slot = 62
+frames = 22
+loop = true
+labelled_build = "zinogre_v10.bin@09091d56"
+
+[clips.walk_forwards_faster]
+slot = 65
+frames = 162
+loop = true
+labelled_build = "zinogre_v10.bin@09091d56"
+
+# MOVES — the ALIGNMENT: which host behaviour pair runs, and which of the port's own
+# clips is painted on it while it does. The pairs are the HOST's (em75 = Tigrex); a
+# ported monster has no AI of its own.
+
+[moves.lunge]
+main = 1
+sub = 4
+clip = "lunge_forward"
+latch = 1                    # (1,4) names a single a1, so one dispatch covers the move
+
+# ⚠️ THE IMPACT IS 22 FRAMES LATE, AND THAT IS ACCEPTED, NOT MISSED.
+# The handler tests frames 0 and 40; lunge_forward's contact is at frame 62, so the
+# damage lands roughly a third of a second before the horns visibly connect. Fixing it
+# means retiming the clip on a rebuild. Judged on screen first.
+#
+# 🔴 THE HOST'S ANIMATION IS EVIDENCE ABOUT THE HOST'S PHYSICS, and that is why this
+# pair and not a better-timed one. (1,4) plays a1=17: 1823 units forward, ~0 vertical —
+# a pure ground charge, the right physics for a lunge. (2,0) tests frame 60 (a 2-frame
+# miss, numerically perfect) but its a1=18 goes 63 units forward and 663 straight UP:
+# it is a jump-and-hover, and a ground lunge painted on it would slide forward while
+# the engine thinks the animal is airborne. Judged in the editor's host reference.
+#
+# ⚠️ (1,4), (1,5) and (1,9) are the SAME FUNCTION — handler 0x09D28738. Aliases; there
+# is nothing to choose between them.
+# ⚠️ This family's a1=17 is `a1_computed: true` — recovered from a register or table
+# rather than read as a literal, so it is the softer half of the intel. `ends_on` is
+# `cursor`, so the clip's length does not end the action; the handler does. Both are
+# cold-boot questions, not static ones.
+# ⚠️ No census covers (1,4): `entered` is UNKNOWN, not zero.
