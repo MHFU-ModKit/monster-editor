@@ -1,0 +1,15 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Game files are never committed — your own dump lives here
+workspace/
+
+# Per-species action intel, read straight out of the game's overlays (derived game data).
+# Regenerate from your own extract:  python tools/em_intel.py --all
+species/
+
+.DS_Store
+.vscode/
+.idea/

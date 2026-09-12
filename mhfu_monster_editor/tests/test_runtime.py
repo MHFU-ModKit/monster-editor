@@ -14,6 +14,10 @@ import sys
 import tempfile
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# the framework's Lua library and stubs live in a sibling checkout upstream; the public
+# monster-editor repo does not carry them, and the tests that need them skip
+_PORT_LUA = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts", "mhfu_port.lua")
+_HAVE_FRAMEWORK = os.path.exists(_PORT_LUA)
 sys.path.insert(0, _ROOT)
 
 from mhfu_monster_editor import manifest as MF
@@ -182,6 +186,9 @@ def test_deploy_brings_the_library_along_when_the_memsticks_is_behind():
     """The failure that hid the hitbox editor's first run: the module on the
     memstick carried `attack_sets`, the memstick's mhfu_port.lua was the version
     from before #33 and dropped them, and the log still said HIT TABLES APPLIED."""
+    if not _HAVE_FRAMEWORK:
+        print("SKIP: no framework checkout beside the editor")
+        return
     lib = os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "scripts",
                        "mhfu_port.lua")
     with tempfile.TemporaryDirectory() as d:
@@ -209,6 +216,9 @@ def test_the_runtime_writer_lands_the_bytes_the_format_module_describes():
     becomes ours, record 1 the sentinel, record 2 stays the original, the grid
     bytes land and the pad does not, and a change under us is re-applied.
     Needs `lua` on the box and the extracts; skips otherwise."""
+    if not _HAVE_FRAMEWORK:
+        print("SKIP: no framework checkout beside the editor")
+        return
     lua = shutil.which("lua")
     data = os.path.join(_ROOT, "workspace", "extracted", "data_files")
     ovl, gt = os.path.join(data, "file_06108.bin"), os.path.join(data, "file_00070.bin")
@@ -248,6 +258,9 @@ def test_the_library_walks_a_declared_chain_and_refuses_to_loop_one_pair():
     PARKED once, a declared pair the engine enters itself is painted by the hook
     once per entry, and an `after` the engine already reached is adopted. Needs
     `lua`; skips otherwise."""
+    if not _HAVE_FRAMEWORK:
+        print("SKIP: no framework checkout beside the editor")
+        return
     lua = shutil.which("lua")
     if not lua:
         print("SKIP: no lua")
@@ -267,6 +280,9 @@ def test_the_library_fits_lua_hosts_file_buffer():
     file with a single boot-log line. On 2026-09-11 mhfu_port.lua crossed the old
     48 KB and the whole port — the quest swap included — silently did not exist.
     Read the cap out of the source so the two cannot drift apart."""
+    if not _HAVE_FRAMEWORK:
+        print("SKIP: no framework checkout beside the editor")
+        return
     src = open(os.path.join(_ROOT, "framework", "prx", "mods", "lua_host", "mod.cpp"),
                encoding="utf-8").read()
     import re
@@ -286,6 +302,9 @@ def test_the_seam_stubs_assemble_branchless_and_in_bounds():
     assembled with the host cc from the same stubs.h the PRX builds, read back by
     an independent decoder — no branch, frame-free slot 29, one call in slot 32,
     targets and config offsets in range. Needs a C compiler; skips otherwise."""
+    if not _HAVE_FRAMEWORK:
+        print("SKIP: no framework checkout beside the editor")
+        return
     if not shutil.which("cc"):
         print("SKIP: no cc")
         return
@@ -304,6 +323,9 @@ def test_the_library_enters_pairs_through_the_native_seam_when_it_is_live():
     request the engine declines is reported with the enter-action ring and does
     NOT walk `after`; `{raw=true}` still writes the cells; a redefine re-arms.
     Needs `lua`; skips otherwise."""
+    if not _HAVE_FRAMEWORK:
+        print("SKIP: no framework checkout beside the editor")
+        return
     lua = shutil.which("lua")
     if not lua:
         print("SKIP: no lua")
