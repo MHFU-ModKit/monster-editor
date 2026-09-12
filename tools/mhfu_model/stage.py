@@ -113,8 +113,40 @@ def read_extracted(data_dir, file_index) -> bytes:
 
 OVL_MAGIC = b"MWo3"
 OVL_HDR = struct.Struct("<4sIIIIIII")
+OVL_NAME_OFF = 0x20      # "stage099.ovl", NUL-padded, inside the 0x40 header
 PARAM_TBL_OFF = 0x0C     # the parameter object field holding the table
-VT_GETTER_SLOT = 10      # vtable slot that returns the parameter object
+PARAM_SPHERES = 0x10     # -> 24-byte spheres,   count at P+0x3E
+PARAM_EXITS = 0x30       # -> 52-byte area exits, count at P+0x3D
+PARAM_OBJ_A = 0x34       # -> 32-byte records,   count at P+0x3F
+PARAM_OBJ_B = 0x38       # -> 32-byte records,   count at P+0x40
+EXIT_STRIDE = 0x34
+
+# The stage module's vtable is ONE table at a fixed address in EBOOT .data,
+# rewritten from the overlay every time a stage loads. Read it live to see
+# which slots the current stage implements; the ones that matter here are:
+VTABLE_VA = 0x089C3EBC   # .data, patched per stage
+VT_PARAM_OBJ = 10        # -> the parameter object P
+VT_DROP_TABLE = 15       # -> drop_tables()[a1 & 0xFF]
+VT_DESCRIPTOR = 18       # -> the {nA, nB, A, B} typed-record descriptor
+STAGE_MODULE_VA = 0x089CC434   # EBOOT global holding the module instance
+
+
+@dataclass
+class Exit:
+    """One area transition — 52 bytes at the parameter object's `+0x30`.
+
+    `trigger` is a cylinder (radius `r`, height `h`) the hunter walks into;
+    `dest` is where he is put down in stage `target`, facing `yaw`
+    (16-bit turn, 0x4000 = 90 deg). `flag` is the target word's high half and
+    is 1 on 21 of the 555 shipped records.
+    """
+    target: int
+    flag: int
+    trigger: tuple
+    r: float
+    h: float
+    dest: tuple
+    yaw: int
 
 
 class Overlay:
@@ -129,13 +161,17 @@ class Overlay:
         self.text_off = 0x80                       # 64-byte header + 64-byte pad
         self.image_end = self.text_off + self.text_size + self.data_size
         self.mem_end = self.image_end + self.bss_size
+        self.name = data[OVL_NAME_OFF:OVL_NAME_OFF + 0x20].split(b"\0")[0].decode()
+        # a few overlays are shorter than header + text + data claims; anything past
+        # the end of the file reads as bss would, zero.
+        self.file_end = min(self.image_end, len(data))
 
     def word(self, va):
         """u32 at a VA, or None outside the file image (bss reads as 0)."""
         off = va - self.load
         if off < 0 or off >= self.mem_end:
             return None
-        if off + 4 > self.image_end:
+        if off + 4 > self.file_end:
             return 0                               # bss: zero-initialised
         return struct.unpack_from("<I", self.data, off)[0]
 
@@ -161,7 +197,7 @@ class Overlay:
                 continue
             # +0x14 is a u16[10] of small slot ids padded with 0xFFFF, and no other
             # constant this idiom returns looks remotely like it — that is the whole
-            # filter, and it picks the right object in 267 of the 267 overlays.
+            # filter, and it picks the right object in every one of the 266 stage overlays.
             ws = [self.word(P + 0x14 + 4 * k) for k in range(5)]
             if any(w is None for w in ws):
                 continue
@@ -175,30 +211,115 @@ class Overlay:
                 best = (run, P)
         return best[1] if best else None
 
-    def objects(self):
-        """The placed-object array at parameter object `+0x34`, count at `+0x3F`.
+    def counts(self):
+        """the four array counts packed into the parameter object's `+0x3C..+0x40`.
 
-        32-byte records — `{u32 flags; u32 kind; u32 id; u32 param; float x,y,z; u32}`.
-        1..4 per stage in 92 of the 267, positions inside the collision lattice, `kind`
-        always 6 in everything sampled. ⚠️ What they ARE is not decoded: the accessors
-        `P+0x34`/`P+0x3F` and `P+0x38`/`P+0x40` are two such (array, count) pairs, read
-        through the getters at overlay `+0xE0`/`+0x108`/`+0x130`/`+0x158`.
+        `+0x3C` is NOT a count — it is a small per-map enum (0 in 207 stages,
+        3/4 across the whole snowy bank day and night, 1/2 in the volcano-shaped
+        rows). Returned as `env` because what it selects is not pinned.
         """
         P = self.param_object()
         if P is None:
+            return None
+        w = self.word(P + 0x3C)
+        return {"env": w & 0xFF, "exits": (w >> 8) & 0xFF, "spheres": (w >> 16) & 0xFF,
+                "obj_a": (w >> 24) & 0xFF, "obj_b": self.word(P + 0x40) & 0xFF}
+
+    def exits(self):
+        """[Exit] — the area transitions, `P+0x30`, count `P+0x3D`.
+
+        555 records over 226 stages. Every one names a real stage, and 507 of
+        the 534 in-range destinations land within 60 units of the TARGET
+        stage's walkable floor, which is what confirms the layout.
+        """
+        P, c = self.param_object(), self.counts()
+        if P is None or not c or not c["exits"]:
             return []
-        base = self.word(P + 0x34)
-        count = (self.word(P + 0x3C) >> 24) & 0xFF      # P+0x3F
-        if not base or not count:
+        b = self.word(P + PARAM_EXITS)
+        out = []
+        for k in range(c["exits"]):
+            w = [self.word(b + EXIT_STRIDE * k + 4 * j) for j in range(13)]
+            if any(v is None for v in w):
+                break
+            f = struct.unpack("<13f", struct.pack("<13I", *w))
+            out.append(Exit(w[0] & 0xFFFF, w[0] >> 16, f[1:4], f[4], f[5], f[9:12],
+                            w[12] & 0xFFFF))
+        return out
+
+    def spheres(self):
+        """24-byte `{u16; u16 id; float x,y,z; float radius; u32}` at `P+0x10`."""
+        P, c = self.param_object(), self.counts()
+        if P is None or not c or not c["spheres"]:
+            return []
+        b = self.word(P + PARAM_SPHERES)
+        out = []
+        for k in range(c["spheres"]):
+            w = [self.word(b + 0x18 * k + 4 * j) for j in range(6)]
+            if any(v is None for v in w):
+                break
+            pos = struct.unpack("<3f", struct.pack("<3I", w[1], w[2], w[3]))
+            r, = struct.unpack("<f", struct.pack("<I", w[4]))
+            out.append({"id": w[0] >> 16, "pos": pos, "radius": r, "tail": w[5]})
+        return out
+
+    def objects(self, which="a"):
+        """The 32-byte placed-object records at `P+0x34` (a) or `P+0x38` (b).
+
+        `{u32 flags; u32 kind; u32 id; u32 param; float x,y,z; u32}`. 143 in the
+        `a` array across 92 stages, positions inside the collision lattice,
+        `kind` 6 or 3. ⚠️ What they ARE is still not decoded.
+        """
+        P, c = self.param_object(), self.counts()
+        if P is None or not c:
+            return []
+        off, n = (PARAM_OBJ_A, c["obj_a"]) if which == "a" else (PARAM_OBJ_B, c["obj_b"])
+        base = self.word(P + off)
+        if not base or not n:
             return []
         out = []
-        for k in range(count):
+        for k in range(n):
             w = [self.word(base + 0x20 * k + 4 * j) for j in range(8)]
             if any(v is None for v in w):
                 break
             pos = struct.unpack("<3f", struct.pack("<3I", w[4], w[5], w[6]))
             out.append({"flags": w[0], "kind": w[1], "id": w[2], "param": w[3], "pos": pos})
         return out
+
+    def drop_tables(self, cap=16):
+        """[[(percent, id)]] — the probability tables `vt[15]` indexes.
+
+        `vt[15]` is `tables[a1 & 0xFF]`, a plain pointer array with no stored
+        length; each table is `(u8 percent, u8 id)` pairs ended by `0xFF`, and
+        the percents sum to 100. Only 38 stages carry one. ⚠️ What they weight
+        is not decoded — see `docs/STAGE_MAP_FORMAT.md`.
+        """
+        def one(va):
+            o = va - self.load
+            if o < 0 or o >= self.file_end:
+                return None
+            out = []
+            while o + 2 <= self.file_end:
+                p = self.data[o]
+                if p == 0xFF:
+                    return out if len(out) >= 2 and sum(q for q, _ in out) == 100 else None
+                out.append((p, self.data[o + 1]))
+                o += 2
+                if len(out) > 64:
+                    return None
+            return None
+
+        best = []
+        for off in range(0, self.file_end - 4, 4):
+            run, o = [], off
+            while o + 4 <= self.image_end:
+                t = one(struct.unpack_from("<I", self.data, o)[0])
+                if t is None:
+                    break
+                run.append(t)
+                o += 4
+            if len(run) > len(best):
+                best = run
+        return best if len(best) >= 2 else []
 
     def surface_table(self, count=8):
         """[u32] surface-property bitmasks, or None if there is no param object.
