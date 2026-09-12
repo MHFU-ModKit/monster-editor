@@ -177,9 +177,10 @@ def test_deploy_copies_beside_the_other_mods_or_says_there_is_no_memstick():
         assert open(dep.module, "rb").read() == open(src, "rb").read()
         # no library beside a module exported into a temp dir: the repo's own is
         # the fallback, and an empty mods dir is behind it by definition
-        assert dep.library is not None and "stale" in dep.describe()
-        assert RT.deploy(src, mods_dir=RT.Path(mods)).library is None, \
-            "identical copies are not re-copied"
+        if _HAVE_FRAMEWORK:
+            assert dep.library is not None and "stale" in dep.describe()
+            assert RT.deploy(src, mods_dir=RT.Path(mods)).library is None, \
+                "identical copies are not re-copied"
 
 
 def test_deploy_brings_the_library_along_when_the_memsticks_is_behind():

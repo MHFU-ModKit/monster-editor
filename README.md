@@ -57,6 +57,7 @@ mhfu_monster_editor/   the package: manifest, intel, align, parts, attacks, clip
 ports/                 the port manifests (also published with example-mods)
 tools/mhfu_model/      the format library — a copy of MHFU-ModKit/formats at the same commit
 tools/em_*.py          the species-intel analysers that produce species/emNN.json
+tools/build_p3rd_port.py, verify_port.py, …   the porter the manifests build with (also in formats)
 docs/                  MOD_PORTED_MONSTER.md — the port library the export targets
 ```
 
