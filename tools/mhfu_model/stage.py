@@ -59,6 +59,13 @@ and each list word holds a triangle's VA. Terminators and float vertices are unt
 nothing at runtime is offset-relative, a new grid, a new cell list or a new triangle can
 be written ANYWHERE in free RAM and linked in by overwriting one pointer. You are not
 confined to the resident chunk's original size.
+
+🔴 **That is true of the COLLISION only.** The visible mesh (`sub[0]`/`sub[2]`, PMO) is
+consumed ONCE at load: zeroing the entire terrain PMO in the resident PAC changes nothing
+on screen, and a savestate round trip rules out an emulator cache. So a geometry edit
+needs a reload — the inject path (`mhfu_model.inject`, "geometry edits apply on the next
+engine rebuild") or a repacked PAC — while a collision edit is live. Editing a map means
+two different write paths for the two halves of it.
 """
 
 import os
@@ -93,10 +100,156 @@ def read_extracted(data_dir, file_index) -> bytes:
         return fh.read()
 
 
+# --- the stage OVERLAY: surface-property table ---------------------------
+#
+# `stage<NNN>.ovl` is an MWo3 overlay, fully linked at its load address, whose
+# parameter object is returned by vtable slot 10 of the object the map manager
+# holds at `*(0x09A4F060) + 0`. That slot is always a constant getter
+#
+#     lui v0, HI ; jr ra ; addiu v0, v0, LO      ->  P
+#
+# and `P + 0x0C` is the SURFACE-PROPERTY TABLE: one u32 bitmask per surface id,
+# indexed by the low byte of a HITS triangle's `flags`. See `TriFlags`.
+
+OVL_MAGIC = b"MWo3"
+OVL_HDR = struct.Struct("<4sIIIIIII")
+PARAM_TBL_OFF = 0x0C     # the parameter object field holding the table
+VT_GETTER_SLOT = 10      # vtable slot that returns the parameter object
+
+
+class Overlay:
+    """Just enough of an MWo3 overlay to find the stage parameter object."""
+
+    def __init__(self, data: bytes):
+        magic, self.oid, self.load, self.text_size, self.data_size, \
+            self.bss_size, self.ctor_s, self.ctor_e = OVL_HDR.unpack_from(data, 0)
+        if magic != OVL_MAGIC:
+            raise ValueError("not an MWo3 overlay: %r" % magic)
+        self.data = data
+        self.text_off = 0x80                       # 64-byte header + 64-byte pad
+        self.image_end = self.text_off + self.text_size + self.data_size
+        self.mem_end = self.image_end + self.bss_size
+
+    def word(self, va):
+        """u32 at a VA, or None outside the file image (bss reads as 0)."""
+        off = va - self.load
+        if off < 0 or off >= self.mem_end:
+            return None
+        if off + 4 > self.image_end:
+            return 0                               # bss: zero-initialised
+        return struct.unpack_from("<I", self.data, off)[0]
+
+    def param_object(self):
+        """VA of the stage parameter object, or None.
+
+        Every `lui v0 / jr ra / addiu v0` in text is a candidate; the parameter
+        object is the one with the run of 0xFFFFFFFF at +0x14 and a table
+        pointer at +0x0C.
+        """
+        best = None
+        for off in range(self.text_off, self.text_off + self.text_size - 8, 4):
+            w0, w1, w2 = struct.unpack_from("<3I", self.data, off)
+            if (w0 >> 26) != 0x0F or ((w0 >> 16) & 31) != 2:        # lui v0
+                continue
+            if w1 != 0x03E00008:                                     # jr ra
+                continue
+            if (w2 >> 26) != 0x09 or ((w2 >> 21) & 31) != 2 or ((w2 >> 16) & 31) != 2:
+                continue                                             # addiu v0, v0
+            P = ((w0 & 0xFFFF) << 16) + (w2 & 0xFFFF)
+            t = self.word(P + PARAM_TBL_OFF)
+            if t is None or not (self.load <= t < self.load + self.mem_end):
+                continue
+            # +0x14 is a u16[10] of small slot ids padded with 0xFFFF, and no other
+            # constant this idiom returns looks remotely like it — that is the whole
+            # filter, and it picks the right object in 267 of the 267 overlays.
+            ws = [self.word(P + 0x14 + 4 * k) for k in range(5)]
+            if any(w is None for w in ws):
+                continue
+            slots = [h for w in ws for h in (w & 0xFFFF, w >> 16)]
+            if any(h != 0xFFFF and h >= 0x40 for h in slots):
+                continue
+            run = slots.count(0xFFFF)
+            if run < 2:
+                continue
+            if best is None or run > best[0]:
+                best = (run, P)
+        return best[1] if best else None
+
+    def surface_table(self, count=8):
+        """[u32] surface-property bitmasks, or None if there is no param object.
+
+        `count` entries are read; the table's real length is not stored anywhere,
+        so bound it by the largest surface id the stage's triangles actually use
+        (`Stage.surface_ids()`). A table in bss reads as all zeroes, which is
+        what a stage with no special surfaces ships.
+        """
+        P = self.param_object()
+        if P is None:
+            return None
+        t = self.word(P + PARAM_TBL_OFF)
+        return [self.word(t + 4 * k) for k in range(count)]
+
+
+def read_overlay(data_dir, stage: int) -> Overlay:
+    return Overlay(read_extracted(data_dir, ovl_file(stage)))
+
+
 def subresources(blob: bytes):
-    """[(offset, size)] of a package."""
+    """[(offset, size)] of a package.
+
+    ⚠️ `pac_file(0)` is NOT a stage PAC — engine file 5808 is `stage266.ovl`, and
+    the PAC range starts at st001. A bad count here means "not a package", so say
+    so rather than over-reading a 2 KB overlay into a 6 GB slice list.
+    """
+    if len(blob) < 12:
+        raise ValueError("too short to be a package (%d bytes)" % len(blob))
     n = struct.unpack_from("<I", blob)[0]
+    if not 0 < n < 64 or 4 + 8 * n > len(blob):
+        raise ValueError("not a package: sub-resource count %d in a %d-byte blob"
+                         % (n, len(blob)))
     return [struct.unpack_from("<II", blob, 4 + 8 * k) for k in range(n)]
+
+
+@dataclass
+class TriFlags:
+    """The u32 at a HITS triangle's offset 0 — three fields, not one number.
+
+    Every engine site reads it as `lbu +0 / lbu +1 / lhu +2`, and the packer at
+    `0x09A70CBC` masks the first two to 3 and 4 bits:
+
+        u8  surface_id;   // 0..7  -> index into the STAGE OVERLAY's property table
+        u8  material;     // 0..15 -> passed to the effect spawner (footstep class)
+        u16 exclude;      // 16-bit query mask: a query that shares a bit SKIPS
+                          // this triangle (`0x09C3E404`, `0x09C40EA4`)
+
+    The whole word is copied onto the actor at `+0x290` by the ground query, so
+    it can be read live: `+0x290` == the flags of the triangle being stood on
+    (verified byte-exact against the disk mesh).
+    """
+    surface_id: int
+    material: int
+    exclude: int
+
+    @classmethod
+    def unpack(cls, word: int):
+        return cls(word & 0xFF, (word >> 8) & 0xFF, word >> 16)
+
+    def pack(self) -> int:
+        return (self.surface_id & 0xFF) | ((self.material & 0xFF) << 8) | (self.exclude << 16)
+
+
+#: what each bit of a surface-property table entry does, and where the engine
+#: reads it (`game_sub.ovl`). The actor offsets are on the combat entity.
+SURFACE_BITS = {
+    0x01: ("contact flag",  "0x09C38FEC — sets 0x0002 in the contact record"),
+    0x02: ("actor flag",    "0x09C39770 — writes 1 to actor+0x27E"),
+    0x10: ("query hit",     "0x09C413F4 — makes the probe 0x09C411A8 answer true"),
+    0x20: ("sink",          "0x09C3F154 — surface height = hit - actor+0x2A8; "
+                            "0x09C3E8E0 skips the triangle"),
+    0x40: ("exclude",       "0x09C3E224 / 0x09C3FE04 — with 0x20, drops the triangle"),
+    0x80: ("wade",          "0x09C3F110 — actor+0x410 |= 0x40; actor types "
+                            "8/14/26/34/43/44/83 then stand on the SURFACE height"),
+}
 
 
 @dataclass
@@ -226,6 +379,14 @@ class Stage:
             "unlisted": ch.tri_count - len(listed),
         }
 
+    def surface_ids(self):
+        """{(chunk, surface_id): count} — which table entries this stage uses."""
+        out = {}
+        for ci, _, fl, _, _, _ in self.triangles():
+            k = (ci, fl & 0xFF)
+            out[k] = out.get(k, 0) + 1
+        return out
+
     def tri_offset(self, chunk: int, tri: int) -> int:
         """byte offset of one triangle record, relative to the START OF THE PAC."""
         base = self.subs[5][0]
@@ -233,6 +394,42 @@ class Stage:
             if ch.index == chunk:
                 return base + ch.tri_offset + TRI_STRIDE * tri
         raise KeyError(chunk)
+
+    def meshes(self, k=0):
+        """Decoded PMO for sub[0] (terrain) or sub[2] (props), in WORLD space.
+
+        Stage PMOs use the same **0x18-stride** mesh table as monster PMOs, so
+        `mhfu_model.pmo` reads them unchanged — 487 of the 487 that ship re-encode
+        byte-identically. Vertices are in the same world frame as the collision:
+        under a standing hunter the visible surface and the HITS floor agree to
+        0.43 units, one s16 quantization step.
+        """
+        from . import pmo as _pmo
+        return _pmo.parse(self.sub(k))
+
+    @property
+    def slack(self) -> bytes:
+        """Bytes after the last sub-resource.
+
+        ⚠️ NOT part of the PAC — `extract_iso.py` slices on sector boundaries, so an
+        extracted file carries a tail of whatever followed it on the disc (276 bytes
+        of high-entropy data for st098). Carry it through and an unedited repack is
+        byte-identical, which is the only honest control for the writer.
+        """
+        o, sz = self.subs[-1]
+        return self.blob[o + sz:]
+
+    def with_sub(self, k, blob, keep_slack=True) -> bytes:
+        """A new PAC blob with sub-resource `k` replaced. Only the table moves."""
+        subs = [self.sub(i) for i in range(len(self.subs))]
+        subs[k] = blob
+        out = build_package(subs, align=SUB_ALIGN)
+        if not keep_slack:
+            return out
+        # build_package pads the LAST sub up to `align` too; the source does not,
+        # so cut back to the end of the last sub before re-attaching the slack.
+        o, sz = subresources(out)[-1]
+        return out[:o + sz] + self.slack
 
     def with_collision(self, chunks) -> bytes:
         """A new PAC blob with sub[5] replaced by these HITS chunk blobs.
@@ -414,7 +611,10 @@ def build_package(blobs, align=SUB_ALIGN) -> bytes:
     off = (head + align - 1) // align * align if align else head
     table, body, cur = [], bytearray(), off
     for b in blobs:
-        table.append((cur, len(b)))
+        # an EMPTY sub-resource is (0, 0) in retail, not (cursor, 0) — five stages
+        # ship one, and getting this wrong is the only thing that stopped a repack
+        # being byte-identical.
+        table.append((cur if b else 0, len(b)))
         body += b
         cur += len(b)
         pad = (-cur) % align if align else 0
