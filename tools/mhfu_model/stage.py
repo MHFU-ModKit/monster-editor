@@ -175,6 +175,31 @@ class Overlay:
                 best = (run, P)
         return best[1] if best else None
 
+    def objects(self):
+        """The placed-object array at parameter object `+0x34`, count at `+0x3F`.
+
+        32-byte records — `{u32 flags; u32 kind; u32 id; u32 param; float x,y,z; u32}`.
+        1..4 per stage in 92 of the 267, positions inside the collision lattice, `kind`
+        always 6 in everything sampled. ⚠️ What they ARE is not decoded: the accessors
+        `P+0x34`/`P+0x3F` and `P+0x38`/`P+0x40` are two such (array, count) pairs, read
+        through the getters at overlay `+0xE0`/`+0x108`/`+0x130`/`+0x158`.
+        """
+        P = self.param_object()
+        if P is None:
+            return []
+        base = self.word(P + 0x34)
+        count = (self.word(P + 0x3C) >> 24) & 0xFF      # P+0x3F
+        if not base or not count:
+            return []
+        out = []
+        for k in range(count):
+            w = [self.word(base + 0x20 * k + 4 * j) for j in range(8)]
+            if any(v is None for v in w):
+                break
+            pos = struct.unpack("<3f", struct.pack("<3I", w[4], w[5], w[6]))
+            out.append({"flags": w[0], "kind": w[1], "id": w[2], "param": w[3], "pos": pos})
+        return out
+
     def surface_table(self, count=8):
         """[u32] surface-property bitmasks, or None if there is no param object.
 
