@@ -42,20 +42,6 @@ def _context():
     return ctx
 
 
-try:
-    import pytest
-
-    @pytest.fixture(scope="module")
-    def ctx():
-        """The GL tests below take `ctx` explicitly so `main()` can run them as a script;
-        under pytest this fixture hands them the same context, or skips the lot without GL."""
-        c = _context()
-        if c is None:
-            pytest.skip("no GL on this machine (moderngl missing or no context)")
-        return c
-except ImportError:                       # run as a script, without pytest installed
-    pass
-
 
 # --------------------------------------------------------------------------- #
 # no GL needed
