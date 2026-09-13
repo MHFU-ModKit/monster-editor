@@ -826,7 +826,8 @@ def group_budget(g: VGroup, first: int = 0, count: Optional[int] = None) -> dict
 
 def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
                count: Optional[int] = None, collapse: bool = True,
-               reindex: bool = True, uv: str = "keep", colour=None) -> dict:
+               reindex: bool = True, uv: str = "keep", colour=None,
+               prims: Optional[Sequence[int]] = None) -> dict:
     """Pack a whole mesh into the primitives a group ALREADY has. No PRIM word moves.
 
     `sculpt_group` hands each primitive one triangle and collapses the rest of its
@@ -854,6 +855,10 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
 
     `colour` = (r, g, b[, a]) writes the vertex colour, which on a stage IS the
     lighting: there are no normals.
+
+    `prims` names the primitives to pack into EXPLICITLY (any set, not a range) — the
+    map editor's way: the primitives of the objects the user chose to sacrifice. It
+    overrides `first` / `count`.
     """
     vt = g.vtype
     if not g.prims:
@@ -862,7 +867,12 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
         raise ValueError("group %d position format %r unsupported"
                          % (g.rec_index, vt.pos_char))
     nprims = len(g.prims)
-    last_prim = nprims if count is None else min(nprims, first + count)
+    if prims is not None:
+        chosen = sorted({int(x) for x in prims if 0 <= int(x) < nprims})
+    else:
+        last_prim = nprims if count is None else min(nprims, first + count)
+        chosen = list(range(first, last_prim))
+    chosen_set = set(chosen)
     offs, at = [], 0
     for _w, _t, c in g.prims:
         offs.append(at)
@@ -870,7 +880,7 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
 
     keep = set()
     for pi in range(nprims):
-        if first <= pi < last_prim:
+        if pi in chosen_set:
             continue
         keep.update(g.indices[offs[pi]:offs[pi] + g.prims[pi][2]])
 
@@ -957,7 +967,7 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
                 put(s, P[vi], vi)
             return s
 
-        for pi in range(first, last_prim):
+        for pi in chosen:
             _w, ptype, c = g.prims[pi]
             lo = offs[pi]
             slots = list(idx[lo:lo + c])
@@ -1015,7 +1025,7 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
             placed += ntri
             touched += 1
             last = pi
-        return {"prims": last_prim - first, "used_prims": touched,
+        return {"prims": len(chosen), "used_prims": touched,
                 "triangles": placed, "skipped": skipped, "left": len(strp),
                 "verts_used": len(cache), "verts_free": len(pool),
                 "ran_out": ran_out, "_idx": idx, "_last": last}
@@ -1028,9 +1038,9 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
     keepset = set(keep)
     r = attempt(keepset)
     for _ in range(3):
-        stop = (r["_last"] + 1) if r["_last"] is not None else first
+        after = [pi for pi in chosen if r["_last"] is None or pi > r["_last"]]
         extra = set()
-        for pi in range(stop, last_prim):
+        for pi in after:
             extra.update(src_idx[offs[pi]:offs[pi] + g.prims[pi][2]])
         if extra <= keepset:
             break
@@ -1043,6 +1053,36 @@ def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
         r.pop("_idx")
     r.pop("_last")
     return r
+
+
+def clear_prims(g: VGroup, prims: Sequence[int]) -> int:
+    """Stop drawing SOME of a group's primitives — an object, not the whole group —
+    by collapsing each one's index entries onto its own first slot (a degenerate strip
+    draws nothing). Index bytes only: no GE word moves, the layout is byte-identical,
+    and the index buffer is honoured at area load (§4d). Returns how many collapsed.
+
+    The vertex slots those primitives owned are now free for `pack_group(prims=...)`;
+    nothing else changes, so a later `pack` into the same primitives is the "replace
+    this object with that shape" a map editor wants.
+    """
+    if g.shared_with is not None:
+        raise ValueError("group %d shares a GE block; clear the owner" % g.rec_index)
+    offs, at = [], 0
+    for _w, _t, c in g.prims:
+        offs.append(at)
+        at += c
+    idx = list(g.indices)
+    n = 0
+    for pi in sorted({int(x) for x in prims}):
+        if not 0 <= pi < len(g.prims):
+            continue
+        _w, _t, c = g.prims[pi]
+        lo = offs[pi]
+        if c:
+            idx[lo:lo + c] = [idx[lo]] * c
+            n += 1
+    g.indices = idx
+    return n
 
 
 def clear_group(g: VGroup, drop_vertices: bool = True,
