@@ -784,8 +784,8 @@ def load(data_dir, stage: int) -> Stage:
 # `game_sub.ovl` (file_00075, base 0x09C19000) carries the map table the stage
 # loader resolves through:
 #
-#   0x09CE470C   {u32 record_ptr, u32 flags}[32]   one row per MAP
-#   record       u16 stage_numbers[]               [0] = base camp / entry area
+#   0x09CE4708   {u32 area_count, u32 record_ptr}[32]   one row per MAP
+#   record       u16 stage_numbers[count]               [0] = base camp / entry area
 #   0x09CE4848   u16 per stage, stride 4           the tag-38 file the stage pulls
 #   0x089A9470   u16 pair per stage, stride 4      ambience .bd / .phd file ids (EBOOT)
 #
@@ -793,41 +793,36 @@ def load(data_dir, stage: int) -> Stage:
 # `[*(0x09A4F060) + 648]`.
 GAME_SUB_FILE = 75
 GAME_SUB_BASE = 0x09C19000
-MAP_TABLE_VA = 0x09CE470C
+# ⚠️ The table is {u32 area_count; u32 record_ptr}[32] and it starts at 0x09CE4708,
+# four bytes EARLIER than long assumed. Reading it as {record_ptr, flags} at
+# 0x09CE470C lands on the pointer by accident (0x4708 + 8i + 4) and makes the
+# "flags" field the NEXT row's count — which is why row 11 "flags" read 0x4 and
+# row 12 has exactly 4 areas. There is no flags field. The engine's own loop is
+# `0x088C7234` / `0x088C7780`: lw count, blez bail, lw ptr, then `slt i, count`
+# stepping the pointer by 2. It is a COUNT, not a terminator — six records run
+# straight into the next with no zero between them.
+MAP_TABLE_VA = 0x09CE4708
 MAP_TABLE_ROWS = 32
 STAGE_SND_TABLE_VA = 0x089A9470      # in the EBOOT, not game_sub
-MAP_RECORD_MAX = 16                  # largest allocation bucket seen (u16 slots)
 
 
 def map_table(data_dir):
-    """[(row, flags, [stage, ...])] read straight out of game_sub.ovl."""
+    """[(row, count, [stage, ...])] read straight out of game_sub.ovl.
+
+    The row's area list is bounded by the table's own `area_count`; rows 24 and 25
+    are empty (count 0, null pointer)."""
     d = read_extracted(data_dir, GAME_SUB_FILE)
     end = GAME_SUB_BASE + len(d)
 
     def u32(va): return struct.unpack_from("<I", d, va - GAME_SUB_BASE)[0]
     def u16(va): return struct.unpack_from("<H", d, va - GAME_SUB_BASE)[0]
 
-    rows = [(i, u32(MAP_TABLE_VA + 8 * i), u32(MAP_TABLE_VA + 8 * i + 4))
-            for i in range(MAP_TABLE_ROWS)]
-    starts = sorted({p for _, p, _ in rows if GAME_SUB_BASE <= p < end})
     out = []
-    for i, p, flags in rows:
-        if p not in starts:
-            out.append((i, flags, []))
+    for i in range(MAP_TABLE_ROWS):
+        count = u32(MAP_TABLE_VA + 8 * i)
+        ptr = u32(MAP_TABLE_VA + 8 * i + 4)
+        if count <= 0 or not (GAME_SUB_BASE <= ptr < end):
+            out.append((i, count, []))
             continue
-        # Records are allocated in 4/8/12/16-slot buckets and ZERO-TERMINATED, with
-        # the spare slots left as 0. Stage numbers run 1..266, so 0 is unambiguous.
-        # ⚠️ Bounding the LAST record by a fixed `p + 16` truncated it: row 31 really
-        # holds [257..266, 0, 0] and read as 8 entries, which made st265/st266 look
-        # like unreferenced stages. Bound by the next record, then cut at the
-        # terminator.
-        j = starts.index(p)
-        stop = starts[j + 1] if j + 1 < len(starts) else min(p + 2 * MAP_RECORD_MAX, end)
-        stages = []
-        for k in range((stop - p) // 2):
-            v = u16(p + 2 * k)
-            if v == 0:
-                break
-            stages.append(v)
-        out.append((i, flags, stages))
+        out.append((i, count, [u16(ptr + 2 * k) for k in range(count)]))
     return out
