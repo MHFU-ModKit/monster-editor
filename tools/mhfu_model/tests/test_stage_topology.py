@@ -32,7 +32,7 @@ DATA = os.path.join(os.path.dirname(__file__), "..", "..", "..",
 
 
 def _stage_pmos():
-    for n in sorted({s for _r, _f, ss in ST.map_table(DATA) for s in ss if s}):
+    for n in sorted({s for _r, _n, ss in ST.map_table(DATA) for s in ss}):
         s = ST.load(DATA, n)
         for k in (0, 2):
             blob = s.sub(k)
