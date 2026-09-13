@@ -404,7 +404,8 @@ def grow_group(g: VGroup, n_new: int, shift=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.
 
 
 def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
-                        weight_slot: int = 0, force_16bit: bool = False):
+                        weight_slot: int = 0, force_16bit: bool = False,
+                        src_indices=None):
     """Append author-supplied vertices + triangles to group g (the Blender path).
 
     `verts`  : list of dicts {x,y,z[, i,j,k normal][, u,v]} in ENGINE units / unit
@@ -414,9 +415,17 @@ def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
                (existing verts keep indices [0,vcount); new verts get [vcount, ...) in
                `verts` order — so a Blender face may reference old AND new verts).
 
+    `src_indices` : optional per-new-vertex index of an EXISTING vertex to inherit the
+               non-authored fields from (vertex colour, above all). Defaults to
+               vertex 0 for every new vertex. Stage PMOs carry no normals — their
+               VTYPE is (uv16, colour16, pos16, no normal, no weight) — so vertex
+               colour *is* the lighting, and inheriting it from the nearest
+               neighbour instead of from vertex0 is what keeps a new face from
+               reading as a flat bright patch.
+
     Unlike grow_group (synthetic ring), positions/normals/UVs are written ABSOLUTE
-    from `verts`. Color/other inherited fields come from vertex0. Auto-promotes to
-    16-bit indices past 256 verts. Adds ONE triangle-list PRIM for the new faces."""
+    from `verts`. Auto-promotes to 16-bit indices past 256 verts. Adds ONE
+    triangle-list PRIM for the new faces."""
     if g.shared_with is not None:
         raise ValueError("group %d shares a GE block; grow the owner" % g.rec_index)
     if g.vtype.index_char not in ("B", "H"):
@@ -442,15 +451,17 @@ def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
     if maxidx >= total:
         raise ValueError("triangle index %d out of range (have %d verts)"
                          % (maxidx, total))
-    src = bytes(g.vbuf[0:vt.vsize])
+    def _src(k):
+        i = 0 if src_indices is None else max(0, min(base - 1, src_indices[k]))
+        return bytes(g.vbuf[i * vt.vsize:(i + 1) * vt.vsize])
 
     def qpos(engine_units, axis):
         if not vt.bypass and vt.pos_char in ("b", "h"):
             return engine_units / scale[axis] * vt.pos_trans
         return engine_units
 
-    for vd in verts:
-        v = bytearray(src)
+    for k, vd in enumerate(verts):
+        v = bytearray(_src(k))
         if vt.pos_char in ("b", "h", "f"):
             _pack_comps(v, vt.pos_off, vt.pos_char,
                         [qpos(vd["x"], 0), qpos(vd["y"], 1), qpos(vd["z"], 2)])
@@ -480,12 +491,46 @@ def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
     g.prims.append((ret_widx, 3, len(flat)))
 
 
+def clear_group(g: VGroup, drop_vertices: bool = True) -> int:
+    """DELETE everything a vertex group draws: drop its PRIM words and its whole index
+    list. Returns the index-buffer bytes freed.
+
+    This is the one topology delete that is safe on a stage without re-encoding
+    anything. Removing SOME faces from a triangle strip would mean splitting the strip
+    (or re-emitting the group as a triangle list, which costs x1.74 on the index buffer
+    and can make a group BIGGER); dropping the group whole costs nothing and frees
+    space. The vertex buffer stays — nothing reads it with no PRIM left, and keeping it
+    means `VADDR` still points somewhere valid.
+
+    The freed bytes are what pays for an `grow_group_explicit` elsewhere when the PMO
+    has to come out at its ORIGINAL SIZE — which it does whenever it is going to be
+    injected into a resident PAC rather than written to a file.
+    """
+    if g.shared_with is not None:
+        raise ValueError("group %d shares a GE block; clear the owner" % g.rec_index)
+    freed = (len(g.indices) * _COMP_SIZE[g.vtype.index_char or "H"]
+             + (len(g.vbuf) if drop_vertices else 0))
+    g.indices = []
+    g.words = [w for w in g.words if (w >> 24) != 0x04]
+    g.prims = []
+    if drop_vertices:
+        g.vbuf = bytearray()
+    return freed
+
+
 # --------------------------------------------------------------------------- #
 # Serialize
 # --------------------------------------------------------------------------- #
-def serialize(blob: bytes, header: List[int], groups: List[VGroup]) -> bytes:
+def serialize(blob: bytes, header: List[int], groups: List[VGroup],
+              pad_to: Optional[int] = None) -> bytes:
     """Rebuild the geBase region from `groups`, patch the vgroup table + header size,
-    keep everything before geBase byte-identical. Returns the new PMO bytes."""
+    keep everything before geBase byte-identical. Returns the new PMO bytes.
+
+    `pad_to` zero-pads the result to exactly that many bytes and reports the padded
+    length in h[0] (retail already pads to 16 the same way). Use it to hold a PMO at
+    its ORIGINAL size after an edit that changed the length — the only way an edited
+    mesh can be written over a RESIDENT PAC, where growing sub[0] would run into
+    sub[1]. Raises if the edit does not fit."""
     ge_base = header[H_GEBASE]
     vg_tab = header[H_VGTAB]
     out = bytearray(blob[:ge_base])     # header + all tables (unchanged so far)
@@ -532,15 +577,126 @@ def serialize(blob: bytes, header: List[int], groups: List[VGroup]) -> bytes:
         struct.pack_into("<2BH3I", out, vo, *rec)
 
     out += region
-    # header size h[0]
-    new_size = len(out)
-    struct.pack_into("<I", out, HEADER_OFF + 0, new_size)
+    # Pad to the 16-byte boundary and count the pad in h[0]. Retail does this on every
+    # shipped PMO: without it the region ends 2..14 bytes short and the round trip is
+    # off by exactly that tail — which is the whole difference between "re-encodes" and
+    # "re-encodes byte for byte". h[0] is the padded size, not the used size.
+    while len(out) % ALIGN:
+        out.append(0)
+    if pad_to is not None:
+        if len(out) > pad_to:
+            raise ValueError("edited PMO is %d bytes, will not fit %d (free space by "
+                             "clear_group()ing a vgroup)" % (len(out), pad_to))
+        out += b"\x00" * (pad_to - len(out))
+    struct.pack_into("<I", out, HEADER_OFF + 0, len(out))
     return bytes(out)
 
 
+def _block_size(g: VGroup) -> int:
+    """Bytes one vgroup's [GE list | vertex buffer | index buffer] block occupies."""
+    vbuf_off = _align(len(g.words) * 4)
+    ibuf_off = _align(vbuf_off + len(g.vbuf))
+    isz = (len(g.indices) * _COMP_SIZE[g.vtype.index_char]) if g.vtype.index_char else 0
+    return ibuf_off + isz
+
+
+def serialize_inplace(blob: bytes, header: List[int], groups: List[VGroup]):
+    """Re-emit the geBase region KEEPING every block that still fits at its ORIGINAL
+    offset, and return (bytes, moved_rec_indices). Same length as `blob`, always.
+
+    `serialize` re-lays the whole region contiguously, which is right for a file but
+    wrong for a RESIDENT PAC: clearing one vgroup shifts every block after it, so the
+    byte diff against the original is most of the mesh. Editing a running game means
+    writing that diff over the debugger, repeatedly, to hold it across an area load —
+    75 % of a 280 KB sub-resource is not something you can hold at 20 ms.
+
+    Here a block that got smaller (`clear_group`) stays put and leaves a HOLE, a block
+    that is unchanged stays put byte-for-byte, and only a block that GREW is relocated,
+    into the first hole it fits. Clear one group and grow a small one and the diff is
+    a couple of KB.
+
+    🔴 The returned `moved` list must be EMPTY for anything written into a resident PAC.
+    The geBase region is load-time, but the engine reads the vgroup TABLE while drawing:
+    14 bytes of changed I3/I4/I5 corrupt the frame the instant they land (measured in
+    Pokke village, and it reverts exactly when the original bytes go back). Relocation is
+    fine in a file and fine once the area reloads — not on a PAC that is on screen. To
+    avoid it entirely, `clear_group` a vgroup and grow THAT SAME vgroup: its block keeps
+    its offset and is now mostly empty.
+    """
+    ge_base = header[H_GEBASE]
+    region_len = len(blob) - ge_base
+    owners = sorted((g for g in groups if g.shared_with is None), key=lambda g: g.geoff)
+    extents = {}
+    for i, g in enumerate(owners):
+        end = owners[i + 1].geoff if i + 1 < len(owners) else region_len
+        extents[g.rec_index] = (g.geoff, end)
+
+    placed, moved, holes = {}, [], []
+    for g in owners:
+        lo, hi = extents[g.rec_index]
+        need = _block_size(g)
+        if need <= hi - lo:
+            placed[g.rec_index] = lo
+            if hi - (lo + _align(need)) > 0:
+                holes.append([lo + _align(need), hi])
+        else:
+            moved.append(g)
+            holes.append([lo, hi])
+    holes.sort()
+    merged = []
+    for h in holes:                     # coalesce adjacent holes
+        if merged and merged[-1][1] == h[0]:
+            merged[-1][1] = h[1]
+        else:
+            merged.append(list(h))
+    for g in moved:
+        need = _block_size(g)
+        for h in merged:
+            start = _align(h[0])
+            if start + need <= h[1]:
+                placed[g.rec_index] = start
+                h[0] = start + need
+                break
+        else:
+            raise ValueError("vgroup %d needs %d bytes and no hole is that big — "
+                             "clear_group() another group to make room"
+                             % (g.rec_index, need))
+
+    region = bytearray(blob[ge_base:])
+    for g in owners:
+        geoff = placed[g.rec_index]
+        words = list(g.words)
+        vbuf_off = geoff + _align(len(words) * 4)
+        ibuf_off = _align(vbuf_off + len(g.vbuf))
+        words[g.vaddr_widx] = 0x01000000 | ((vbuf_off - geoff) & 0xFFFFFF)
+        if g.iaddr_widx is not None:
+            words[g.iaddr_widx] = 0x02000000 | ((ibuf_off - geoff) & 0xFFFFFF)
+        region[geoff:geoff + len(words) * 4] = struct.pack("<%dI" % len(words), *words)
+        region[vbuf_off:vbuf_off + len(g.vbuf)] = g.vbuf
+        if g.vtype.index_char and g.indices:
+            packed = struct.pack("<%d%s" % (len(g.indices), g.vtype.index_char),
+                                 *g.indices)
+            region[ibuf_off:ibuf_off + len(packed)] = packed
+
+    out = bytearray(blob[:ge_base])
+    for g in groups:
+        rec = list(g.rec)
+        geoff = placed[g.rec_index if g.shared_with is None else g.shared_with]
+        rec[3] = geoff
+        rec[4] = geoff + _align(len(g.words) * 4)
+        rec[5] = _align(rec[4] + len(g.vbuf))
+        struct.pack_into("<2BH3I", out, header[H_VGTAB] + g.rec_index * 0x10, *rec)
+    out += region
+    assert len(out) == len(blob), (len(out), len(blob))
+    struct.pack_into("<I", out, HEADER_OFF + 0, len(out))
+    return bytes(out), [g.rec_index for g in moved]
+
+
 def roundtrip_region(blob: bytes) -> bytes:
-    """Parse + serialize with NO edits — should yield a VALID PMO that re-parses to
-    the same vgroup geometry (NOT byte-identical: layout is rebuilt). Used by tests."""
+    """Parse + serialize with NO edits. This is BYTE-IDENTICAL on everything shipped —
+    all 282 stage terrain/props PMOs and the monster set — because the re-layout here
+    reproduces retail's exactly. Treat any diff as a bug in the encoder, not as
+    expected churn. Used by tests."""
     header, groups = parse(blob)
     return serialize(blob, header, groups)
 

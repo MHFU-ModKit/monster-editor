@@ -103,7 +103,13 @@ def run_ge(buf: io.BytesIO, scale):
                 r = range(0, index_count, 3)
             for i in r:
                 face = {"v3": index[i + 2] + index_offset}
-                if ((i + face_order) % 2) or ((primative_type == 3) and face_order):
+                # A triangle LIST does not alternate winding — only a strip/fan does.
+                # The old parity term made every other triangle of a list come out
+                # mirrored. Retail never showed it (all 479 shipped lists are a single
+                # triangle, so i is always 0), but the topology-grow path emits
+                # multi-triangle lists and tripped it on the first quad.
+                swap = face_order if primative_type == 3 else (i + face_order) % 2
+                if swap:
                     face["v2"] = index[i] + index_offset
                     face["v1"] = index[i + 1] + index_offset
                 else:

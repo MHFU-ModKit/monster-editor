@@ -24,8 +24,10 @@ import os
 import re
 import sys
 
-# PAC file index = em_id + 0x17AB (em01=file_06060, Tigrex em75=file_06134). The
-# engine's loader fileId is exactly this index, so the inject filename carries it.
+# PAC file index: an EXTRACTED monster PAC is `file_0{em_id + 6110}` (Tigrex em75 =
+# file_06185); the ENGINE asks for em_id + 6111, one higher, because extract_iso.py
+# reads the TOC from offset 4. The old `+ 0x17AB` here was wrong — see CLAUDE.md §4.
+# Stage PACs are the same table, ids 5808..6071 (`mhfu_model.stage.pac_file`).
 _NAME_RE = re.compile(r"file_(\d{4,6})\b")
 
 # PPSSPP memstick roots, most-likely first. The PRX sees `ms0:/PSP/...`.
