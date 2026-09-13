@@ -199,6 +199,14 @@ def _walk(blob, header, scale, stride):
         header[5], header[7], header[8], header[11], header[12])
     if mesh_tab + nmesh * stride > fsz:
         return None, -1, set()
+    # 🔴 For the 0x18-stride layout the material is NOT `mat_tab[vg[0]]`. `vg[0]` is the
+    # group's ordinal within its mesh (0..count-1, always), and the real binding is a
+    # u8 PER VGROUP at header[9] (`vg_end`, the bytes between the vgroup table and the
+    # material table): `material_index = mat_map[vgroup_index]`, with `header[6]` the
+    # material count it indexes. Verified 487/487 stage PMOs (every byte < header[6],
+    # zero padding to `mat_tab`); only 78 of them are the identity map the old lookup
+    # assumed, and 409 drew some group with the wrong texture. docs/PMO_MODEL_FORMAT.md.
+    mat_map_off, nmat = header[9], header[6]
     buf = io.BytesIO(blob)
     groups: List[MeshGroup] = []
     total = 0
@@ -212,7 +220,7 @@ def _walk(blob, header, scale, stride):
                 mat_base, vg_count, vg_start = mh[5], mh[6], mh[7]
             else:
                 vg_count, vg_start = struct.unpack_from("2H", blob, m + 0x10)
-                mat_base = 0
+                mat_base = None                       # -> the per-vgroup map
             for j in range(vg_count):
                 vgi = vg_start + j
                 vo = vg_tab + vgi * 0x10
@@ -220,7 +228,11 @@ def _walk(blob, header, scale, stride):
                     return None, -1, set()
                 vg = struct.unpack_from("2BH3I", blob, vo)
                 material = 0
-                mo = mat_tab + (mat_base + vg[0]) * 16
+                if mat_base is None:
+                    mi = blob[mat_map_off + vgi] if mat_map_off + vgi < fsz else nmat
+                    mo = mat_tab + mi * 16 if mi < nmat else fsz
+                else:
+                    mo = mat_tab + (mat_base + vg[0]) * 16
                 if mo + 16 <= fsz:
                     material = struct.unpack_from("4I", blob, mo)[2]
                 ge = ge_base + vg[3]
