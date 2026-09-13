@@ -403,6 +403,29 @@ def grow_group(g: VGroup, n_new: int, shift=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.
     g.prims.append((ret_widx, 3, len(tri)))
 
 
+def _prim_slots(g: VGroup):
+    """Word indices of the PRIM commands in a GE display list."""
+    return [i for i, w in enumerate(g.words) if (w >> 24) == 0x04]
+
+
+def _insert_prim_after_the_last_one(g: VGroup, prim_word: int) -> int:
+    """Put a new PRIM where PRIMs already are — never at the end of the list.
+
+    🔴 The order of a GE list is not decoration. These lists open with ORIGIN_ADDR
+    (0x14), which latches the list's own address so that VADDR/IADDR can be written
+    relative to it, and most of them CLOSE with OFFSETADDR 0 (0x13), which throws that
+    origin away again. Append a PRIM before the RET and it lands on the far side of
+    that reset: the vertex pointer resolves to a raw offset near zero, the GPU draws
+    nothing at all, and the edit reads as "my geometry never appeared" with a PMO that
+    decodes perfectly. Measured in the snowy base camp — 168 triangles, correct
+    positions, invisible.
+    """
+    slots = _prim_slots(g)
+    at = (slots[-1] + 1) if slots else max(0, len(g.words) - 1)
+    g.words.insert(at, prim_word)
+    return at
+
+
 def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
                         weight_slot: int = 0, force_16bit: bool = False,
                         src_indices=None):
@@ -485,13 +508,207 @@ def grow_group_explicit(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
     for a, b, c in tris:
         flat += [a, b, c]
     g.indices.extend(flat)
-    ret_widx = len(g.words) - 1
     prim_word = 0x04000000 | (3 << 16) | (len(flat) & 0xFFFF)
-    g.words.insert(ret_widx, prim_word)
-    g.prims.append((ret_widx, 3, len(flat)))
+    at = _insert_prim_after_the_last_one(g, prim_word)
+    g.prims.append((at, 3, len(flat)))
 
 
-def clear_group(g: VGroup, drop_vertices: bool = True) -> int:
+def _pad_words_to(g: VGroup, n_words: int) -> None:
+    """Pad a GE display list back to `n_words` with NOPs, inserted before the RET.
+
+    Opcode 0x00 is NOP, so the padding draws nothing — but it keeps `len(g.words)`
+    constant, and that is the whole point: every downstream offset in the block
+    (`vbuf_off = geoff + align(len(words)*4)`, then `ibuf_off`) is derived from the
+    word count, so a GE list that shrinks silently moves the vertex and index buffers
+    and rewrites the vgroup record's I4/I5. In a file that is fine. In a RESIDENT PAC
+    it is the documented instant-garbage failure (docs/STAGE_MAP_FORMAT.md §4b).
+    """
+    if len(g.words) > n_words:
+        raise ValueError("group %d GE list grew to %d words, cannot pad back to %d"
+                         % (g.rec_index, len(g.words), n_words))
+    at = len(g.words) - 1               # before the RET
+    for _ in range(n_words - len(g.words)):
+        g.words.insert(at, 0x00000000)
+
+
+def overwrite_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
+                    weight_slot: int = 0, src_indices=None) -> None:
+    """REPLACE what a vgroup draws, reusing the buffers it already has, IN PLACE.
+
+    The resident-safe sibling of `clear_group` + `grow_group_explicit`. Those two
+    change the group's GE-list length and its vertex count, which moves the vertex and
+    index buffers inside the block and therefore rewrites I4/I5 in the vgroup table —
+    and the engine reads that table while it draws, so the frame corrupts the instant
+    the write lands. Here nothing about the layout changes at all:
+
+      * the new vertices are written OVER the first `len(verts)` slots of the existing
+        vertex buffer, which keeps its size;
+      * the new indices go at the existing index buffer's offset and must fit in it;
+      * the GE list is padded back to its original word count with NOPs.
+
+    So `_block_size(g)` is unchanged, `serialize_inplace` reports nothing moved, and
+    the vgroup table comes out byte-identical — the edit is only in the geBase region,
+    which is load-time. That is the one shape of mesh edit that can sit in a resident
+    PAC without being visible as corruption before the area reloads.
+
+    `verts`/`tris`/`src_indices` are as `grow_group_explicit`, except that the triangle
+    indices are relative to the NEW vertex list (0..len(verts)-1) and `src_indices`
+    defaults to slot k for vertex k — i.e. each new vertex inherits the colour and UV
+    of the vertex it overwrites.
+    """
+    if g.shared_with is not None:
+        raise ValueError("group %d shares a GE block; overwrite the owner" % g.rec_index)
+    if g.vtype.index_char not in ("B", "H"):
+        raise ValueError("group %d index fmt %r unsupported" % (g.rec_index,
+                                                                g.vtype.index_char))
+    if not g.vbuf:
+        raise ValueError("group %d has no vertex buffer" % g.rec_index)
+    vt = g.vtype
+    n_words = len(g.words)
+    have_bytes = len(g.indices) * _COMP_SIZE[vt.index_char]
+    if len(verts) > g.vcount:
+        raise ValueError("group %d holds %d vertices, cannot take %d without growing "
+                         "the buffer" % (g.rec_index, g.vcount, len(verts)))
+    need_bytes = len(tris) * 3 * _COMP_SIZE[vt.index_char]
+    if need_bytes > have_bytes:
+        raise ValueError("group %d index buffer is %d bytes, %d triangles need %d"
+                         % (g.rec_index, have_bytes, len(tris), need_bytes))
+    maxidx = max(i for t in tris for i in t)
+    if maxidx >= len(verts):
+        raise ValueError("triangle index %d out of range (%d vertices)"
+                         % (maxidx, len(verts)))
+
+    def qpos(engine_units, axis):
+        if not vt.bypass and vt.pos_char in ("b", "h"):
+            return engine_units / scale[axis] * vt.pos_trans
+        return engine_units
+
+    for k, vd in enumerate(verts):
+        slot = k if src_indices is None else max(0, min(g.vcount - 1, src_indices[k]))
+        v = bytearray(g.vbuf[slot * vt.vsize:(slot + 1) * vt.vsize])
+        if vt.pos_char in ("b", "h", "f"):
+            _pack_comps(v, vt.pos_off, vt.pos_char,
+                        [qpos(vd["x"], 0), qpos(vd["y"], 1), qpos(vd["z"], 2)])
+        if vt.uv_off is not None and "u" in vd:
+            _pack_comps(v, vt.uv_off, vt.uv_char,
+                        [vd["u"] * vt.uv_trans, vd["v"] * vt.uv_trans])
+        if vt.wt_off is not None and vt.wt_count:
+            ws = [0.0] * vt.wt_count
+            ws[max(0, min(vt.wt_count - 1, weight_slot))] = 1.0 * vt.wt_trans
+            _pack_comps(v, vt.wt_off, vt.wt_char, ws)
+        g.vbuf[k * vt.vsize:(k + 1) * vt.vsize] = v
+
+    g.indices = [i for t in tris for i in t]
+    slots = _prim_slots(g)
+    if not slots:
+        raise ValueError("group %d has no PRIM to replace" % g.rec_index)
+    # Overwrite the FIRST PRIM and NOP the others, rather than stripping and
+    # re-appending: every other command keeps its position, so the ORIGIN_ADDR /
+    # OFFSETADDR bracket still encloses the draw (see _insert_prim_after_the_last_one),
+    # and the word count is unchanged for free.
+    g.words[slots[0]] = 0x04000000 | (3 << 16) | (len(g.indices) & 0xFFFF)
+    for i in slots[1:]:
+        g.words[i] = 0x00000000
+    g.prims = [(slots[0], 3, len(g.indices))]
+    _pad_words_to(g, n_words)
+
+
+def set_vertex_positions(g: VGroup, items, scale=(1.0, 1.0, 1.0)) -> None:
+    """Move vertices that are already there. `items` = [(index, (x, y, z)), ...] in
+    ENGINE units.
+
+    The one stage edit that is resident-safe for free: it writes over the position
+    field of existing vertices, so no buffer changes length, no offset moves and the
+    vgroup table is untouched. It is also the only way to move an object in a stage
+    mesh — a stage PMO has no object boundaries below the vertex group, so "the crate"
+    is whatever set of vertices you select, and a selection that cuts through a face
+    stretches it instead of moving it. Pick the selection so that no face straddles
+    the edge (see `stage_tool.py edit`, which reports exactly that count).
+    """
+    vt = g.vtype
+    if vt.pos_char not in ("b", "h", "f"):
+        raise ValueError("group %d position format %r unsupported"
+                         % (g.rec_index, vt.pos_char))
+
+    def qpos(engine_units, axis):
+        if not vt.bypass and vt.pos_char in ("b", "h"):
+            return engine_units / scale[axis] * vt.pos_trans
+        return engine_units
+
+    for i, (x, y, z) in items:
+        if not 0 <= i < g.vcount:
+            raise ValueError("vertex %d out of range (group %d has %d)"
+                             % (i, g.rec_index, g.vcount))
+        v = bytearray(g.vbuf[i * vt.vsize:(i + 1) * vt.vsize])
+        _pack_comps(v, vt.pos_off, vt.pos_char,
+                    [qpos(x, 0), qpos(y, 1), qpos(z, 2)])
+        g.vbuf[i * vt.vsize:(i + 1) * vt.vsize] = v
+
+
+def sculpt_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
+                 first: int = 0, collapse: bool = True) -> dict:
+    """Re-shape a vertex group into arbitrary geometry WITHOUT touching a PRIM word.
+
+    The safest edit there is, and the only one measured to actually show up in a
+    running quest area. `overwrite_group` rewrites the group's PRIM to one triangle
+    list; that decodes correctly, survives every offline check, and draws NOTHING in
+    game — whatever the engine builds at load, a PRIM this side of it is not enough.
+    Vertex data, on the other hand, is honoured: moving a group's vertices moves what
+    is on screen (the base camp's supply box, 2026-09-13).
+
+    So this keeps every PRIM exactly as it is and only moves vertices. Each existing
+    primitive is handed ONE triangle from `tris`: its first three vertex slots get the
+    triangle's corners and any remaining slot is collapsed onto the last corner, which
+    makes the rest of that strip degenerate and therefore invisible. Primitives past
+    the end of `tris` collapse to a point.
+
+    The budget is one triangle per PRIM, not per index — g9 of st098 has 158 four-vertex
+    strips, so 158 triangles. Returns {"prims", "used", "spare"}.
+
+    `first` starts at that PRIM instead of 0, and `collapse=False` leaves every PRIM the
+    shape did not need exactly as it was. Together they carve the new object out of a
+    CORNER of a big group's triangle budget and leave the rest of it standing — which is
+    how you get an opaque-textured object without flattening the scenery that supplies
+    the texture.
+    """
+    vt = g.vtype
+    if not g.prims:
+        raise ValueError("group %d draws nothing to sculpt" % g.rec_index)
+
+    def qpos(engine_units, axis):
+        if not vt.bypass and vt.pos_char in ("b", "h"):
+            return engine_units / scale[axis] * vt.pos_trans
+        return engine_units
+
+    def put(slot, xyz):
+        v = bytearray(g.vbuf[slot * vt.vsize:(slot + 1) * vt.vsize])
+        _pack_comps(v, vt.pos_off, vt.pos_char,
+                    [qpos(xyz[0], 0), qpos(xyz[1], 1), qpos(xyz[2], 2)])
+        g.vbuf[slot * vt.vsize:(slot + 1) * vt.vsize] = v
+
+    at = sum(c for _w, _t, c in g.prims[:first])
+    used = 0
+    for _widx, _ptype, count in g.prims[first:]:
+        slots = g.indices[at:at + count]
+        at += count
+        if len(slots) < 3:
+            continue
+        if used >= len(tris) and not collapse:
+            break
+        if used < len(tris):
+            tri = [verts[i] for i in tris[used]]
+            pts = [(v["x"], v["y"], v["z"]) for v in tri]
+            used += 1
+        else:
+            pts = [(verts[0]["x"], verts[0]["y"], verts[0]["z"])] * 3
+        for k, slot in enumerate(slots):
+            put(slot, pts[k] if k < 3 else pts[2])
+    return {"prims": len(g.prims) - first, "used": used,
+            "spare": len(g.prims) - first - used}
+
+
+def clear_group(g: VGroup, drop_vertices: bool = True,
+                keep_layout: bool = False) -> int:
     """DELETE everything a vertex group draws: drop its PRIM words and its whole index
     list. Returns the index-buffer bytes freed.
 
@@ -502,6 +719,11 @@ def clear_group(g: VGroup, drop_vertices: bool = True) -> int:
     space. The vertex buffer stays — nothing reads it with no PRIM left, and keeping it
     means `VADDR` still points somewhere valid.
 
+    `keep_layout=True` pads the GE list back to its original word count with NOPs and
+    frees NOTHING. That is the right call for a RESIDENT PAC: a shrinking GE list moves
+    the vertex/index buffers and rewrites the vgroup record, which corrupts the frame on
+    the spot. See `overwrite_group`.
+
     The freed bytes are what pays for an `grow_group_explicit` elsewhere when the PMO
     has to come out at its ORIGINAL SIZE — which it does whenever it is going to be
     injected into a resident PAC rather than written to a file.
@@ -511,6 +733,14 @@ def clear_group(g: VGroup, drop_vertices: bool = True) -> int:
     freed = (len(g.indices) * _COMP_SIZE[g.vtype.index_char or "H"]
              + (len(g.vbuf) if drop_vertices else 0))
     g.indices = []
+    if keep_layout:
+        # Free nothing on purpose: NOP the PRIMs where they stand. The block keeps its
+        # exact shape, the vgroup record does not move, and no other command changes
+        # position. That is what a resident PAC needs.
+        for i in _prim_slots(g):
+            g.words[i] = 0x00000000
+        g.prims = []
+        return 0
     g.words = [w for w in g.words if (w >> 24) != 0x04]
     g.prims = []
     if drop_vertices:
