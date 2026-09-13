@@ -72,6 +72,11 @@ class VType:
     wt_char: Optional[str] = None      # 'B'/'H'/'f'
     wt_count: int = 0                  # number of weight (bone-palette) components
     wt_trans: float = 1.0
+    # colour. Stage vertices carry NO normal, so this field IS the lighting
+    # (docs/STAGE_MAP_FORMAT.md §4b) — writing it is the only way to shade new geometry.
+    col_off: Optional[int] = None
+    col_char: Optional[str] = None     # 'H' (5650/5551/4444) or 'I' (8888)
+    col_fmt: int = 0                   # the raw VTYPE colour enum, 4..7
 
 
 def decode_vtype(word: int) -> VType:
@@ -108,8 +113,10 @@ def decode_vtype(word: int) -> VType:
         uv_trans = 1 if bypass else (None, 0x80, 0x8000, 1)[texture]
         uv_off = field(2, uv_char)
     color = (word >> 2) & 7
+    col_off = col_char = None
     if color:
-        field(1, (None, None, None, None, "H", "H", "H", "I")[color])
+        col_char = (None, None, None, None, "H", "H", "H", "I")[color]
+        col_off = field(1, col_char)
     normal = (word >> 5) & 3
     nrm_off = nrm_char = None
     nrm_trans = 1.0
@@ -140,7 +147,8 @@ def decode_vtype(word: int) -> VType:
                  pos_trans=pos_trans,
                  uv_off=uv_off, uv_char=uv_char, uv_trans=uv_trans,
                  nrm_off=nrm_off, nrm_char=nrm_char, nrm_trans=nrm_trans,
-                 wt_off=wt_off, wt_char=wt_char, wt_count=wt_count, wt_trans=wt_trans)
+                 wt_off=wt_off, wt_char=wt_char, wt_count=wt_count, wt_trans=wt_trans,
+                 col_off=col_off, col_char=col_char, col_fmt=color)
 
 
 def _through_pos(off, position):
@@ -705,6 +713,336 @@ def sculpt_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0),
             put(slot, pts[k] if k < 3 else pts[2])
     return {"prims": len(g.prims) - first, "used": used,
             "spare": len(g.prims) - first - used}
+
+
+# --------------------------------------------------------------------------- #
+# Packing a whole mesh into the primitives a group already has
+# --------------------------------------------------------------------------- #
+def pack_colour(rgba, fmt: int) -> int:
+    """(r, g, b, a) 0..255 -> the GE colour word for VTYPE colour enum `fmt`."""
+    r, g, b, a = (list(rgba) + [255, 255, 255, 255])[:4]
+    if fmt == 4:                                   # BGR 5650
+        return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11)
+    if fmt == 5:                                   # ABGR 5551
+        return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((1 if a >= 128 else 0) << 15)
+    if fmt == 6:                                   # ABGR 4444
+        return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12)
+    if fmt == 7:                                   # ABGR 8888
+        return r | (g << 8) | (b << 16) | (a << 24)
+    raise ValueError("no colour field (VTYPE colour enum %d)" % fmt)
+
+
+class _Stripper:
+    """Greedy triangle-strip builder that hands out strips of a REQUESTED length.
+
+    The shape of the problem is unusual: we are not free to choose the primitives, we
+    are handed a fixed list of them (`g.prims`) and each one draws exactly `count`
+    vertices. So the stripifier is asked for "a strip of at most N vertices" rather
+    than for its own idea of a good decomposition — a 4-slot strip is a quad, a 3-slot
+    strip is one triangle, and whatever is left over goes to the next primitive.
+
+    Winding follows the GE rule (triangle k is (v[k], v[k+1], v[k+2]) for even k and
+    (v[k+1], v[k], v[k+2]) for odd k), so every triangle in a strip comes out with the
+    source mesh's own winding and none of them is back-face culled away.
+    """
+
+    def __init__(self, tris):
+        self.tris = list(tris)
+        self.alive = set(range(len(self.tris)))
+        self.by_edge = {}
+        for i, (a, b, c) in enumerate(self.tris):
+            for e in ((a, b), (b, c), (c, a)):
+                self.by_edge.setdefault(e, []).append(i)
+
+    def __len__(self):
+        return len(self.alive)
+
+    def _third(self, i, u, v):
+        for x in self.tris[i]:
+            if x != u and x != v:
+                return x
+        return self.tris[i][2]
+
+    def strip(self, cap):
+        """<= `cap` vertex ids, consuming `cap - 2` triangles when the mesh allows."""
+        if not self.alive or cap < 3:
+            return None
+        i = min(self.alive)
+        self.alive.discard(i)
+        a, b, c = self.tris[i]
+        out = [a, b, c]
+        k = 1
+        while len(out) < cap:
+            p, q = out[-2], out[-1]
+            want = (q, p) if (k & 1) else (p, q)
+            nxt = None
+            for t in self.by_edge.get(want, ()):
+                if t in self.alive:
+                    nxt = t
+                    break
+            if nxt is None:
+                break
+            self.alive.discard(nxt)
+            out.append(self._third(nxt, p, q))
+            k += 1
+        return out
+
+    def loose(self, n):
+        """`n` independent triangles, for a tri-LIST primitive."""
+        out = []
+        while self.alive and len(out) < n:
+            i = min(self.alive)
+            self.alive.discard(i)
+            out.append(self.tris[i])
+        return out
+
+
+def group_budget(g: VGroup, first: int = 0, count: Optional[int] = None) -> dict:
+    """How much geometry a group's existing primitives can be made to draw.
+
+    `tri` is the one-triangle-per-PRIM budget `sculpt_group` used; `strip` is what
+    `pack_group` gets by filling each strip to its own length. `verts` caps a packed
+    mesh's vertex count, because a packed vertex needs a vertex slot of its own.
+    """
+    last = len(g.prims) if count is None else min(len(g.prims), first + count)
+    sel = g.prims[first:last]
+    offs, at = [], 0
+    for _w, _t, c in g.prims:
+        offs.append(at)
+        at += c
+    keep = set()
+    for pi in range(len(g.prims)):
+        if first <= pi < last:
+            continue
+        keep.update(g.indices[offs[pi]:offs[pi] + g.prims[pi][2]])
+    return {
+        "prims": len(sel),
+        "slots": sum(c for _w, _t, c in sel),
+        "tri": sum(1 for _w, _t, c in sel if c >= 3),
+        "strip": sum((c - 2) if t == 4 else (c // 3) for _w, t, c in sel if c >= 3),
+        "verts": g.vcount - len(keep),
+    }
+
+
+def pack_group(g: VGroup, verts, tris, scale=(1.0, 1.0, 1.0), first: int = 0,
+               count: Optional[int] = None, collapse: bool = True,
+               reindex: bool = True, uv: str = "keep", colour=None) -> dict:
+    """Pack a whole mesh into the primitives a group ALREADY has. No PRIM word moves.
+
+    `sculpt_group` hands each primitive one triangle and collapses the rest of its
+    strip; that wastes most of the budget, because a stage strip is 4-11 vertices long
+    and a 4-vertex strip draws a quad, not a triangle. This fills them: st098's g11
+    goes from 1 168 triangles to 3 007, g9 from 158 to 316.
+
+    Two modes, and the difference is whether the INDEX buffer may be rewritten:
+
+    * `reindex=True` (default) re-points the group's index entries at vertex slots of
+      our choosing. Slots are handed out per source vertex, so a shared mesh vertex
+      costs one slot however many triangles use it, and nothing in the group can
+      collide with anything else in it. Index bytes are geBase data, exactly like the
+      vertex bytes that are already proven to be honoured at area load.
+    * `reindex=False` writes vertex POSITIONS ONLY — the strictly-proven edit (the
+      snowy base camp's supply box moved that way). It has to skip any primitive whose
+      slots share a vertex with another primitive, because two primitives that share a
+      vertex cannot be given two different positions for it; `skipped` reports how many.
+
+    `uv`: "keep" leaves each slot's texture coordinate alone (the packed mesh wears a
+    scrambled patch of the group's own texture, which is what the proven cube did),
+    "obj" takes u/v off the source vertices, "planar" projects world position onto the
+    mesh's two widest axes and maps it into the UV box the group already occupies — so
+    the result stays on texels that page is known to have.
+
+    `colour` = (r, g, b[, a]) writes the vertex colour, which on a stage IS the
+    lighting: there are no normals.
+    """
+    vt = g.vtype
+    if not g.prims:
+        raise ValueError("group %d draws nothing to pack into" % g.rec_index)
+    if vt.pos_char not in ("b", "h", "f"):
+        raise ValueError("group %d position format %r unsupported"
+                         % (g.rec_index, vt.pos_char))
+    nprims = len(g.prims)
+    last_prim = nprims if count is None else min(nprims, first + count)
+    offs, at = [], 0
+    for _w, _t, c in g.prims:
+        offs.append(at)
+        at += c
+
+    keep = set()
+    for pi in range(nprims):
+        if first <= pi < last_prim:
+            continue
+        keep.update(g.indices[offs[pi]:offs[pi] + g.prims[pi][2]])
+
+    def qpos(engine_units, axis):
+        if not vt.bypass and vt.pos_char in ("b", "h"):
+            return engine_units / scale[axis] * vt.pos_trans
+        return engine_units
+
+    # --- UV source ---------------------------------------------------------- #
+    uvs = None
+    if uv == "obj":
+        uvs = [(v.get("u", 0.0), v.get("v", 0.0)) for v in verts]
+    elif uv == "planar":
+        lo = [min(v[k] for v in ((q["x"], q["y"], q["z"]) for q in verts))
+              for k in range(3)]
+        hi = [max(v[k] for v in ((q["x"], q["y"], q["z"]) for q in verts))
+              for k in range(3)]
+        ext = [hi[k] - lo[k] for k in range(3)]
+        ax = sorted(range(3), key=lambda k: -ext[k])[:2]
+        # stay inside the texture box the group already uses
+        ulo = uhi = vlo = vhi = None
+        if vt.uv_off is not None:
+            got = [struct.unpack_from("<2%s" % vt.uv_char, g.vbuf, i * vt.vsize + vt.uv_off)
+                   for i in range(g.vcount)]
+            if got:
+                ulo, uhi = min(p[0] for p in got), max(p[0] for p in got)
+                vlo, vhi = min(p[1] for p in got), max(p[1] for p in got)
+        uvs = []
+        for q in verts:
+            p = (q["x"], q["y"], q["z"])
+            s0 = (p[ax[0]] - lo[ax[0]]) / (ext[ax[0]] or 1.0)
+            s1 = (p[ax[1]] - lo[ax[1]]) / (ext[ax[1]] or 1.0)
+            if ulo is None:
+                uvs.append((s0, s1))
+            else:                                 # raw stored units, written verbatim
+                uvs.append(((ulo + s0 * (uhi - ulo)) / vt.uv_trans,
+                            (vlo + s1 * (vhi - vlo)) / vt.uv_trans))
+    elif uv != "keep":
+        raise ValueError("uv must be keep/obj/planar, not %r" % uv)
+
+    colword = None
+    if colour is not None:
+        if vt.col_off is None:
+            raise ValueError("group %d has no vertex colour field" % g.rec_index)
+        colword = pack_colour(colour, vt.col_fmt)
+
+    def put(slot, pt, src=None):
+        v = bytearray(g.vbuf[slot * vt.vsize:(slot + 1) * vt.vsize])
+        _pack_comps(v, vt.pos_off, vt.pos_char,
+                    [qpos(pt[0], 0), qpos(pt[1], 1), qpos(pt[2], 2)])
+        if uvs is not None and src is not None and vt.uv_off is not None:
+            u0, v0 = uvs[src]
+            _pack_comps(v, vt.uv_off, vt.uv_char,
+                        [u0 * vt.uv_trans, v0 * vt.uv_trans])
+        if colword is not None:
+            _pack_comps(v, vt.col_off, vt.col_char, [colword])
+        g.vbuf[slot * vt.vsize:(slot + 1) * vt.vsize] = v
+
+    P = [(q["x"], q["y"], q["z"]) for q in verts]
+    src_vbuf = bytes(g.vbuf)
+    src_idx = list(g.indices)
+
+    def attempt(keepset):
+        """One packing pass. `keepset` is every vertex we are forbidden to write."""
+        g.vbuf = bytearray(src_vbuf)
+        idx = list(src_idx)
+        pool = [i for i in range(g.vcount) if i not in keepset]
+        pool.reverse()
+        cache = {}
+        strp = _Stripper(tris)
+        placed = skipped = touched = 0
+        ran_out = False
+        last = None
+
+        def slot_for(vi):
+            nonlocal ran_out
+            s = cache.get(vi)
+            if s is None:
+                if not pool:
+                    ran_out = True
+                    return None
+                s = pool.pop()
+                cache[vi] = s
+                put(s, P[vi], vi)
+            return s
+
+        for pi in range(first, last_prim):
+            _w, ptype, c = g.prims[pi]
+            lo = offs[pi]
+            slots = list(idx[lo:lo + c])
+            if c < 3:
+                continue
+            if not len(strp):
+                if not collapse:
+                    continue
+                if reindex:
+                    sl = slot_for(0)
+                    if sl is None:
+                        break
+                    idx[lo:lo + c] = [sl] * c
+                else:
+                    if any(x in keepset for x in slots):
+                        skipped += 1
+                        continue
+                    for x in slots:
+                        put(x, P[0], 0)
+                touched += 1
+                last = pi
+                continue
+            if not reindex and (any(x in keepset for x in slots)
+                                or len(set(slots)) != len(slots)):
+                # two primitives cannot be given two different positions for one shared
+                # vertex — check BEFORE consuming triangles, or a skip throws them away
+                skipped += 1
+                continue
+            if ptype == 4:
+                strip = strp.strip(c) or []
+                src = list(strip) + [strip[-1]] * (c - len(strip))
+                ntri = max(0, len(strip) - 2)
+            else:
+                got = strp.loose(c // 3)
+                src = [k for t in got for k in t]
+                src += [src[-1]] * (c - len(src)) if src else []
+                ntri = len(got)
+            if not src:
+                continue
+            if reindex:
+                row = []
+                for vi in src:
+                    sl = slot_for(vi)
+                    if sl is None:
+                        break
+                    row.append(sl)
+                if len(row) != c:
+                    ran_out = True
+                    break
+                idx[lo:lo + c] = row
+            else:
+                for x, vi in zip(slots, src):
+                    put(x, P[vi], vi)
+                keepset = keepset | set(slots)      # claimed; nobody else may write them
+            placed += ntri
+            touched += 1
+            last = pi
+        return {"prims": last_prim - first, "used_prims": touched,
+                "triangles": placed, "skipped": skipped, "left": len(strp),
+                "verts_used": len(cache), "verts_free": len(pool),
+                "ran_out": ran_out, "_idx": idx, "_last": last}
+
+    # 🔴 A vertex may only be written if NO primitive that keeps its original indices
+    # still draws it. Out-of-range primitives are known up front; in-range ones PAST the
+    # last one we rewrite are not, so pack, see where it stopped, widen the protected
+    # set and pack again. Widening can only shrink the pool, which can only move the
+    # stopping point earlier, so this converges — two passes in practice.
+    keepset = set(keep)
+    r = attempt(keepset)
+    for _ in range(3):
+        stop = (r["_last"] + 1) if r["_last"] is not None else first
+        extra = set()
+        for pi in range(stop, last_prim):
+            extra.update(src_idx[offs[pi]:offs[pi] + g.prims[pi][2]])
+        if extra <= keepset:
+            break
+        keepset |= extra
+        r = attempt(keepset)
+
+    if reindex:
+        g.indices = r.pop("_idx")
+    else:
+        r.pop("_idx")
+    r.pop("_last")
+    return r
 
 
 def clear_group(g: VGroup, drop_vertices: bool = True,

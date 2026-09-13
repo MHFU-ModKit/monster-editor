@@ -246,6 +246,98 @@ def test_a_new_prim_lands_before_the_lists_offset_reset():
     print("  [order] PRIM at %d, OFFSETADDR reset at %d" % (prims[0], resets[0]))
 
 
+def _tetra(cx, cy, cz, r=200.0):
+    """A closed 4-face shape — connected, so the stripifier has real work to do."""
+    v = [{"x": cx, "y": cy + r, "z": cz},
+         {"x": cx - r, "y": cy - r, "z": cz - r},
+         {"x": cx + r, "y": cy - r, "z": cz - r},
+         {"x": cx, "y": cy - r, "z": cz + r}]
+    return v, [(0, 1, 2), (0, 2, 3), (0, 3, 1), (1, 3, 2)]
+
+
+def _grid_mesh(cx, cy, cz, n=6, step=80.0):
+    """An n x n quad grid — the connected case a strip packer should pack densely."""
+    v = [{"x": cx + i * step, "y": cy, "z": cz + j * step}
+         for j in range(n + 1) for i in range(n + 1)]
+    t = []
+    for j in range(n):
+        for i in range(n):
+            a = j * (n + 1) + i
+            t += [(a, a + 1, a + n + 1), (a + 1, a + n + 2, a + n + 1)]
+    return v, t
+
+
+def test_pack_fills_a_strip_instead_of_wasting_it():
+    """The whole point: a 4-vertex strip is a QUAD, not one triangle."""
+    blob = ST.load(DATA, 98).sub(0)
+    header, groups = topo.parse(blob)
+    g = groups[9]                                   # 158 strips of exactly 4 vertices
+    b = topo.group_budget(g)
+    assert b["tri"] == 158 and b["strip"] == 316, b
+    verts, tris = _grid_mesh(14000.0, 1500.0, 16000.0, n=6)      # 72 triangles
+    before = list(g.words)
+    r = topo.pack_group(g, verts, tris, scale=header[2:5], collapse=False)
+    assert g.words == before, "pack_group must not touch a GE word"
+    assert r["triangles"] == len(tris), r
+    assert r["used_prims"] <= len(tris) // 2, r      # every 4-slot strip drew a quad
+    print("  [pack] %d triangles into %d of %d prims, budget %d (one-per-prim %d)"
+          % (r["triangles"], r["used_prims"], r["prims"], b["strip"], b["tri"]))
+
+
+def test_pack_lands_where_asked_and_keeps_the_table():
+    blob = ST.load(DATA, 98).sub(0)
+    verts, tris = _tetra(14500.0, 1500.0, 16000.0)
+    for reindex in (True, False):
+        header, groups = topo.parse(blob)
+        g = groups[11]
+        ibytes = list(g.indices)
+        # collapse=True over an explicit RANGE is the reindex-friendly shape: every
+        # primitive in [first, first+count) is ours, so every vertex in it is ours too.
+        r = topo.pack_group(g, verts, tris, scale=header[2:5], first=0, count=64,
+                            collapse=True, reindex=reindex)
+        assert r["triangles"] == len(tris), (reindex, r)
+        if not reindex:
+            assert g.indices == ibytes, "reindex=False must not write an index"
+        else:
+            assert g.indices != ibytes, "reindex=True should have rewritten indices"
+        out, moved = topo.serialize_inplace(blob, header, groups)
+        assert not moved and len(out) == len(blob)
+        t0, t1 = header[8], header[9]
+        assert out[t0:t1] == blob[t0:t1], "vgroup table moved"
+        m = pmo.parse(out)
+        d = [x for x in m.mesh_groups if x.vg_rec == 11][0]
+        src = [(v["x"], v["y"], v["z"]) for v in verts]
+        on = 0
+        for f in d.faces:
+            vv = [d.vertices[f[k]] for k in ("v1", "v2", "v3")]
+            if any(v is None for v in vv):
+                continue
+            if all(min(abs(v["x"] - s[0]) + abs(v["y"] - s[1]) + abs(v["z"] - s[2])
+                       for s in src) <= 4.0 for v in vv):
+                on += 1
+        assert on >= len(tris), (reindex, on, len(tris))
+        print("  [pack] reindex=%-5s %d faces land on the shape (source %d)"
+              % (reindex, on, len(tris)))
+
+
+def test_pack_never_writes_a_vertex_another_primitive_owns():
+    """reindex=False has to skip a primitive that shares a vertex — check it does."""
+    blob = ST.load(DATA, 98).sub(0)
+    header, groups = topo.parse(blob)
+    g = groups[11]
+    keep_from = 300
+    before = bytes(g.vbuf)
+    owned = set(g.indices[sum(c for _w, _t, c in g.prims[:keep_from]):])
+    verts, tris = _grid_mesh(14000.0, 1500.0, 16000.0, n=8)
+    topo.pack_group(g, verts, tris, scale=header[2:5], first=0, count=keep_from,
+                    collapse=False, reindex=False)
+    vs = g.vtype.vsize
+    hurt = [i for i in sorted(owned)
+            if i < len(before) // vs and g.vbuf[i * vs:(i + 1) * vs] != before[i * vs:(i + 1) * vs]]
+    assert not hurt, "wrote %d vertices that primitives 300+ still draw" % len(hurt)
+    print("  [pack] %d vertices owned by the untouched primitives are intact" % len(owned))
+
+
 if __name__ == "__main__":
     test_roundtrip_is_byte_identical()
     test_triangle_list_winding_does_not_alternate()
@@ -256,4 +348,7 @@ if __name__ == "__main__":
     test_sculpt_changes_no_ge_word_and_lands_where_asked()
     test_sculpt_can_leave_the_rest_of_the_group_alone()
     test_a_new_prim_lands_before_the_lists_offset_reset()
+    test_pack_fills_a_strip_instead_of_wasting_it()
+    test_pack_lands_where_asked_and_keeps_the_table()
+    test_pack_never_writes_a_vertex_another_primitive_owns()
     print("OK stage_topology")
