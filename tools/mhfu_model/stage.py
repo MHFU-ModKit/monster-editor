@@ -796,6 +796,7 @@ GAME_SUB_BASE = 0x09C19000
 MAP_TABLE_VA = 0x09CE470C
 MAP_TABLE_ROWS = 32
 STAGE_SND_TABLE_VA = 0x089A9470      # in the EBOOT, not game_sub
+MAP_RECORD_MAX = 16                  # largest allocation bucket seen (u16 slots)
 
 
 def map_table(data_dir):
@@ -814,8 +815,19 @@ def map_table(data_dir):
         if p not in starts:
             out.append((i, flags, []))
             continue
+        # Records are allocated in 4/8/12/16-slot buckets and ZERO-TERMINATED, with
+        # the spare slots left as 0. Stage numbers run 1..266, so 0 is unambiguous.
+        # ⚠️ Bounding the LAST record by a fixed `p + 16` truncated it: row 31 really
+        # holds [257..266, 0, 0] and read as 8 entries, which made st265/st266 look
+        # like unreferenced stages. Bound by the next record, then cut at the
+        # terminator.
         j = starts.index(p)
-        stop = starts[j + 1] if j + 1 < len(starts) else p + 16
-        stages = [u16(p + 2 * k) for k in range((stop - p) // 2)]
+        stop = starts[j + 1] if j + 1 < len(starts) else min(p + 2 * MAP_RECORD_MAX, end)
+        stages = []
+        for k in range((stop - p) // 2):
+            v = u16(p + 2 * k)
+            if v == 0:
+                break
+            stages.append(v)
         out.append((i, flags, stages))
     return out
