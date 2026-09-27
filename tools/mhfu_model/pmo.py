@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2013 Seth VanHeulen (mhff, https://github.com/svanheulen/mhff)
+# Copyright 2026 sp00ktober
 """PMO geometry (PAC sub-1) <-> data model.
 
 Decodes the MHFU/MHP2G *monster* PMO (magic 'pmo\\x00' ver '1.0\\x00') into

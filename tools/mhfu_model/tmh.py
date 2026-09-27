@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2013 Seth VanHeulen (mhff, https://github.com/svanheulen/mhff)
+# Copyright 2026 sp00ktober
 """In-memory TMH texture codec (PIL-free) for the Blender importer and the stage editor.
 
 Ported from tools/mhff/psp/tmh.py (Seth VanHeulen, GPL) but returns raw RGBA8

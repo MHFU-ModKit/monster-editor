@@ -95,5 +95,8 @@ The siblings:
 
 ## License
 
-[MIT](LICENSE). Not affiliated with or endorsed by Capcom. Monster Hunter is a trademark of
-Capcom Co., Ltd.
+[GPL-3.0-or-later](LICENSE). `tools/mhfu_model` contains code derived from
+[mhff](https://github.com/svanheulen/mhff) (Copyright 2013 Seth VanHeulen, GPL-3.0-or-later):
+the TMH codec and the PMO display-list walker.
+
+Not affiliated with or endorsed by Capcom. Monster Hunter is a trademark of Capcom Co., Ltd.
