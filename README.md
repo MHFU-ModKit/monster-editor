@@ -4,6 +4,8 @@
 
 # MHFU ModKit — monster editor
 
+> **Archived.** This code now lives in [MHFU-ModKit/modkit](https://github.com/MHFU-ModKit/modkit), at [`apps/studio`](https://github.com/MHFU-ModKit/modkit/tree/main/apps/studio). Open issues and pull requests there.
+
 A desktop editor for **ported monsters** in Monster Hunter Freedom Unite. It draws the animal
 skinned and textured, plays every clip at the engine's own rate, puts the host action's frame
 numbers on the same timeline as your clip, and edits hitboxes, hurtboxes, parts and moves as
